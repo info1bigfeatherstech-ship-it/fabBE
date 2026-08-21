@@ -1,0 +1,434 @@
+// models/Order.js
+const mongoose = require('mongoose');
+const { allocateUniqueOrderId, orderIdsForDigitSuffix } = require('../utils/orderId');
+
+const orderItemSchema = new mongoose.Schema(
+  {
+    productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+    variantId: { type: mongoose.Schema.Types.ObjectId },
+    /** Snapshot of variant.productCode at order time (inventory SSOT key) */
+    productCode: { type: String, trim: true, uppercase: true, default: null },
+    quantity: { type: Number, required: true, min: 1 },
+    priceSnapshot: {
+      base: { type: Number, required: true },
+      sale: { type: Number, default: null },
+      total: { type: Number, required: true }
+    },
+    variantAttributesSnapshot: [
+      { key: String, value: String }
+    ],
+    userType: { type: String, enum: ['normal', 'wholesaler'], required: true },
+    
+    // ✅ NEW FIELDS FOR AGGREGATOR
+    hsnCode: { type: String, trim: true, uppercase: true, default: null },
+    gstRate: { type: Number, min: 0, default: null },
+    isFragile: { type: Boolean, default: false }
+  },
+  { _id: false }
+);
+
+const orderSchema = new mongoose.Schema(
+  {
+    orderId: { type: String, unique: true, required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    items: { type: [orderItemSchema], required: true },
+    
+    // Price breakdown (calculated on server)
+    subtotal: { type: Number, required: true },
+    deliveryCharges: { type: Number, required: true, default: 0 },
+    /**
+     * Admin/RTO clarity only: Shiprocket quote split when COD fee was bundled into deliveryCharges.
+     * Customer totals still use deliveryCharges; do not surface these on storefront UI.
+     */
+    deliveryFreightInr: { type: Number, default: null },
+    deliveryCodFeeInr: { type: Number, default: null },
+    tax: { type: Number, required: true, default: 0 },
+    discount: { type: Number, default: 0 },
+    totalAmount: { type: Number, required: true },
+    
+    address: { type: mongoose.Schema.Types.ObjectId, ref: 'Address', required: true },
+    addressSnapshot: { type: Object, required: true },
+    
+    userType: { type: String, enum: ['normal', 'wholesaler'], required: true },
+
+    /** Checkout channel at order place (for ID prefix + admin scope) */
+    storefront: { type: String, enum: ['ecomm', 'wholesale'], default: 'ecomm' },
+
+    /**
+     * Frozen at place-order from active shipping partner setting.
+     * Fulfillment/track/return ALWAYS use this — never the current active setting.
+     * Legacy orders without this field are treated as shiprocket.
+     */
+    shippingProvider: {
+      type: String,
+      enum: ['shiprocket', 'shipmozo'],
+      default: 'shiprocket',
+      index: true
+    },
+    
+    orderStatus: {
+      type: String,
+      enum: ['pending', 'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled', 'return_requested', 'payment_failed', 'rto', 'pickup_exception'],
+      default: 'pending'
+    },
+    
+    paymentStatus: { 
+      type: String, 
+      enum: ['pending', 'initiated', 'paid', 'failed', 'refunded', 'partially_paid', 'partially_refunded'], 
+      default: 'pending' 
+    },
+
+    /** Online checkout: server time after which unpaid orders may be auto-cancelled (see paymentHoldExpiry.service) */
+    paymentHoldExpiresAt: { type: Date, default: null, index: true },
+
+    /** Paid so far (INR) when using advance / multi-capture flows */
+    amountPaidInr: { type: Number, default: 0 },
+    balanceDueInr: { type: Number, default: 0 },
+    
+    paymentInfo: { 
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    },
+
+    /**
+     * External / local stock hold tracking (Phase 2 inventory bridge).
+     * source: inventory | mongo | hybrid
+     * status: none | held | committed | released
+     */
+    inventoryHold: {
+      source: { type: String, default: null }, // inventory | mongo | hybrid
+      status: {
+        type: String,
+        enum: ['none', 'held', 'committed', 'released'],
+        default: 'none'
+      },
+      reservationId: { type: String, default: null },
+      inventoryReserved: { type: Boolean, default: false },
+      mongoReserved: { type: Boolean, default: false },
+      reason: { type: String, default: null },
+      updatedAt: { type: Date, default: null }
+    },
+
+    refundHistory: {
+      type: [
+        {
+          refundId: String,
+          amountInr: Number,
+          amountPaise: Number,
+          status: String,
+          reason: String,
+          createdAt: Date
+        }
+      ],
+      default: []
+    },
+    
+    // For shipment (future use)
+    shipmentInfo: {
+      shipmentId: String,
+      /** Shiprocket channel order id (numeric) — used for cancel API */
+      shiprocketOrderId: { type: String, default: null },
+      /** Shipmozo panel order id / reference after push-order */
+      shipmozoOrderId: { type: String, default: null },
+      shipmozoReferenceId: { type: String, default: null },
+      /** Mirror of order.shippingProvider for quick shipment reads */
+      provider: { type: String, enum: ['shiprocket', 'shipmozo', null], default: null },
+      awbCode: String,
+      trackingNumber: String,
+      courier: String,
+      assignedCourierId: { type: String, default: null },
+      /** Set when Ship Now assigns a different courier because checkout quote was inactive/blocked */
+      courierAssignNote: { type: String, default: null },
+      courierSubstitutedFromId: { type: Number, default: null },
+      courierSubstitutedFromName: { type: String, default: null },
+      /**
+       * Shipmozo: when true, schedule-pickup was required / done.
+       * When false, panel auto-schedules pickups.
+       */
+      shipmozoNeedsManualPickup: { type: Boolean, default: null },
+      providerStatus: String,
+      estimatedDelivery: String,
+      labelUrl: String,
+      /** Shiprocket handover manifest PDF URL */
+      manifestUrl: { type: String, default: null },
+      manifestDownloaded: { type: Boolean, default: false },
+      labelDownloaded: { type: Boolean, default: false },
+      manifestGeneratedAt: Date,
+      fulfillmentArtifactAwb: { type: String, default: null },
+      fulfillmentLabelAwb: { type: String, default: null },
+      fulfillmentManifestAwb: { type: String, default: null },
+      shippedAt: Date,
+      outForDeliveryAt: Date,
+      deliveredAt: Date,
+      /** Scheduled pickup date YYYY-MM-DD (Shiprocket generate/pickup) */
+      pickupDate: { type: String, default: null },
+      pickupScheduledAt: Date,
+      /** Shiprocket pickup batch id (panel: SRPID-48421432) */
+      shiprocketPickupId: { type: String, default: null },
+      lastSyncAt: Date,
+      lastSyncSource: String,
+      lastError: String,
+      lastPickupError: { type: String, default: null },
+      createAttemptCount: { type: Number, default: 0 },
+      rawEvents: { type: [mongoose.Schema.Types.Mixed], default: [] },
+      /** Shiprocket orders/show address intelligence (0–1 ratio) */
+      addressScore: { type: Number, default: null },
+      addressCategory: { type: String, default: null },
+      addressRisk: { type: String, default: null },
+      rtoRisk: { type: String, default: null },
+      addressScoreSyncedAt: { type: Date, default: null },
+      /** Shiprocket RTO reverse freight (₹), when known from billing/shipment APIs */
+      rtoFreightCharge: { type: Number, default: null },
+      rtoFreightSyncedAt: { type: Date, default: null }
+    },
+
+    /** Cached shipment ops view (list/detail actions + provider state classification) */
+    shipmentOps: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
+    },
+    
+    // For returns
+    returnInfo: {
+      reasonType: {
+        type: String,
+        enum: ['damaged', 'wrong_item', null],
+        default: null
+      },
+      reasonMessage: { type: String, default: null },
+      proofs: {
+        type: [
+          {
+            kind: { type: String, enum: ['image', 'video'], required: true },
+            url: { type: String, required: true },
+            publicId: { type: String, default: null }
+          }
+        ],
+        default: []
+      },
+      requestedAt: Date,
+      approvedAt: Date,
+      approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      rejectedAt: Date,
+      rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      decisionReason: { type: String, default: null },
+      reverseShipmentId: { type: String, default: null },
+      reverseAwbCode: { type: String, default: null },
+      reverseTrackingNumber: { type: String, default: null },
+      reverseCourier: { type: String, default: null },
+      reverseProviderStatus: { type: String, default: null },
+      reverseEvents: { type: [mongoose.Schema.Types.Mixed], default: [] },
+      reverseLastSyncAt: Date,
+      reverseLastError: { type: String, default: null },
+      refundInitiatedAt: Date,
+      refundAmount: Number,
+      refundId: String,
+      status: String,
+      /** `cancellation` = order cancelled before delivery; `product_return` = post-delivery return flow */
+      refundContext: { type: String, enum: ['cancellation', 'product_return', null], default: null },
+      chat: {
+        type: [
+          {
+            sender: { type: String, enum: ['user', 'admin'], required: true },
+            message: { type: String, required: true },
+            createdAt: { type: Date, default: Date.now }
+          }
+        ],
+        default: []
+      },
+      userLastRead: { type: Date, default: null },
+      adminLastRead: { type: Date, default: null },
+
+      /** RTO management (admin RTO tab — does not affect product-return flow) */
+      rtoStatus: {
+        type: String,
+        enum: ['pending', 'refunded', 'refund_failed', 'refund_rejected', 'closed', 'resolved', null],
+        default: null
+      },
+      rtoRefundAmount: { type: Number, default: null },
+      rtoRefundId: { type: String, default: null },
+      rtoRefundedAt: { type: Date, default: null },
+      rtoResolvedAt: { type: Date, default: null },
+      rtoResolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      rtoRejectedAt: { type: Date, default: null },
+      rtoRejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+      rtoRejectionNote: { type: String, default: null },
+      /** Exact Shiprocket carrier label at classification time */
+      rtoShiprocketReason: { type: String, default: null },
+      rtoReasonCategory: {
+        type: String,
+        enum: ['customer', 'courier', 'unknown', null],
+        default: null
+      },
+      rtoRefundError: { type: String, default: null },
+      /**
+       * Latched when Shiprocket first reports RTO delivered to warehouse (or equivalent).
+       * Keeps refund gate open if status later changes to e.g. RTO Acknowledged.
+       */
+      rtoWarehouseDeliveredAt: { type: Date, default: null },
+      rtoDeductions: {
+        forwardShipping: { type: Number, default: 0 },
+        rtoShipping: { type: Number, default: 0 },
+        platformFee: { type: Number, default: 0 },
+        platformFeePercent: { type: Number, default: 0 },
+        orderTotal: { type: Number, default: 0 },
+        cartValue: { type: Number, default: 0 }
+      },
+      rtoShippingCharges: { type: Number, default: null },
+      /** Last attempt to pull RTO reverse freight from Shiprocket (even if amount still unknown). */
+      rtoFreightSyncedAt: { type: Date, default: null },
+      rtoHistory: {
+        type: [
+          {
+            action: { type: String, required: true },
+            note: { type: String, default: null },
+            performedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+            createdAt: { type: Date, default: Date.now },
+            metadata: { type: mongoose.Schema.Types.Mixed, default: null }
+          }
+        ],
+        default: []
+      }
+    },
+    appliedCoupon: {
+        code: { type: String },
+        discount: { type: Number, default: 0 }
+    },
+
+    /** Snapshot from checkout quote — quote courier at order time */
+    shippingSnapshot: {
+      courierName: { type: String, default: null },
+      estimatedDays: { type: String, default: null },
+      /** Shiprocket courier company id OR Shipmozo courier_id (same slot for quote→ship continuity) */
+      courierCompanyId: { type: Number, default: null },
+      /** Explicit Shipmozo courier id (mirrors courierCompanyId when provider=shipmozo) */
+      shipmozoCourierId: { type: Number, default: null },
+      /** Provider that produced this quote */
+      provider: { type: String, enum: ['shiprocket', 'shipmozo', null], default: null },
+      pickupsAutomaticallyScheduled: { type: Boolean, default: null }
+    },
+
+    /** Package weight/dims sent to Shiprocket at checkout (frozen at order place) */
+    shippingWeightSnapshot: {
+      totalWeightKg: { type: Number, default: null },
+      totalDimWeightKg: { type: Number, default: null },
+      dims: {
+        lengthCm: { type: Number, default: null },
+        widthCm: { type: Number, default: null },
+        heightCm: { type: Number, default: null }
+      },
+      lines: {
+        type: [
+          {
+            productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+            variantId: { type: mongoose.Schema.Types.ObjectId },
+            productName: { type: String, default: null },
+            sku: { type: String, default: null },
+            quantity: { type: Number, default: 0 },
+            unitWeightKg: { type: Number, default: null },
+            lineWeightKg: { type: Number, default: null },
+            lengthCm: { type: Number, default: null },
+            widthCm: { type: Number, default: null },
+            heightCm: { type: Number, default: null },
+            unitDimWeightKg: { type: Number, default: null },
+            lineDimWeightKg: { type: Number, default: null }
+          }
+        ],
+        default: []
+      },
+      /** checkout | catalog_fallback (legacy display only) */
+      source: { type: String, default: 'checkout' }
+    },
+
+    /**
+     * Lines removed by admin before accept (OOS / qty cut).
+     * Kept for customer order history even after they leave `items`.
+     */
+    removedItemsArchive: {
+      type: [
+        {
+          productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', default: null },
+          variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          productName: { type: String, default: 'Product' },
+          sku: { type: String, default: null },
+          quantity: { type: Number, default: 0 },
+          priceSnapshot: {
+            base: { type: Number, default: null },
+            sale: { type: Number, default: null },
+            total: { type: Number, default: null }
+          },
+          reason: {
+            type: String,
+            enum: ['unavailable', 'qty_reduced', 'order_cancelled_empty'],
+            default: 'unavailable'
+          },
+          removedAt: { type: Date, default: Date.now }
+        }
+      ],
+      default: []
+    },
+
+    /**
+     * Permanent English customer-facing notes (admin pending-order edits, refunds, etc.).
+     * Never auto-removed — shown on user order detail.
+     */
+    customerFacingNotes: {
+      type: [
+        {
+          message: { type: String, required: true, trim: true },
+          kind: {
+            type: String,
+            enum: [
+              'order_amended',
+              'item_unavailable_refund',
+              'order_cancelled_empty',
+              'oos_shipping_settled',
+              'info'
+            ],
+            default: 'info'
+          },
+          createdAt: { type: Date, default: Date.now },
+          metadata: { type: mongoose.Schema.Types.Mixed, default: null }
+        }
+      ],
+      default: []
+    },
+
+    /** Admin audit trail for pending-order line edits (internal) */
+    adminEditHistory: {
+      type: [
+        {
+          action: { type: String, required: true },
+          note: { type: String, default: null },
+          performedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+          createdAt: { type: Date, default: Date.now },
+          before: { type: mongoose.Schema.Types.Mixed, default: null },
+          after: { type: mongoose.Schema.Types.Mixed, default: null },
+          metadata: { type: mongoose.Schema.Types.Mixed, default: null }
+        }
+      ],
+      default: []
+    }
+  },
+  { timestamps: true }
+);
+
+// Generate order ID before saving (fallback if controller did not set orderId).
+// Digit suffix is unique across OWB-ECOMM and OWB-WH.
+orderSchema.pre('save', async function () {
+  if (this.orderId) return;
+  this.orderId = await allocateUniqueOrderId({
+    storefront: this.storefront,
+    userType: this.userType,
+    maxAttempts: 32,
+    isSuffixTaken: async (digits) => {
+      const ids = orderIdsForDigitSuffix(digits);
+      return Boolean(await mongoose.model('Order').exists({ orderId: { $in: ids } }));
+    }
+  });
+});
+
+orderSchema.index({ userId: 1, createdAt: -1 });
+orderSchema.index({ createdAt: -1, orderStatus: 1 });
+
+module.exports = mongoose.model('Order', orderSchema);

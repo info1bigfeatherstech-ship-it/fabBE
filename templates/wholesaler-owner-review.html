@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wholesaler application — review</title>
+  <link rel="stylesheet" href="/wholesaler/owner-review.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header class="page-head">
+      <h1>Wholesaler application</h1>
+      <p class="lede">{{LEDE}}</p>
+    </header>
+
+    <section class="at-a-glance" aria-label="Summary">
+      <p class="summary">{{SUMMARY_LINE}}</p>
+    </section>
+
+    <details class="fold" open>
+      <summary>{{DETAILS_SUMMARY_LABEL}}</summary>
+      <div class="table-wrap">
+        <table>
+          <tbody>
+            {{TABLE_ROWS}}
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    {{DOCS_SECTION}}
+
+    <section class="actions" aria-label="Decision">
+      <form class="action-card" method="post" action="{{DECISION_URL}}">
+        <input type="hidden" name="token" value="{{TOKEN}}" />
+        <input type="hidden" name="decision" value="approve" />
+        <h2>Approve</h2>
+        <p>{{APPROVE_HINT}}</p>
+        <button type="submit" class="dec approve">Approve</button>
+      </form>
+      <form class="action-card" method="post" action="{{DECISION_URL}}">
+        <input type="hidden" name="token" value="{{TOKEN}}" />
+        <input type="hidden" name="decision" value="reject" />
+        <h2>Reject</h2>
+        <p>Optional note for internal records.</p>
+        <textarea name="reason" maxlength="500" rows="2" placeholder="Reason (optional)"></textarea>
+        <button type="submit" class="dec reject" style="margin-top:8px">Reject</button>
+      </form>
+    </section>
+    <footer class="foot">OfferWaleBaba · wholesaler onboarding</footer>
+  </main>
+</body>
+</html>
