@@ -3,6 +3,15 @@ const logger = require('../utils/logger');
 
 const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
 
+function defaultSupportEmail() {
+  return String(
+    process.env.STORE_EMAIL ||
+      process.env.MARKETING_EMAIL_USER ||
+      process.env.EMAIL_USER ||
+      ''
+  ).trim();
+}
+
 function normalizeStorefront(value) {
   const s = String(value || 'ecomm').toLowerCase().trim();
   return VALID_STOREFRONTS.has(s) ? s : 'ecomm';
@@ -31,7 +40,7 @@ function defaultSettings() {
     support: {
       showCustomerSupport: true,
       mobile: '',
-      email: String(process.env.STORE_EMAIL || 'support.offerwalebaba@gmail.com').trim()
+      email: defaultSupportEmail()
     },
     delivery: {
       showPaymentMode: true,

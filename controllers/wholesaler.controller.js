@@ -28,6 +28,7 @@ const {
   buildCustomerContactLookup,
   buildStaffContactLookup
 } = require('../utils/accountScope');
+const { getAppName, getAppTeamSignature } = require('../utils/appBrand');
 
 // Wholesaler activation OTP follows the same global expiry window as every
 // other OTP flow. Driven by OTP_EXPIRY_MINUTES env (default: 5 minutes).
@@ -384,7 +385,8 @@ function buildOwnerReviewPageHtml({ doc, token, apiBase }) {
     .replace(/\{\{DOCS_SECTION\}\}/g, docsSection)
     .replace(/\{\{APPROVE_HINT\}\}/g, escapeHtml(approveHint))
     .replace(/\{\{DECISION_URL\}\}/g, decisionUrl)
-    .replace(/\{\{TOKEN\}\}/g, tokenField);
+    .replace(/\{\{TOKEN\}\}/g, tokenField)
+    .replace(/\{\{APP_NAME\}\}/g, escapeHtml(getAppName()));
 }
 
 function buildPublicApiBase(req) {
@@ -1372,7 +1374,7 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
           '',
           `Your registered mobile (${doc.mobileNumber}) is already attached to this link.`,
           '',
-          '— Team OfferWaleBaba'
+          getAppTeamSignature()
         ].join('\n');
       } else {
         const activateUrl = getWholesalerActivateAppUrl({
@@ -1389,7 +1391,7 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
           '',
           `Registered mobile: ${doc.mobileNumber}`,
           '',
-          '— Team OfferWaleBaba'
+          getAppTeamSignature()
         ].join('\n');
       }
     } else if (doc.status === 'rejected') {
@@ -1398,7 +1400,7 @@ exports.buildNotifyApplicantPayload = async (req, res) => {
         '',
         'Thank you for your interest. Unfortunately your wholesaler application was not approved at this time.',
         '',
-        '— Team OfferWaleBaba'
+        getAppTeamSignature()
       ].join('\n');
     } else {
       return res.status(409).json({ success: false, message: `Unexpected status: ${doc.status}` });

@@ -14,6 +14,7 @@ const leadsPushSettingsService = require('./leadsPushSettings.service');
 const logger = require('../utils/logger');
 const { findCartForStorefront } = require('./cartStorefront.service');
 const { mergeCustomerStorefrontFilter, normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
+const { getAppName } = require('../utils/appBrand');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -45,10 +46,10 @@ function ensureVapidConfigured() {
 }
 
 function getStorefrontCartUrl() {
-  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
+  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || '')
+    .split(',')[0]
+    .trim()
+    .replace(/\/$/, '');
   return `${base}/account/usercart`;
 }
 
@@ -98,6 +99,7 @@ function buildPushPayload({ customerName, cartSummary }) {
 
   const vars = {
     name: displayName,
+    appName: getAppName(),
     itemCount: String(itemCount),
     itemLabel,
     cartTotal: formatInr(totalAmount),

@@ -6,6 +6,7 @@ const cartReminderTemplate = require('../templates/cartReminderEmail.template');
 const logger = require('../utils/logger');
 const { findCartForStorefront } = require('./cartStorefront.service');
 const { normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
+const { getAppName, getAppEmailFromName } = require('../utils/appBrand');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -30,7 +31,7 @@ function getMarketingEmailPassword() {
 }
 
 function getMarketingFromAddress() {
-  const fromName = String(process.env.MARKETING_EMAIL_FROM_NAME || 'OfferWaaleBaba').trim();
+  const fromName = getAppEmailFromName();
   const fromEmail = getMarketingEmailUser();
   return `"${fromName}" <${fromEmail}>`;
 }
@@ -54,10 +55,10 @@ function getTransporter() {
 }
 
 function getStorefrontCartUrl() {
-  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
+  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || '')
+    .split(',')[0]
+    .trim()
+    .replace(/\/$/, '');
   return `${base}/account/usercart`;
 }
 
@@ -187,13 +188,16 @@ function buildEmailContent({ customerName, cartSummary }) {
   const cartUrl = getStorefrontCartUrl();
   const cartItemsHtml = buildCartItemsHtml(rows);
   const displayName = customerName || 'there';
+  const appName = getAppName();
 
   const greetingText = applyPlaceholders(cartReminderTemplate.greeting, { name: displayName });
+  const introText = applyPlaceholders(cartReminderTemplate.intro, { appName });
 
   const vars = {
     name: displayName,
+    appName,
     greeting: applyPlaceholders(cartReminderTemplate.greeting, { name: escapeHtml(displayName) }),
-    intro: cartReminderTemplate.intro,
+    intro: applyPlaceholders(cartReminderTemplate.intro, { appName: escapeHtml(appName) }),
     itemCount: String(itemCount),
     itemLabel,
     cartTotal: formatInr(totalAmount),
@@ -212,7 +216,7 @@ function buildEmailContent({ customerName, cartSummary }) {
   const text = [
     greetingText,
     '',
-    cartReminderTemplate.intro,
+    introText,
     '',
     vars.itemsSectionTitle,
     buildCartItemsText(rows),
@@ -223,7 +227,7 @@ function buildEmailContent({ customerName, cartSummary }) {
   ].join('\n');
 
   return {
-    subject: cartReminderTemplate.subject,
+    subject: applyPlaceholders(cartReminderTemplate.subject, { appName }),
     html,
     text
   };

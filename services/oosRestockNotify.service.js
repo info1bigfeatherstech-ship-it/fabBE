@@ -18,6 +18,7 @@ const OutOfStockInquiry = require('../models/OutOfStockInquiry');
 const Product = require('../models/Product');
 const logger = require('../utils/logger');
 const template = require('../templates/oosRestockEmail.template');
+const { getAppName, getAppEmailFromName } = require('../utils/appBrand');
 
 const SEND_DELAY_MS = Math.min(
   2000,
@@ -49,7 +50,7 @@ function getMarketingEmailPassword() {
 }
 
 function getMarketingFromAddress() {
-  const fromName = String(process.env.MARKETING_EMAIL_FROM_NAME || 'OfferWaaleBaba').trim();
+  const fromName = getAppEmailFromName();
   const fromEmail = getMarketingEmailUser();
   return `"${fromName}" <${fromEmail}>`;
 }
@@ -85,18 +86,18 @@ function escapeHtml(value) {
 }
 
 function storefrontBaseUrl(storefront) {
+  const pick = (raw) =>
+    String(raw || '')
+      .split(',')[0]
+      .trim()
+      .replace(/\/$/, '');
+
   if (storefront === 'wholesale') {
-    return String(
-      process.env.WHOLESALE_FRONTEND_URL ||
-        process.env.FRONTEND_URL ||
-        process.env.STORE_URL ||
-        'https://offerwalebaba.com'
-    ).replace(/\/$/, '');
+    return pick(
+      process.env.WHOLESALE_FRONTEND_URL || process.env.FRONTEND_URL || process.env.STORE_URL || ''
+    );
   }
-  return String(process.env.FRONTEND_URL || process.env.STORE_URL || 'https://offerwalebaba.com').replace(
-    /\/$/,
-    ''
-  );
+  return pick(process.env.FRONTEND_URL || process.env.STORE_URL || '');
 }
 
 function buildProductUrl(inquiry) {
@@ -291,6 +292,7 @@ async function sendRestockEmail(inquiry, ctx) {
       };
 
   const map = {
+    appName: escapeHtml(getAppName()),
     productName: escapeHtml(productName),
     productUrl,
     greeting: copy.greeting,
@@ -299,7 +301,7 @@ async function sendRestockEmail(inquiry, ctx) {
     ctaLabel: copy.ctaLabel,
     footer: copy.footer,
   };
-  const subject = fillTemplate(copy.subject, { productName });
+  const subject = fillTemplate(copy.subject, { productName, appName: getAppName() });
   const html = fillTemplate(template.htmlLayout, map);
   const text = `${copy.greeting}\n\n${fillTemplate(copy.textBody, { productName })}\n\n${productUrl}\n`;
 

@@ -1,5 +1,7 @@
 // utils/seoUtils.js
 
+const { getAppName } = require('./appBrand');
+
 /**
  * Resolve the public site origin used for canonical URLs / OG metadata.
  * Returns a clean origin (no trailing slash) or empty string when not configured.
@@ -66,7 +68,7 @@ const generateSEOData = (productData) => {
         // =============================================
         // 1. META TITLE (50-60 characters)
         // =============================================
-        let metaTitle = `${productData.name}${bestPrice} | Buy Online | OfferWaleBaba`;
+        let metaTitle = `${productData.name}${bestPrice} | Buy Online | ${getAppName()}`;
         if (metaTitle.length > 60) {
             metaTitle = metaTitle.substring(0, 57) + '...';
         }
@@ -128,7 +130,7 @@ const generateSEOData = (productData) => {
         // Safe fallback — uses outer-scope baseUrl so this branch never
         // throws on its own (avoids "baseUrl is not defined" ReferenceError).
         return {
-            meta_title: `${productData?.name || 'Product'} | Buy Online | OfferWaleBaba`,
+            meta_title: `${productData?.name || 'Product'} | Buy Online | ${getAppName()}`,
             meta_description: 'Shop now for best prices with free shipping and COD',
             meta_keywords: 'buy online, best price, shop now',
             og_title: productData?.name || 'Product',

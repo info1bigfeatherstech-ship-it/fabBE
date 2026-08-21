@@ -4,6 +4,7 @@
  *
  * Placeholders (replaced per recipient):
  *   {{name}}           Customer display name
+ *   {{appName}}        Brand from APP_NAME env
  *   {{itemCount}}      Number of line items in cart
  *   {{itemLabel}}      "item" or "items"
  *   {{cartTotal}}      Formatted cart total (INR)
@@ -12,12 +13,12 @@
  */
 
 module.exports = {
-  subject: 'Your cart is waiting at OfferWaaleBaba',
+  subject: 'Your cart is waiting at {{appName}}',
 
   greeting: 'Hi {{name}},',
 
   intro:
-    'You left great picks in your cart on OfferWaaleBaba. These items are still waiting for you — complete your order before they go out of stock!',
+    'You left great picks in your cart on {{appName}}. These items are still waiting for you — complete your order before they go out of stock!',
 
   itemsSectionTitle: 'Your cart ({{itemCount}} {{itemLabel}} · {{cartTotal}})',
 
@@ -28,7 +29,7 @@ module.exports = {
 
   htmlLayout: `
 <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:24px;border:1px solid #eee;border-radius:10px;">
-  <h2 style="margin:0 0 12px 0;color:#1a1a1a;font-size:20px;">OfferWaaleBaba</h2>
+  <h2 style="margin:0 0 12px 0;color:#1a1a1a;font-size:20px;">{{appName}}</h2>
   <p style="color:#444;line-height:1.6;margin:0 0 12px 0;">{{greeting}}</p>
   <p style="color:#555;line-height:1.6;margin:0 0 20px 0;">{{intro}}</p>
   <p style="font-weight:600;color:#333;margin:0 0 8px 0;">{{itemsSectionTitle}}</p>

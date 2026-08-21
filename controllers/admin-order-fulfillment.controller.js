@@ -16,6 +16,7 @@ const {
   isShipmozoOrder
 } = require('../constants/shippingProviders');
 const logger = require('../utils/logger');
+const { getAppUserAgent } = require('../utils/appBrand');
 const { isOrderStaffRequest } = require('../utils/checkoutFlow');
 const { buildGstInvoiceHtml, buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const { applyUpsertShipmentInfo, ensureShipmentForOrderExport } = require('./order.controller');
@@ -757,7 +758,7 @@ async function fetchShipmozoLabelFile(order) {
         maxContentLength: 25 * 1024 * 1024,
         headers: {
           Accept: 'application/pdf,application/octet-stream,image/*,*/*',
-          'User-Agent': 'Mozilla/5.0 (compatible; OfferWaleBaba/1.0; +https://offerwalebaba.com)'
+          'User-Agent': getAppUserAgent()
         },
         validateStatus: (s) => s >= 200 && s < 400
       });
@@ -865,7 +866,7 @@ async function fetchShiprocketLabelPdfBuffer(order) {
     maxContentLength: 25 * 1024 * 1024,
     headers: {
       Accept: 'application/pdf,application/octet-stream,*/*',
-      'User-Agent': 'Mozilla/5.0 (compatible; OfferWaleBaba/1.0; +https://offerwalebaba.com)'
+      'User-Agent': getAppUserAgent()
     },
     validateStatus: (s) => s >= 200 && s < 400
   });
@@ -942,7 +943,7 @@ async function fetchShiprocketManifestPdfBuffer(order) {
     maxContentLength: 25 * 1024 * 1024,
     headers: {
       Accept: 'application/pdf,application/octet-stream,*/*',
-      'User-Agent': 'Mozilla/5.0 (compatible; OfferWaleBaba/1.0; +https://offerwalebaba.com)'
+      'User-Agent': getAppUserAgent()
     },
     validateStatus: (s) => s >= 200 && s < 400
   });

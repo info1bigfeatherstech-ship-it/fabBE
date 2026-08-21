@@ -17,7 +17,7 @@ function getVapidSubject() {
   if (marketingEmail) return `mailto:${marketingEmail}`;
   const otpEmail = String(process.env.EMAIL_USER || '').trim();
   if (otpEmail) return `mailto:${otpEmail}`;
-  return 'mailto:support@offerwalebaba.com';
+  return 'mailto:support@example.com';
 }
 
 function isPushConfigured() {

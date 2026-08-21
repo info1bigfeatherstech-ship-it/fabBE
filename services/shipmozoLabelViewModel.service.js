@@ -7,6 +7,7 @@ const shippingProviderSettingsService = require('./shippingProviderSettings.serv
 const { sanitizeSettings, defaultSettings } = require('./shipmozoLabelSettings.service');
 const ShipmozoService = require('../utils/shipmozo');
 const logger = require('../utils/logger');
+const { getAppName } = require('../utils/appBrand');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -333,7 +334,7 @@ async function buildLabelViewModel(order, settingsPatch) {
     totalQty,
     hiddenCount,
     gstin: settings.pickup.gstin || String(process.env.STORE_GSTIN || '').trim(),
-    poweredBy: 'Offer Wale Baba'
+    poweredBy: getAppName()
   };
 }
 
@@ -413,7 +414,7 @@ function buildSampleViewModel(settingsPatch, storefront) {
     ewayBill: '1234567890',
     ...buildSampleLineItems(settings),
     gstin: settings.pickup.gstin,
-    poweredBy: 'Offer Wale Baba'
+    poweredBy: getAppName()
   };
 }
 
