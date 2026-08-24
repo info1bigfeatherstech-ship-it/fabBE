@@ -2,8 +2,10 @@
  * Shiprocket Ship Now — production fulfillment policy:
  * 1) Prefer checkout quoted courier via assign/awb (do not rate-gate before assign)
  * 2) On assign failure (non-wallet) → live serviceability → suggest substitute
- *    preferring rate ≤ customer-paid freight (COD-capable when COD)
- * 3) confirmSubstitute / courierId → assign chosen alternative after admin confirm
+ *    preferring rate ≤ customer-paid freight (COD-capable when COD), always excluding
+ *    the failed quoted courier ID so it is never re-suggested
+ * 3) confirmSubstitute / courierId → assign chosen alternative after admin confirm;
+ *    on assign failure, try next cheapest alternatives (bounded) without re-using failed IDs
  * 4) NEVER mutate customer order totals / deliveryCharges / payment bill
  *
  * Shipmozo orders never enter this module (caller routes by isShipmozoOrder).
@@ -51,11 +53,13 @@ function quotedFreightInr(order) {
   const n = Number(
     snap.freightInr != null
       ? snap.freightInr
-      : snap.deliveryCharges != null
-        ? snap.deliveryCharges
-        : snap.shippingCharges != null
-          ? snap.shippingCharges
-          : order?.deliveryCharges
+      : order?.deliveryFreightInr != null
+        ? order.deliveryFreightInr
+        : snap.deliveryCharges != null
+          ? snap.deliveryCharges
+          : snap.shippingCharges != null
+            ? snap.shippingCharges
+            : order?.deliveryCharges
   );
   return Number.isFinite(n) && n >= 0 ? round2(n) : null;
 }
@@ -219,8 +223,9 @@ async function runShiprocketAssignAwb(order, opts = {}) {
 
     const quoted = quotedCourierFromOrder(order);
     const freightCap = quotedFreightInr(order);
-    const hasOverride =
+    let hasOverride =
       courierIdOverride != null && Number.isFinite(Number(courierIdOverride)) && Number(courierIdOverride) > 0;
+    const MAX_SUBSTITUTE_ASSIGN_ATTEMPTS = 5;
 
     let available = [];
     let ratesLoaded = false;
@@ -237,13 +242,30 @@ async function runShiprocketAssignAwb(order, opts = {}) {
 
     const codRequired = () => Boolean(parts?.useCodAtDoor);
 
-    const suggestedFromRates = () => {
+    const suggestedFromRates = (excludeCourierIds = null) => {
       const picked = pickCheapestActiveCourier(available, {
         codRequired: codRequired(),
-        maxCharge: freightCap
+        maxCharge: freightCap,
+        excludeCourierIds
       });
       return enrichSuggested(picked, freightCap);
     };
+
+    let effectiveOverride = hasOverride ? Number(courierIdOverride) : null;
+    // Admin confirmed but UI re-sent the failed quoted ID — pick a real alternative instead.
+    if (
+      confirmSubstitute &&
+      effectiveOverride != null &&
+      quoted.courierId != null &&
+      Number(effectiveOverride) === Number(quoted.courierId)
+    ) {
+      logger.info('[Shiprocket] Ignoring override that matches failed quoted courier', {
+        orderId: order.orderId,
+        courierIdOverride: effectiveOverride
+      });
+      effectiveOverride = null;
+      hasOverride = false;
+    }
 
     const finishSuccess = ({ assign, courierId, courierName, substituted, substituteMeta }) => ({
       success: true,
@@ -296,9 +318,145 @@ async function runShiprocketAssignAwb(order, opts = {}) {
       return { ok: true, assign, ...meta };
     };
 
+    /**
+     * After admin confirms substitute: try preferred id then next cheapest (exclude failed).
+     * Never re-assigns quoted courier when excludeQuoted is set.
+     */
+    const assignSubstituteWithFallback = async ({ preferredId = null, excludeQuoted = true }) => {
+      await ensureRates();
+      const failed = new Set();
+      if (excludeQuoted && quoted.courierId != null) failed.add(Number(quoted.courierId));
+
+      const candidates = [];
+      const seen = new Set();
+      const pushId = (id) => {
+        const n = Number(id);
+        if (!Number.isFinite(n) || n <= 0 || failed.has(n) || seen.has(n)) return;
+        if (isCourierInactive({ id: n })) return;
+        seen.add(n);
+        candidates.push(n);
+      };
+
+      if (preferredId != null) pushId(preferredId);
+
+      const seedExclude = new Set(failed);
+      if (preferredId != null) seedExclude.add(Number(preferredId));
+      for (let i = 0; i < MAX_SUBSTITUTE_ASSIGN_ATTEMPTS; i++) {
+        const next = suggestedFromRates(seedExclude);
+        if (!next?.courierId) break;
+        pushId(next.courierId);
+        seedExclude.add(Number(next.courierId));
+      }
+
+      if (!candidates.length) {
+        return { ok: false, empty: true, suggested: null, lastAssign: null };
+      }
+
+      let lastAssign = null;
+      for (let i = 0; i < candidates.length && i < MAX_SUBSTITUTE_ASSIGN_ATTEMPTS; i++) {
+        const targetId = candidates[i];
+        if (isCourierInactive({ id: targetId })) {
+          failed.add(targetId);
+          continue;
+        }
+        logger.info('[Shiprocket] Ship now: substitute assign attempt', {
+          orderId: order.orderId,
+          shipmentId: sid,
+          targetId,
+          attempt: i + 1
+        });
+        const res = await assignTarget(targetId);
+        if (res.ok) {
+          return { ok: true, targetId, assign: res.assign, suggested: suggestedFromRates(failed) };
+        }
+        lastAssign = res.assign;
+        if (isWalletAssignFailure(res.assign)) {
+          return { ok: false, wallet: true, lastAssign: res.assign, suggested: suggestedFromRates(failed) };
+        }
+        failed.add(Number(targetId));
+        logger.warn('[Shiprocket] Substitute assign failed; trying next', {
+          orderId: order.orderId,
+          targetId,
+          message: res.assign?.message
+        });
+      }
+
+      return {
+        ok: false,
+        empty: false,
+        lastAssign,
+        suggested: suggestedFromRates(failed)
+      };
+    };
+
     // ── Override (admin picked / confirmed suggested id) ───────────────────
-    if (hasOverride) {
-      const targetId = Number(courierIdOverride);
+    if (hasOverride && effectiveOverride != null) {
+      if (confirmSubstitute) {
+        const result = await assignSubstituteWithFallback({
+          preferredId: effectiveOverride,
+          excludeQuoted: quoted.courierId != null
+        });
+        if (result.wallet) {
+          return {
+            success: false,
+            code: 'SHIPROCKET_WALLET_OR_BALANCE',
+            message: result.lastAssign.message,
+            details: result.lastAssign.details || result.lastAssign.raw || null,
+            customerBillUnchanged: true
+          };
+        }
+        if (result.ok) {
+          const targetId = result.targetId;
+          const substituted =
+            quoted.courierId != null && Number(targetId) !== Number(quoted.courierId);
+          const substituteMeta = substituted
+            ? {
+                courierAssignNote: buildCourierSubstituteNote({
+                  quotedId: quoted.courierId,
+                  quotedName: quoted.courierName,
+                  assignedId: targetId,
+                  assignedName: result.assign.courier || String(targetId),
+                  reason: 'admin_confirm'
+                }),
+                courierSubstitutedFromId: quoted.courierId,
+                courierSubstitutedFromName: quoted.courierName
+              }
+            : null;
+          return finishSuccess({
+            assign: result.assign,
+            courierId: targetId,
+            courierName: result.assign.courier || null,
+            substituted,
+            substituteMeta
+          });
+        }
+        if (result.empty || !result.suggested) {
+          return unavailablePayload({
+            message:
+              (result.lastAssign?.message ? `${result.lastAssign.message} ` : '') +
+              'No other active courier is available via API for this route — assign from the Shiprocket panel. Customer order total is not changed.',
+            quoted,
+            suggested: null,
+            available,
+            freightCap,
+            details: result.lastAssign?.details || result.lastAssign?.raw || null,
+            assignCode: result.lastAssign?.code || 'NO_SUBSTITUTE_COURIER'
+          });
+        }
+        return unavailablePayload({
+          message:
+            result.lastAssign?.message ||
+            'Could not assign selected courier. Confirm another substitute or use the Shiprocket panel.',
+          quoted,
+          suggested: result.suggested,
+          available,
+          freightCap,
+          details: result.lastAssign?.details || result.lastAssign?.raw || null,
+          assignCode: result.lastAssign?.code
+        });
+      }
+
+      const targetId = Number(effectiveOverride);
       if (isCourierInactive({ id: targetId })) {
         return {
           success: false,
@@ -325,12 +483,13 @@ async function runShiprocketAssignAwb(order, opts = {}) {
           };
         }
         await ensureRates();
+        const exclude = quoted.courierId != null ? [quoted.courierId, targetId] : [targetId];
         return unavailablePayload({
           message:
             res.assign.message ||
             'Could not assign selected courier. Confirm another substitute or use the Shiprocket panel.',
           quoted,
-          suggested: suggestedFromRates(),
+          suggested: suggestedFromRates(exclude),
           available,
           freightCap,
           details: res.assign.details || res.assign.raw || null,
@@ -346,7 +505,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
               quotedName: quoted.courierName,
               assignedId: targetId,
               assignedName: res.assign.courier || String(targetId),
-              reason: confirmSubstitute ? 'admin_confirm' : 'admin_confirm'
+              reason: 'admin_confirm'
             }),
             courierSubstitutedFromId: quoted.courierId,
             courierSubstitutedFromName: quoted.courierName
@@ -363,90 +522,55 @@ async function runShiprocketAssignAwb(order, opts = {}) {
 
     // ── Admin confirmed substitute without explicit id ─────────────────────
     if (confirmSubstitute) {
-      const rates = await ensureRates();
-      if (!rates.ok && quoted.courierId == null) {
+      const result = await assignSubstituteWithFallback({
+        preferredId: null,
+        excludeQuoted: quoted.courierId != null
+      });
+      if (result.wallet) {
         return {
           success: false,
-          code: rates.code || 'NO_ACTIVE_COURIER',
-          message:
-            rates.message ||
-            'No Shiprocket courier rates available. Retry later or assign from the Shiprocket panel.',
+          code: 'SHIPROCKET_WALLET_OR_BALANCE',
+          message: result.lastAssign.message,
+          details: result.lastAssign.details || result.lastAssign.raw || null,
           customerBillUnchanged: true
         };
       }
-      const suggested = suggestedFromRates();
-      let targetId = suggested?.courierId ?? null;
-      let courierName = suggested?.courierName || null;
-      let reason = 'admin_confirm';
-
-      if (targetId == null && quoted.courierId != null) {
-        logger.info('[Shiprocket] confirmSubstitute with empty/poor rates — retry quoted', {
-          orderId: order.orderId,
-          quotedCourierId: quoted.courierId
+      if (result.ok) {
+        const targetId = result.targetId;
+        const substituted =
+          quoted.courierId == null || Number(targetId) !== Number(quoted.courierId);
+        return finishSuccess({
+          assign: result.assign,
+          courierId: targetId,
+          courierName: result.assign.courier || null,
+          substituted,
+          substituteMeta: substituted
+            ? {
+                courierAssignNote: buildCourierSubstituteNote({
+                  quotedId: quoted.courierId,
+                  quotedName: quoted.courierName,
+                  assignedId: targetId,
+                  assignedName: result.assign.courier || String(targetId),
+                  reason: 'admin_confirm'
+                }),
+                courierSubstitutedFromId: quoted.courierId,
+                courierSubstitutedFromName: quoted.courierName
+              }
+            : null
         });
-        targetId = Number(quoted.courierId);
-        courierName = quoted.courierName;
-        reason = 'assign_failed';
       }
-      if (targetId == null) {
-        return {
-          success: false,
-          code: 'NO_ACTIVE_COURIER',
-          message:
-            'No active courier available for this route. Assign from the Shiprocket panel or retry shortly.',
-          customerBillUnchanged: true
-        };
-      }
-      if (isCourierInactive({ id: targetId, name: courierName })) {
-        return {
-          success: false,
-          code: 'COURIER_INACTIVE',
-          message: 'Suggested courier is inactive in our shipping policy. Pick another from the Shiprocket panel.',
-          customerBillUnchanged: true
-        };
-      }
-
-      const res = await assignTarget(targetId);
-      if (!res.ok) {
-        if (isWalletAssignFailure(res.assign)) {
-          return {
-            success: false,
-            code: 'SHIPROCKET_WALLET_OR_BALANCE',
-            message: res.assign.message,
-            details: res.assign.details || res.assign.raw || null,
-            customerBillUnchanged: true
-          };
-        }
-        return {
-          success: false,
-          code: res.assign.code || 'ASSIGN_AWB_FAILED',
-          message: res.assign.message || 'Shiprocket assign AWB failed',
-          details: res.assign.details || res.assign.raw || null,
-          suggestedCourier: suggested,
-          availableCouriers: available.slice(0, 15).map(mapCourierPublic),
-          customerBillUnchanged: true
-        };
-      }
-      const substituted =
-        quoted.courierId == null || Number(targetId) !== Number(quoted.courierId);
-      return finishSuccess({
-        assign: res.assign,
-        courierId: targetId,
-        courierName: res.assign.courier || courierName,
-        substituted,
-        substituteMeta: substituted
-          ? {
-              courierAssignNote: buildCourierSubstituteNote({
-                quotedId: quoted.courierId,
-                quotedName: quoted.courierName,
-                assignedId: targetId,
-                assignedName: res.assign.courier || courierName || String(targetId),
-                reason
-              }),
-              courierSubstitutedFromId: quoted.courierId,
-              courierSubstitutedFromName: quoted.courierName
-            }
-          : null
+      return unavailablePayload({
+        message:
+          (result.lastAssign?.message ? `${result.lastAssign.message} ` : '') +
+          (result.empty || !result.suggested
+            ? 'No other active courier is available via API for this route — assign from the Shiprocket panel. Customer order total is not changed.'
+            : 'Could not assign a substitute courier. Confirm another option or use the Shiprocket panel.'),
+        quoted,
+        suggested: result.suggested || null,
+        available,
+        freightCap,
+        details: result.lastAssign?.details || result.lastAssign?.raw || null,
+        assignCode: result.lastAssign?.code || 'NO_SUBSTITUTE_COURIER'
       });
     }
 
@@ -454,7 +578,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
     if (quoted.courierId != null) {
       if (isCourierInactive({ id: quoted.courierId, name: quoted.courierName })) {
         await ensureRates();
-        const suggested = suggestedFromRates();
+        const suggested = suggestedFromRates([quoted.courierId]);
         return unavailablePayload({
           message: `Checkout courier "${quoted.courierName || quoted.courierId}" is inactive in our shipping policy. Confirm a substitute (customer bill unchanged), or assign from the Shiprocket panel.`,
           quoted,
@@ -495,7 +619,7 @@ async function runShiprocketAssignAwb(order, opts = {}) {
       }
 
       await ensureRates();
-      const suggested = suggestedFromRates();
+      const suggested = suggestedFromRates([quoted.courierId]);
       logger.warn('[Shiprocket] Quoted assign failed; offering substitute', {
         orderId: order.orderId,
         quotedCourierId: quoted.courierId,
@@ -504,6 +628,20 @@ async function runShiprocketAssignAwb(order, opts = {}) {
         suggestedCourierId: suggested?.courierId || null,
         freightCap
       });
+
+      if (!suggested) {
+        return unavailablePayload({
+          message:
+            `${direct.assign.message || `Could not assign checkout courier "${quoted.courierName || quoted.courierId}".`} ` +
+            'No other active courier is available via API for this route — assign from the Shiprocket panel. Customer order total is not changed.',
+          quoted,
+          suggested: null,
+          available,
+          freightCap,
+          details: direct.assign.details || direct.assign.raw || null,
+          assignCode: direct.assign.code || 'NO_SUBSTITUTE_COURIER'
+        });
+      }
 
       const gapNote =
         suggested?.exceedsQuotedFreight && suggested.freightGapInr != null

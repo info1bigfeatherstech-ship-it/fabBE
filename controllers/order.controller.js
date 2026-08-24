@@ -1325,6 +1325,16 @@ exports.createOrder = async (req, res) => {
                     Number.isFinite(Number(quote.shippingMeta.courierCompanyId))
                         ? Number(quote.shippingMeta.courierCompanyId)
                         : null,
+                shipmozoCourierId:
+                    quote.shippingMeta?.shipmozoCourierId != null &&
+                    Number.isFinite(Number(quote.shippingMeta.shipmozoCourierId))
+                        ? Number(quote.shippingMeta.shipmozoCourierId)
+                        : null,
+                shippingProvider: quote.shippingMeta?.shippingProvider || null,
+                pickupsAutomaticallyScheduled:
+                    quote.shippingMeta?.pickupsAutomaticallyScheduled != null
+                        ? Boolean(quote.shippingMeta.pickupsAutomaticallyScheduled)
+                        : null,
                 isDeliverable: true,
                 codAvailable: quote.shippingMeta?.codAvailable !== false,
                 freightInr:
@@ -1336,7 +1346,14 @@ exports.createOrder = async (req, res) => {
                     quote.shippingMeta?.codFeeInr != null &&
                     Number.isFinite(Number(quote.shippingMeta.codFeeInr))
                         ? roundMoney2(Number(quote.shippingMeta.codFeeInr))
-                        : null
+                        : null,
+                originalDeliveryCharges:
+                    quote.shippingMeta?.originalDeliveryCharges != null &&
+                    Number.isFinite(Number(quote.shippingMeta.originalDeliveryCharges))
+                        ? roundMoney2(Number(quote.shippingMeta.originalDeliveryCharges))
+                        : null,
+                freeShippingApplied: Boolean(quote.shippingMeta?.freeShippingApplied),
+                freeShippingOffer: quote.shippingMeta?.freeShippingOffer || null
             }
         };
 
@@ -1541,6 +1558,43 @@ exports.createOrder = async (req, res) => {
             appliedCoupon: appliedCouponCode
                 ? { code: appliedCouponCode, discount }
                 : { code: null, discount: 0 },
+            appliedFreeShippingOffer: (() => {
+                const fs =
+                    priced.freeShippingOffer ||
+                    priced.deliveryMeta?.freeShippingOffer ||
+                    quote.shippingMeta?.freeShippingOffer ||
+                    null;
+                const applied = Boolean(
+                    priced.freeShippingApplied ||
+                        priced.deliveryMeta?.freeShippingApplied ||
+                        quote.shippingMeta?.freeShippingApplied
+                );
+                if (!applied || !fs) {
+                    return {
+                        offerId: null,
+                        name: null,
+                        minCartValue: null,
+                        originalDeliveryCharges: null
+                    };
+                }
+                const orig =
+                    priced.originalDeliveryCharges != null
+                        ? roundMoney2(Number(priced.originalDeliveryCharges))
+                        : priced.deliveryMeta?.originalDeliveryCharges != null
+                          ? roundMoney2(Number(priced.deliveryMeta.originalDeliveryCharges))
+                          : quote.shippingMeta?.originalDeliveryCharges != null
+                            ? roundMoney2(Number(quote.shippingMeta.originalDeliveryCharges))
+                            : null;
+                return {
+                    offerId: fs.offerId || null,
+                    name: fs.name || null,
+                    minCartValue:
+                        fs.minCartValue != null && Number.isFinite(Number(fs.minCartValue))
+                            ? roundMoney2(Number(fs.minCartValue))
+                            : null,
+                    originalDeliveryCharges: orig
+                };
+            })(),
             paymentInfo: {
                 method: normalizedPaymentMethod,
                 status: 'initiated',
@@ -1564,7 +1618,26 @@ exports.createOrder = async (req, res) => {
                         ? Boolean(pricedShip.pickupsAutomaticallyScheduled)
                         : quoteShip.pickupsAutomaticallyScheduled != null
                           ? Boolean(quoteShip.pickupsAutomaticallyScheduled)
-                          : null
+                          : null,
+                freightInr:
+                    priced.deliveryMeta?.freightInr != null &&
+                    Number.isFinite(Number(priced.deliveryMeta.freightInr))
+                        ? roundMoney2(Number(priced.deliveryMeta.freightInr))
+                        : quoteShip.freightInr != null && Number.isFinite(Number(quoteShip.freightInr))
+                          ? roundMoney2(Number(quoteShip.freightInr))
+                          : null,
+                codFeeInr:
+                    priced.deliveryMeta?.codFeeInr != null &&
+                    Number.isFinite(Number(priced.deliveryMeta.codFeeInr))
+                        ? roundMoney2(Number(priced.deliveryMeta.codFeeInr))
+                        : quoteShip.codFeeInr != null && Number.isFinite(Number(quoteShip.codFeeInr))
+                          ? roundMoney2(Number(quoteShip.codFeeInr))
+                          : null,
+                freeShippingApplied: Boolean(
+                    priced.freeShippingApplied ||
+                        priced.deliveryMeta?.freeShippingApplied ||
+                        quoteShip.freeShippingApplied
+                )
             },
             shippingWeightSnapshot
         };

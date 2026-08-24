@@ -295,6 +295,14 @@ const orderSchema = new mongoose.Schema(
         discount: { type: Number, default: 0 }
     },
 
+    /** Auto free-shipping offer applied at checkout (not a coupon code) */
+    appliedFreeShippingOffer: {
+      offerId: { type: String, default: null },
+      name: { type: String, default: null },
+      minCartValue: { type: Number, default: null },
+      originalDeliveryCharges: { type: Number, default: null }
+    },
+
     /** Snapshot from checkout quote — quote courier at order time */
     shippingSnapshot: {
       courierName: { type: String, default: null },
@@ -305,7 +313,11 @@ const orderSchema = new mongoose.Schema(
       shipmozoCourierId: { type: Number, default: null },
       /** Provider that produced this quote */
       provider: { type: String, enum: ['shiprocket', 'shipmozo', null], default: null },
-      pickupsAutomaticallyScheduled: { type: Boolean, default: null }
+      pickupsAutomaticallyScheduled: { type: Boolean, default: null },
+      /** Original courier freight (for substitute margin when customer deliveryCharges was waived) */
+      freightInr: { type: Number, default: null },
+      codFeeInr: { type: Number, default: null },
+      freeShippingApplied: { type: Boolean, default: false }
     },
 
     /** Package weight/dims sent to Shiprocket at checkout (frozen at order place) */

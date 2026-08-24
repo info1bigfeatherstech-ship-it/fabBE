@@ -111,12 +111,37 @@ function testSubstituteNote() {
   assert.ok(/Customer bill unchanged/i.test(note));
 }
 
+function testPickCheapestExcludesIds() {
+  withEnv({ SHIPROCKET_INACTIVE_COURIER_IDS: '' }, () => {
+    const picked = pickCheapestActiveCourier(
+      [
+        { courier_company_id: 10, courier_name: 'Quoted Fail', rate: 30 },
+        { courier_company_id: 20, courier_name: 'Alt Cheap', rate: 35 },
+        { courier_company_id: 30, courier_name: 'Alt Mid', rate: 50 }
+      ],
+      { codRequired: false, maxCharge: 40, excludeCourierIds: [10] }
+    );
+    assert.ok(picked);
+    assert.strictEqual(picked.courierCompanyId, 20);
+    assert.notStrictEqual(picked.courierCompanyId, 10);
+
+    const none = pickCheapestActiveCourier(
+      [
+        { courier_company_id: 10, courier_name: 'Only One', rate: 30 }
+      ],
+      { excludeCourierIds: [10] }
+    );
+    assert.strictEqual(none, null);
+  });
+}
+
 function run() {
   testNoDefaultNameBlocksWhenEnvUnset();
   testNamePatternBlockOnlyWhenEnvSet();
   testInactiveById();
   testPickCheapestSkipsInactive();
   testPickCheapestRespectsMaxCharge();
+  testPickCheapestExcludesIds();
   testSubstituteNote();
   console.log('All courier policy tests passed.');
 }

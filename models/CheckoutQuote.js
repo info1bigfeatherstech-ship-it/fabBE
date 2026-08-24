@@ -26,7 +26,18 @@ const checkoutQuoteSchema = new mongoose.Schema(
       pickupsAutomaticallyScheduled: { type: Boolean, default: null },
       codAvailable: { type: Boolean, default: true },
       message: { type: String, default: null },
-      mock: { type: Boolean, default: false }
+      mock: { type: Boolean, default: false },
+      /** Courier split — admin/RTO/fulfillment; not shown as customer charge */
+      freightInr: { type: Number, default: null },
+      codFeeInr: { type: Number, default: null },
+      /** Pre-waiver customer delivery (freight+COD fee) for UI strikethrough */
+      originalDeliveryCharges: { type: Number, default: null },
+      freeShippingApplied: { type: Boolean, default: false },
+      freeShippingOffer: {
+        offerId: { type: String, default: null },
+        name: { type: String, default: null },
+        minCartValue: { type: Number, default: null }
+      }
     },
 
     totalWeightKg: { type: Number, default: null },

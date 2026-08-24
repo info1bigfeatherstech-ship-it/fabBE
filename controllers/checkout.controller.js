@@ -20,6 +20,9 @@ const {
   buildRequestLogContext
 } = require('../utils/checkoutFlow');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const {
+  evaluateFreeShippingForSubtotal
+} = require('../services/freeShippingOffer.service');
 const { pricingUserTypeForStorefront } = require('../utils/accountScope');
 const {
   isAdvanceBalanceCodCheckout,
@@ -54,6 +57,43 @@ function allowDemoMockShipping(req) {
   return true;
 }
 
+/** Storefront-safe free-shipping fields from computeCheckoutTotals / deliveryMeta. */
+function buildFreeShippingClientFields(finalTotals) {
+  const meta = finalTotals?.deliveryMeta || {};
+  const applied = Boolean(finalTotals?.freeShippingApplied || meta.freeShippingApplied);
+  const originalDeliveryCharges =
+    finalTotals?.originalDeliveryCharges != null &&
+    Number.isFinite(Number(finalTotals.originalDeliveryCharges))
+      ? roundMoney2(Number(finalTotals.originalDeliveryCharges))
+      : meta.originalDeliveryCharges != null && Number.isFinite(Number(meta.originalDeliveryCharges))
+        ? roundMoney2(Number(meta.originalDeliveryCharges))
+        : null;
+  const freightInr =
+    meta.freightInr != null && Number.isFinite(Number(meta.freightInr))
+      ? roundMoney2(Number(meta.freightInr))
+      : null;
+  const codFeeInr =
+    meta.codFeeInr != null && Number.isFinite(Number(meta.codFeeInr))
+      ? roundMoney2(Number(meta.codFeeInr))
+      : null;
+  const offer = finalTotals?.freeShippingOffer || meta.freeShippingOffer || null;
+  return {
+    freeShippingApplied: applied,
+    freeShippingOffer: applied && offer
+      ? {
+          name: offer.name || null,
+          minCartValue:
+            offer.minCartValue != null && Number.isFinite(Number(offer.minCartValue))
+              ? roundMoney2(Number(offer.minCartValue))
+              : null
+        }
+      : null,
+    originalDeliveryCharges: applied ? originalDeliveryCharges : null,
+    originalFreightInr: applied ? freightInr : null,
+    originalCodFeeInr: applied ? codFeeInr : null
+  };
+}
+
 /**
  * @param {'cod_full'|'online'|'advance_balance_cod'} shiprocketPricingMode — how Shiprocket COD amount is derived for quotes
  * @param {number|null} advancePercentForBalanceCod — admin advance % when mode is advance_balance_cod
@@ -78,7 +118,26 @@ async function buildFinalTotals({
       null,
       { consumeUsage: false }
     );
-    const deliveryCharges = roundMoney2(35 + Math.floor(Math.random() * 56));
+    let deliveryCharges = roundMoney2(35 + Math.floor(Math.random() * 56));
+    const originalDeliveryCharges = deliveryCharges;
+    const freightInr = deliveryCharges;
+    const codFeeInr = 0;
+    let freeShippingApplied = false;
+    let freeShippingOfferMeta = null;
+    try {
+      const fsEval = await evaluateFreeShippingForSubtotal({ itemsSubtotal: evaluated.subtotal });
+      if (fsEval.applied && fsEval.offer) {
+        freeShippingApplied = true;
+        freeShippingOfferMeta = {
+          offerId: String(fsEval.offer._id),
+          name: fsEval.offer.name,
+          minCartValue: fsEval.minCartValue
+        };
+        deliveryCharges = 0;
+      }
+    } catch (_) {
+      /* fail closed */
+    }
     const tax = calculateTax(evaluated.lines);
     const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
     return {
@@ -88,13 +147,21 @@ async function buildFinalTotals({
       deliveryCharges,
       tax,
       totalAmount,
+      freeShippingApplied,
+      freeShippingOffer: freeShippingOfferMeta,
+      originalDeliveryCharges,
       deliveryMeta: {
         estimatedDays: String(2 + Math.floor(Math.random() * 3)) + '-5',
         courierName: 'Demo courier (Shiprocket off)',
         courierCompanyId: null,
         isDeliverable: true,
         codAvailable: true,
-        mock: true
+        mock: true,
+        freightInr,
+        codFeeInr,
+        originalDeliveryCharges,
+        freeShippingApplied,
+        freeShippingOffer: freeShippingOfferMeta
       }
     };
   }
@@ -320,7 +387,8 @@ exports.quoteCheckout = async (req, res) => {
         taxes: finalTotals.tax,
         amountPayable: finalTotals.totalAmount,
         includesShippingAndHandling: true,
-        couponApplied: finalTotals.appliedCouponCode
+        couponApplied: finalTotals.appliedCouponCode,
+        ...buildFreeShippingClientFields(finalTotals)
       });
     }
 
@@ -394,7 +462,15 @@ exports.quoteCheckout = async (req, res) => {
         codFeeInr:
           finalTotals.deliveryMeta?.codFeeInr != null
             ? roundMoney2(Number(finalTotals.deliveryMeta.codFeeInr))
-            : null
+            : null,
+        originalDeliveryCharges:
+          finalTotals.originalDeliveryCharges != null
+            ? roundMoney2(Number(finalTotals.originalDeliveryCharges))
+            : finalTotals.deliveryMeta?.originalDeliveryCharges != null
+              ? roundMoney2(Number(finalTotals.deliveryMeta.originalDeliveryCharges))
+              : null,
+        freeShippingApplied: Boolean(finalTotals.freeShippingApplied),
+        freeShippingOffer: finalTotals.freeShippingOffer || null
       },
       totalWeightKg: finalTotals.totalWeight,
       dims: finalTotals.dims,
@@ -435,7 +511,8 @@ exports.quoteCheckout = async (req, res) => {
       couponApplied: finalTotals.appliedCouponCode,
       quoteExpiresAt: quoteExpiresAt.toISOString(),
       cartFingerprint: fp,
-      demoMockShipping: Boolean(allowDemoMockShipping(req))
+      demoMockShipping: Boolean(allowDemoMockShipping(req)),
+      ...buildFreeShippingClientFields(finalTotals)
     });
   } catch (err) {
     if (err.statusCode) {
@@ -666,7 +743,8 @@ exports.confirmCheckout = async (req, res) => {
         promotionDiscount: recomputed.discount,
         deliveryCharges: recomputed.deliveryCharges,
         taxes: recomputed.tax,
-        amountPayable: recomputed.totalAmount
+        amountPayable: recomputed.totalAmount,
+        ...buildFreeShippingClientFields(recomputed)
       },
       next: {
         createOrderEndpoint: '/api/orders/items',

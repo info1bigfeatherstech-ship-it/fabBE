@@ -108,15 +108,26 @@ function filterActiveCouriers(couriers) {
  * Pick cheapest active courier (same logic as ShiprocketService.pickRecommendedCourierId).
  * When maxCharge is set, prefer cheapest with rate <= maxCharge; else overall cheapest.
  * @param {Array<object>} couriers
- * @param {{ codRequired?: boolean, maxCharge?: number|null }} [opts]
+ * @param {{ codRequired?: boolean, maxCharge?: number|null, excludeCourierIds?: Iterable<number>|number|null }} [opts]
  * @returns {{ courier: object, courierCompanyId: number, courierName: string, rate: number }|null}
  */
 function pickCheapestActiveCourier(couriers, opts = {}) {
   const active = filterActiveCouriers(couriers);
   if (!active.length) return null;
 
+  const exclude = new Set();
+  const rawExclude = opts.excludeCourierIds;
+  if (rawExclude != null) {
+    const list = rawExclude instanceof Set ? [...rawExclude] : Array.isArray(rawExclude) ? rawExclude : [rawExclude];
+    for (const id of list) {
+      if (id == null || id === '') continue;
+      const n = Number(id);
+      if (Number.isFinite(n)) exclude.add(n);
+    }
+  }
+
   const needCod = Boolean(opts.codRequired);
-  const filtered = needCod
+  let filtered = needCod
     ? active.filter(
         (c) =>
           c.cod === 1 ||
@@ -125,9 +136,17 @@ function pickCheapestActiveCourier(couriers, opts = {}) {
           c.is_cod_available === true
       )
     : active;
-  const pool = filtered.length ? filtered : active;
+  if (!filtered.length) filtered = active;
 
-  const scored = pool.map((c) => {
+  if (exclude.size) {
+    filtered = filtered.filter((c) => {
+      const id = getCourierCompanyIdFromRow(c);
+      return id == null || !exclude.has(Number(id));
+    });
+  }
+  if (!filtered.length) return null;
+
+  const scored = filtered.map((c) => {
     const rate = Number(c.rate ?? c.freight_charge ?? Infinity);
     const etd = Number(c.estimated_delivery_days ?? c.etd ?? c.etd_hours ?? 999);
     return { c, rate: Number.isFinite(rate) ? rate : Infinity, etd: Number.isFinite(etd) ? etd : 999 };

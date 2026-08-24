@@ -25,6 +25,9 @@ const {
 } = require('../utils/variantCatalogFields');
 const { overlayExternalStockOnProducts } = require('./inventoryStockOverlay.service');
 const { normalizeProductCode } = require('../utils/productCode');
+const {
+  evaluateFreeShippingForSubtotal
+} = require('./freeShippingOffer.service');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -359,7 +362,30 @@ async function computeCheckoutTotals({
       codFeeInr:
         baseOverride.codFeeInr != null && Number.isFinite(Number(baseOverride.codFeeInr))
           ? roundMoney2(Number(baseOverride.codFeeInr))
-          : null
+          : null,
+      originalDeliveryCharges:
+        baseOverride.originalDeliveryCharges != null &&
+        Number.isFinite(Number(baseOverride.originalDeliveryCharges))
+          ? roundMoney2(Number(baseOverride.originalDeliveryCharges))
+          : roundMoney2(Number(deliveryCharges) || 0),
+      freeShippingApplied: Boolean(baseOverride.freeShippingApplied),
+      freeShippingOffer: baseOverride.freeShippingOffer || null
+    };
+
+    const tax = calculateTax(evaluated.lines);
+    const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
+    return {
+      ...evaluated,
+      lines: evaluated.lines,
+      discount,
+      appliedCouponCode,
+      deliveryCharges,
+      deliveryMeta,
+      tax,
+      totalAmount,
+      freeShippingApplied: Boolean(baseOverride.freeShippingApplied),
+      freeShippingOffer: baseOverride.freeShippingOffer || null,
+      originalDeliveryCharges: deliveryMeta.originalDeliveryCharges
     };
   } else {
     const ship = await checkDeliveryAvailabilityForActiveProvider(postalCode, {
@@ -414,6 +440,48 @@ async function computeCheckoutTotals({
     };
   }
 
+  // Auto free-shipping offer: waive customer-billed delivery (freight + COD fee bundled).
+  // Keep original courier splits on deliveryMeta for admin / RTO / fulfillment margin.
+  const originalDeliveryCharges = roundMoney2(Number(deliveryCharges) || 0);
+  let freeShippingApplied = false;
+  let freeShippingOfferMeta = null;
+  try {
+    // Threshold uses items subtotal only (before shipping; coupon discount does not change eligibility).
+    const fsEval = await evaluateFreeShippingForSubtotal({
+      itemsSubtotal: evaluated.subtotal
+    });
+    if (fsEval.applied && fsEval.offer) {
+      freeShippingApplied = true;
+      freeShippingOfferMeta = {
+        offerId: String(fsEval.offer._id),
+        name: fsEval.offer.name,
+        minCartValue: fsEval.minCartValue
+      };
+      deliveryCharges = 0;
+      deliveryMeta = {
+        ...deliveryMeta,
+        originalDeliveryCharges,
+        freeShippingApplied: true,
+        freeShippingOffer: freeShippingOfferMeta
+      };
+    } else {
+      deliveryMeta = {
+        ...deliveryMeta,
+        originalDeliveryCharges,
+        freeShippingApplied: false,
+        freeShippingOffer: null
+      };
+    }
+  } catch (fsErr) {
+    // Fail closed: keep charged shipping if offer evaluation throws.
+    deliveryMeta = {
+      ...deliveryMeta,
+      originalDeliveryCharges,
+      freeShippingApplied: false,
+      freeShippingOffer: null
+    };
+  }
+
   const tax = calculateTax(evaluated.lines);
   const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
 
@@ -425,7 +493,10 @@ async function computeCheckoutTotals({
     deliveryCharges,
     deliveryMeta,
     tax,
-    totalAmount
+    totalAmount,
+    freeShippingApplied,
+    freeShippingOffer: freeShippingOfferMeta,
+    originalDeliveryCharges
   };
 }
 
