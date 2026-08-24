@@ -1595,6 +1595,26 @@ exports.createOrder = async (req, res) => {
                     originalDeliveryCharges: orig
                 };
             })(),
+            appliedFreeGiftOffer: (() => {
+                const fg =
+                    priced.freeGiftOffer ||
+                    quote.freeGiftOffer ||
+                    null;
+                const applied = Boolean(
+                    priced.freeGiftApplied ||
+                    quote.freeGiftApplied
+                );
+                if (!applied || !fg) {
+                    return { offerId: null, name: null, adminGiftLabel: null, adminGiftLabelSetAt: null, adminGiftLabelSetBy: null };
+                }
+                return {
+                    offerId: fg.offerId || null,
+                    name: fg.name || null,
+                    adminGiftLabel: null,
+                    adminGiftLabelSetAt: null,
+                    adminGiftLabelSetBy: null
+                };
+            })(),
             paymentInfo: {
                 method: normalizedPaymentMethod,
                 status: 'initiated',

@@ -138,6 +138,18 @@ async function buildFinalTotals({
     } catch (_) {
       /* fail closed */
     }
+    let freeGiftApplied = false;
+    let freeGiftOfferMeta = null;
+    try {
+      const { evaluateFreeGiftForOrder: evalFG } = require('../services/freeGiftOffer.service');
+      const fgEval = await evalFG();
+      if (fgEval.applied && fgEval.offer) {
+        freeGiftApplied = true;
+        freeGiftOfferMeta = { offerId: String(fgEval.offer._id), name: fgEval.offer.name };
+      }
+    } catch (_) {
+      /* fail closed */
+    }
     const tax = calculateTax(evaluated.lines);
     const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
     return {
@@ -150,6 +162,8 @@ async function buildFinalTotals({
       freeShippingApplied,
       freeShippingOffer: freeShippingOfferMeta,
       originalDeliveryCharges,
+      freeGiftApplied,
+      freeGiftOffer: freeGiftOfferMeta,
       deliveryMeta: {
         estimatedDays: String(2 + Math.floor(Math.random() * 3)) + '-5',
         courierName: 'Demo courier (Shiprocket off)',
@@ -472,6 +486,8 @@ exports.quoteCheckout = async (req, res) => {
         freeShippingApplied: Boolean(finalTotals.freeShippingApplied),
         freeShippingOffer: finalTotals.freeShippingOffer || null
       },
+      freeGiftApplied: Boolean(finalTotals.freeGiftApplied),
+      freeGiftOffer: finalTotals.freeGiftOffer || null,
       totalWeightKg: finalTotals.totalWeight,
       dims: finalTotals.dims,
       status: 'active',
@@ -512,7 +528,11 @@ exports.quoteCheckout = async (req, res) => {
       quoteExpiresAt: quoteExpiresAt.toISOString(),
       cartFingerprint: fp,
       demoMockShipping: Boolean(allowDemoMockShipping(req)),
-      ...buildFreeShippingClientFields(finalTotals)
+      ...buildFreeShippingClientFields(finalTotals),
+      freeGiftApplied: Boolean(finalTotals.freeGiftApplied),
+      freeGiftOffer: finalTotals.freeGiftApplied && finalTotals.freeGiftOffer
+        ? { name: finalTotals.freeGiftOffer.name || null }
+        : null
     });
   } catch (err) {
     if (err.statusCode) {
@@ -744,7 +764,11 @@ exports.confirmCheckout = async (req, res) => {
         deliveryCharges: recomputed.deliveryCharges,
         taxes: recomputed.tax,
         amountPayable: recomputed.totalAmount,
-        ...buildFreeShippingClientFields(recomputed)
+        ...buildFreeShippingClientFields(recomputed),
+        freeGiftApplied: Boolean(recomputed.freeGiftApplied),
+        freeGiftOffer: recomputed.freeGiftApplied && recomputed.freeGiftOffer
+          ? { name: recomputed.freeGiftOffer.name || null }
+          : null
       },
       next: {
         createOrderEndpoint: '/api/orders/items',

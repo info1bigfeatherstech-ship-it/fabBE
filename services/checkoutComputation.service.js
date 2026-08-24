@@ -28,6 +28,9 @@ const { normalizeProductCode } = require('../utils/productCode');
 const {
   evaluateFreeShippingForSubtotal
 } = require('./freeShippingOffer.service');
+const {
+  evaluateFreeGiftForOrder
+} = require('./freeGiftOffer.service');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -485,6 +488,24 @@ async function computeCheckoutTotals({
   const tax = calculateTax(evaluated.lines);
   const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
 
+  // Auto free-gift offer: independent of free shipping. Applies to every order when live.
+  let freeGiftApplied = false;
+  let freeGiftOfferMeta = null;
+  try {
+    const fgEval = await evaluateFreeGiftForOrder();
+    if (fgEval.applied && fgEval.offer) {
+      freeGiftApplied = true;
+      freeGiftOfferMeta = {
+        offerId: String(fgEval.offer._id),
+        name: fgEval.offer.name
+      };
+    }
+  } catch (fgErr) {
+    // Fail closed: no gift applied on error — does not affect pricing.
+    freeGiftApplied = false;
+    freeGiftOfferMeta = null;
+  }
+
   return {
     ...evaluated,
     lines: evaluated.lines,
@@ -496,7 +517,9 @@ async function computeCheckoutTotals({
     totalAmount,
     freeShippingApplied,
     freeShippingOffer: freeShippingOfferMeta,
-    originalDeliveryCharges
+    originalDeliveryCharges,
+    freeGiftApplied,
+    freeGiftOffer: freeGiftOfferMeta
   };
 }
 

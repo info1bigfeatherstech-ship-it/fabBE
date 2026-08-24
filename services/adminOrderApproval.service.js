@@ -160,6 +160,23 @@ async function runAdminApproveOrderSingle(orderId, opts = {}) {
       };
     }
 
+    // Free-gift gate: if this order received a free-gift offer, admin must have recorded a gift label first.
+    const hasGiftOffer = Boolean(
+      order.appliedFreeGiftOffer?.offerId || order.appliedFreeGiftOffer?.name
+    );
+    if (hasGiftOffer) {
+      const giftLabel = String(order.appliedFreeGiftOffer?.adminGiftLabel || '').trim();
+      if (!giftLabel) {
+        return {
+          orderId: id,
+          success: false,
+          skipped: false,
+          code: 'GIFT_LABEL_REQUIRED',
+          message: 'This order includes a free gift. Please record the gift name/number before confirming.'
+        };
+      }
+    }
+
     order.orderStatus = 'confirmed';
     order.paymentInfo = order.paymentInfo || {};
     order.paymentInfo.adminConfirmedAt = new Date();

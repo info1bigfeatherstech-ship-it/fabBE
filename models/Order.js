@@ -303,6 +303,16 @@ const orderSchema = new mongoose.Schema(
       originalDeliveryCharges: { type: Number, default: null }
     },
 
+    /** Auto free-gift offer applied at checkout — every order qualifies when offer is live. */
+    appliedFreeGiftOffer: {
+      offerId: { type: String, default: null },
+      name: { type: String, default: null },
+      /** Admin-only: name/number of the actual gift dispatched. Never sent to storefront. */
+      adminGiftLabel: { type: String, default: null },
+      adminGiftLabelSetAt: { type: Date, default: null },
+      adminGiftLabelSetBy: { type: mongoose.Schema.Types.Mixed, default: null }
+    },
+
     /** Snapshot from checkout quote — quote courier at order time */
     shippingSnapshot: {
       courierName: { type: String, default: null },

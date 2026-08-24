@@ -40,6 +40,13 @@ const checkoutQuoteSchema = new mongoose.Schema(
       }
     },
 
+    /** Free-gift offer snapshot stored at quote time */
+    freeGiftOffer: {
+      offerId: { type: String, default: null },
+      name: { type: String, default: null }
+    },
+    freeGiftApplied: { type: Boolean, default: false },
+
     totalWeightKg: { type: Number, default: null },
     dims: {
       lengthCm: { type: Number, default: null },
