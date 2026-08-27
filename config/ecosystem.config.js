@@ -28,7 +28,7 @@
 
 // module.exports = {
 //   apps: [{
-//     name: 'ecommerce-api',
+//     name: 'fabuniqo-api',
 //     script: './index.js',
 //     cwd: __dirname.replace(/[\\/]config$/, ''),
 //     instances: resolvedInstances,
@@ -92,7 +92,7 @@ const prodEnv = {
 
 module.exports = {
   apps: [{
-    name: 'ecommerce-api',
+    name: 'fabuniqo-api',
     script: './index.js',
     cwd: __dirname.replace(/[\\/]config$/, ''),
     instances: resolvedInstances,

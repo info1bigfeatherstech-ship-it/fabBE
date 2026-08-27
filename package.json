@@ -15,10 +15,10 @@
     "start:dev": "cross-env NODE_ENV=development node index.js",
     "build": "npm install",
     "pm2:start": "pm2 start config/ecosystem.config.js --env production",
-    "pm2:stop": "pm2 stop ecommerce-api",
-    "pm2:restart": "pm2 restart ecommerce-api",
-    "pm2:reload": "pm2 reload ecommerce-api",
-    "pm2:logs": "pm2 logs ecommerce-api",
+    "pm2:stop": "pm2 stop fabuniqo-api",
+    "pm2:restart": "pm2 restart fabuniqo-api",
+    "pm2:reload": "pm2 reload fabuniqo-api",
+    "pm2:logs": "pm2 logs fabuniqo-api",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {

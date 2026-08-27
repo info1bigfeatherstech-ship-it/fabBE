@@ -449,6 +449,13 @@ app.post(
   orderController.shiprocketWebhook
 );
 
+// Shipmozo status webhooks (separate from Shiprocket — never share the same handler)
+app.post(
+  '/api/orders/shipping/shipmozo/webhook',
+  express.json({ limit: '1mb' }),
+  orderController.shipmozoWebhook
+);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan(IS_PRODUCTION ? 'combined' : 'dev'));

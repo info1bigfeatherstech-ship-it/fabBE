@@ -2501,6 +2501,57 @@ exports.shiprocketWebhook = async (req, res) => {
     }
 };
 
+// ========== SHIPMOZO WEBHOOK (Shipmozo orders only — does not touch Shiprocket) ==========
+exports.shipmozoWebhook = async (req, res) => {
+    try {
+        const {
+            processShipmozoWebhook,
+            extractShipmozoWebhookToken
+        } = require('../services/shipmozoWebhook.service');
+
+        const configuredToken = String(process.env.SHIPMOZO_WEBHOOK_TOKEN || '').trim();
+        const incomingToken = extractShipmozoWebhookToken(req);
+        if (configuredToken && incomingToken !== configuredToken) {
+            return respondOrderError(
+                res,
+                401,
+                'SHIPMOZO_WEBHOOK_UNAUTHORIZED',
+                'Invalid Shipmozo webhook token'
+            );
+        }
+
+        const result = await processShipmozoWebhook(req.body || {});
+        const httpStatus = Number(result.httpStatus) || (result.success ? 200 : 500);
+
+        if (!result.success) {
+            return respondOrderError(
+                res,
+                httpStatus,
+                result.code || 'SHIPMOZO_WEBHOOK_FAILED',
+                result.message || 'Failed to process Shipmozo webhook'
+            );
+        }
+
+        return res.status(httpStatus).json({
+            success: true,
+            ignored: Boolean(result.ignored),
+            cancelled: Boolean(result.cancelled),
+            code: result.code || null,
+            message: result.message || 'OK',
+            orderId: result.orderId || null,
+            matchedBy: result.matchedBy || null,
+            currentProviderStatus: result.currentProviderStatus || null,
+            currentOrderStatus: result.currentOrderStatus || null
+        });
+    } catch (error) {
+        logger.error('Shipmozo webhook error', {
+            message: error.message,
+            stack: error.stack
+        });
+        return respondOrderError(res, 500, 'SHIPMOZO_WEBHOOK_FAILED', 'Failed to process Shipmozo webhook');
+    }
+};
+
 // ========== PAY REMAINING BALANCE (after advance) ==========
 exports.payOrderBalance = async (req, res) => {
     try {
