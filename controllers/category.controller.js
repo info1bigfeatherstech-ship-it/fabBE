@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Category = require('../models/Category');
 const Product = require('../models/Product');
 const slugify = require('slugify');
@@ -421,6 +422,78 @@ const deleteCategory = async (req, res) => {
   }
 };
 
+const hardDeleteCategory = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid category id'
+      });
+    }
+
+    const category = await Category.findById(id);
+    if (!category) {
+      return res.status(404).json({
+        success: false,
+        message: 'Category not found'
+      });
+    }
+
+    if (category.status === 'active') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only inactive categories can be permanently deleted. Hide the category first.'
+      });
+    }
+
+    const childCount = await Category.countDocuments({ parent: id });
+    if (childCount > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot permanently delete category. ${childCount} subcategory(ies) still exist.`
+      });
+    }
+
+    const productCount = await Product.countDocuments({ category: id });
+    if (productCount > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot permanently delete category. ${productCount} product(s) are still linked to this category.`
+      });
+    }
+
+    const previousPublicId = category.image?.publicId;
+    const deletedSnapshot = category.toObject();
+
+    await Category.findByIdAndDelete(id);
+
+    if (previousPublicId) {
+      try {
+        await deleteFromCloudinary(previousPublicId);
+      } catch (mediaErr) {
+        console.error('Category media cleanup failed:', mediaErr.message);
+      }
+    }
+
+    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Category permanently deleted',
+      category: deletedSnapshot
+    });
+  } catch (error) {
+    console.error('Hard delete category error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error permanently deleting category',
+      error: error.message
+    });
+  }
+};
+
 const reorderCategories = async (req, res) => {
   try {
     const { categories } = req.body;
@@ -542,6 +615,7 @@ module.exports = {
   createCategory,
   updateCategory,
   deleteCategory,
+  hardDeleteCategory,
   reorderCategories,
   toggleCategoryVisibility,
   getAllCategoriesAdmin,

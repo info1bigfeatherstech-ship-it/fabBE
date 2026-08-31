@@ -18,6 +18,7 @@ router.get('/admin/categories/all', verifyToken, authorizeRoles('admin', 'produc
 // Admin category endpoints
 router.post('/admin/categories', verifyToken, authorizeRoles('admin', 'product_manager'), uploadSingleImage, categoryController.createCategory);
 router.put('/admin/categories/:id', verifyToken, authorizeRoles('admin', 'product_manager'), uploadSingleImage, categoryController.updateCategory);
+router.delete('/admin/categories/:id/hard', verifyToken, authorizeRoles('admin', 'product_manager'), categoryController.hardDeleteCategory);
 router.delete('/admin/categories/:id', verifyToken, authorizeRoles('admin', 'product_manager'), categoryController.deleteCategory);
 
 module.exports = router;
