@@ -38,6 +38,19 @@ class CacheInvalidationService {
     logger.info(`[Invalidation] Order placed, invalidated ${count} analytics cache`);
     return count;
   }
+
+  /** Call when marketing tags (ProductTag) are created/updated/removed. */
+  async onProductTagChange(productIds = []) {
+    const patterns = [
+      `${cacheConfig.prefixes.PRODUCT}:*`,
+      `${cacheConfig.prefixes.SEARCH}:*`,
+    ];
+    const count = await cacheService.forgetMany(patterns);
+    logger.info(
+      `[Invalidation] Product tags changed (${Array.isArray(productIds) ? productIds.length : 0} products), invalidated ${count} cache entries`
+    );
+    return count;
+  }
 }
 
 module.exports = new CacheInvalidationService();

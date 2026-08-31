@@ -15,6 +15,10 @@ const {
   overlayExternalStockOnProducts,
   overlayExternalStockOnProduct
 } = require('../services/inventoryStockOverlay.service');
+const {
+  normalizeTagSlugs,
+  buildTagFilterClause,
+} = require('../utils/productTagQuery');
 
 const storefrontFrom = (req) => req.storefront || 'ecomm';
 const useWholesalePricing = (storefront) => storefront === 'wholesale';
@@ -197,65 +201,28 @@ const getProducts = async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.max(1, parseInt(req.query.limit) || 12);
     const skip = (page - 1) * limit;
-    const allProducts = await Product.find({}).lean();
 
-console.table(
-  allProducts.map((p) => ({
-    name: p.name,
-    sale: p.variants?.[0]?.price?.sale,
-    base: p.variants?.[0]?.price?.base,
-  }))
-);
-    // ✅ normalize tag (on_sale → on-sale)
-    const normalizeTag = (tag) => tag.replace(/_/g, '-');
+    const tagsFilter = normalizeTagSlugs(req.query.tags);
 
-    const tagsRaw = req.query.tags;
-    const tagsFilter = tagsRaw
-      ? String(tagsRaw)
-          .split(',')
-          .map(t => normalizeTag(t.trim()))
-          .filter(Boolean)
-      : [];
-
-
-    // ✅ category filter
     const storefront = storefrontFrom(req);
     const currentUserType = req.userType || "user";
-      // category filter
-    if (req.query.category) {
-      const categoryDoc = await Category.findOne({
-        slug: String(req.query.category).toLowerCase(),
-      }).select("_id");
 
-      if (categoryDoc) {
-        extraClauses.push({ category: categoryDoc._id });
-      }
-    }
-
-    // featured filter
-    if (req.query.featured === "true") {
-      extraClauses.push({ isFeatured: true });
-    }
     const extraClauses = [];
+
     if (req.query.category) {
       const cat = await Category.findOne({
         slug: String(req.query.category).toLowerCase()
       }).select('_id');
       if (cat) extraClauses.push({ category: cat._id });
     }
-    if (req.query.featured === 'true') extraClauses.push({ isFeatured: true });
 
-    // tag filter
+    if (req.query.featured === 'true') {
+      extraClauses.push({ isFeatured: true });
+    }
+
     if (tagsFilter.length > 0) {
-      const taggedProducts = await ProductTag.find({
-        tags: { $in: tagsFilter },
-      })
-        .select("product")
-        .lean({ virtuals: true });
-
-      const taggedProductIds = taggedProducts.map((item) => item.product);
-
-      if (!taggedProductIds.length) {
+      const tagClause = await buildTagFilterClause(tagsFilter);
+      if (!tagClause) {
         return res.json({
           success: true,
           pagination: {
@@ -270,10 +237,7 @@ console.table(
           appliedTags: tagsFilter,
         });
       }
-
-      extraClauses.push({
-        _id: { $in: taggedProductIds },
-      });
+      extraClauses.push(tagClause);
     }
 
     // search
@@ -483,15 +447,7 @@ const searchProducts= async (req, res) => {
     const currentStorefront = storefrontFrom(req);
 
     // tags
-    const normalizeTag = (tag) => tag.replace(/_/g, "-");
-
-    const tagsRaw = req.query.tags;
-    const tagsFilter = tagsRaw
-      ? String(tagsRaw)
-          .split(",")
-          .map((t) => normalizeTag(t.trim()))
-          .filter(Boolean)
-      : [];
+    const tagsFilter = normalizeTagSlugs(req.query.tags);
 
     const cacheKey = cacheConfig.generateKey("SEARCH", {
       v: "code-prefix-v2",
@@ -551,17 +507,9 @@ const searchProducts= async (req, res) => {
 
     // tag filter
     if (tagsFilter.length > 0) {
-      const taggedProducts = await ProductTag.find({
-        tags: { $in: tagsFilter },
-      })
-        .select("product")
-        .lean();
+      const tagClause = await buildTagFilterClause(tagsFilter);
 
-      const taggedProductIds = taggedProducts.map(
-        (item) => item.product
-      );
-
-      if (!taggedProductIds.length) {
+      if (!tagClause) {
         return res.json({
           success: true,
           total: 0,
@@ -574,9 +522,7 @@ const searchProducts= async (req, res) => {
         });
       }
 
-      extraClauses.push({
-        _id: { $in: taggedProductIds },
-      });
+      extraClauses.push(tagClause);
     }
 
     const filters = mongoCatalogAnd(
@@ -651,15 +597,7 @@ const getProductsByCategory = async (req, res) => {
     const currentStorefront = storefrontFrom(req);
 
     // tags
-    const normalizeTag = (tag) => tag.replace(/_/g, "-");
-
-    const tagsRaw = req.query.tags;
-    const tagsFilter = tagsRaw
-      ? String(tagsRaw)
-          .split(",")
-          .map((t) => normalizeTag(t.trim()))
-          .filter(Boolean)
-      : [];
+    const tagsFilter = normalizeTagSlugs(req.query.tags);
 
     const cacheKey = cacheConfig.generateKey("PRODUCT", {
       categorySlug: slug,
@@ -704,17 +642,9 @@ const getProductsByCategory = async (req, res) => {
 
     // tag filter
     if (tagsFilter.length > 0) {
-      const taggedProducts = await ProductTag.find({
-        tags: { $in: tagsFilter },
-      })
-        .select("product")
-        .lean();
+      const tagClause = await buildTagFilterClause(tagsFilter);
 
-      const taggedProductIds = taggedProducts.map(
-        (item) => item.product
-      );
-
-      if (!taggedProductIds.length) {
+      if (!tagClause) {
         return res.json({
           success: true,
           total: 0,
@@ -728,25 +658,13 @@ const getProductsByCategory = async (req, res) => {
         });
       }
 
-      extraClauses.push({
-        _id: { $in: taggedProductIds },
-      });
+      extraClauses.push(tagClause);
     }
 
     const filters = mongoCatalogAnd(
       currentStorefront,
       ...extraClauses
     );
-
-    // ✅ ADD THIS — tags filter using ProductTag lookup
-    if (tagsFilter.length > 0) {
-      const taggedProducts = await ProductTag.find({
-        tags: { $in: tagsFilter }
-      }).select('product').lean();
-
-      const taggedProductIds = taggedProducts.map(t => t.product);
-      filters._id = { $in: taggedProductIds };
-    }
 
     const total = await Product.countDocuments(filters);
 

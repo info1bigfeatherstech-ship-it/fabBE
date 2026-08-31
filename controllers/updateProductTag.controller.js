@@ -1,12 +1,10 @@
 const Product = require("../models/Product");
 const ProductTag = require("../models/ProductTag");
+const cacheInvalidation = require("../services/cacheInvalidation.service");
+const { mongoCatalogAnd } = require("../utils/storefrontCatalog");
+const { MARKETING_TAG_SLUGS } = require("../utils/productTagQuery");
 
-const CONTROLLED_FLAGS = [
-  "today-arrival",
-  "on-sale",
-  "jewellery-spotted",
-  "bestselling-jewelry",
-];
+const CONTROLLED_FLAGS = MARKETING_TAG_SLUGS;
 
 async function updateProductTagController(req, res) {
   try {
@@ -55,7 +53,7 @@ async function updateProductTagController(req, res) {
 
     const products = await Product.find({
       slug: { $in: normalizedSlugs },
-    }).select("_id slug");
+    }).select("_id slug channelStatus status");
 
     if (!products.length) {
       return res.status(404).json({
@@ -88,6 +86,30 @@ async function updateProductTagController(req, res) {
       })
     );
 
+    const productIds = products.map((p) => p._id);
+
+    try {
+      await cacheInvalidation.onProductTagChange(productIds);
+    } catch (cacheErr) {
+      // Non-fatal: tags were persisted; storefront cache may be briefly stale.
+      console.error("Product tag cache invalidation failed:", cacheErr.message);
+    }
+
+    const notStorefrontVisible = [];
+    if (value === true) {
+      for (const product of products) {
+        const liveCount = await Product.countDocuments(
+          mongoCatalogAnd("ecomm", { _id: product._id })
+        );
+        if (!liveCount) {
+          notStorefrontVisible.push({
+            slug: product.slug,
+            reason: "Product is not live on the ecomm storefront (inactive channel or no visible variants).",
+          });
+        }
+      }
+    }
+
     return res.status(200).json({
       success: true,
       message: "Flag updated successfully",
@@ -95,6 +117,7 @@ async function updateProductTagController(req, res) {
       value,
       updatedCount: results.length,
       slugs: products.map((p) => p.slug),
+      notStorefrontVisible,
     });
   } catch (error) {
     console.error("updateProductTag error:", error);
