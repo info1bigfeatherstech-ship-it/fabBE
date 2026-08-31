@@ -16,6 +16,7 @@ class CacheConfig {
       
       // Category endpoints
       CATEGORY_LIST: 1800,      // 30 minutes
+      CATEGORY_MOVING_FAST: 180, // 3 minutes — backup TTL; writes invalidate immediately
       CATEGORY_DETAIL: 1800,    // 30 minutes
       
       // Analytics endpoints (admin only)

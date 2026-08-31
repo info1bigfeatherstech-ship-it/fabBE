@@ -50,7 +50,20 @@ const categorySchema = new mongoose.Schema(
     order: {
       type: Number,
       default: 0
-    }
+    },
+
+    /** Homepage "Moving Fast" section (max 4 active categories). */
+    showInMovingFast: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    /** Display order within Moving Fast (0–3). */
+    movingFastOrder: {
+      type: Number,
+      default: 0,
+    },
   },
   { timestamps: true }
 );

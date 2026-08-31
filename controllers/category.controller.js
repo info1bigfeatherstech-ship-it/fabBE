@@ -12,6 +12,13 @@ const {
 const cacheService = require('../services/cache.service');
 const cacheConfig = require('../config/cache.config');
 const { setApiCacheHeaders } = require('../utils/apiCacheHeaders');
+const {
+  MOVING_FAST_MAX,
+  assignMovingFastOrder,
+  assertMovingFastCapacity,
+  categoryHasDisplayImage,
+} = require('../utils/categoryMovingFast');
+const { invalidateCategoryCaches } = require('../utils/categoryCache');
 
 /** Category tiles / headers: slightly tighter cap than product gallery (override via env). */
 const CATEGORY_IMAGE_MAX_WIDTH = Math.min(
@@ -136,6 +143,53 @@ const getAllCategories = async (req, res) => {
       success: false,
       message: 'Error fetching categories',
       error: error.message
+    });
+  }
+};
+
+// =============================================
+// GET /categories/moving-fast - WITH CACHE
+// =============================================
+const getMovingFastCategories = async (req, res) => {
+  try {
+    const bypassCache = req.query._cb === '1';
+    const cacheKey = cacheConfig.generateKey('CATEGORY', { movingFast: true });
+
+    const cachedData = bypassCache ? null : await cacheService.get(cacheKey);
+    if (cachedData) {
+      res.setHeader('X-Cache', 'HIT');
+      setApiCacheHeaders(res);
+      return res.status(200).json(cachedData);
+    }
+
+    const categories = await Category.find({
+      status: 'active',
+      showInMovingFast: true,
+    })
+      .sort({ movingFastOrder: 1, order: 1, name: 1 })
+      .limit(MOVING_FAST_MAX)
+      .lean();
+
+    const withImages = categories.filter(categoryHasDisplayImage);
+
+    const responseData = {
+      success: true,
+      count: withImages.length,
+      max: MOVING_FAST_MAX,
+      categories: withImages,
+    };
+
+    await cacheService.set(cacheKey, responseData, cacheConfig.ttl.CATEGORY_MOVING_FAST);
+
+    res.setHeader('X-Cache', 'MISS');
+    setApiCacheHeaders(res);
+    return res.status(200).json(responseData);
+  } catch (error) {
+    console.error('Get moving fast categories error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error fetching moving fast categories',
+      error: error.message,
     });
   }
 };
@@ -272,7 +326,7 @@ const createCategory = async (req, res) => {
     await category.save();
 
     //  INVALIDATE CATEGORY CACHE AFTER CREATE
-    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+    await invalidateCategoryCaches(category._id);
 
     return res.status(201).json({
       success: true,
@@ -302,6 +356,11 @@ const updateCategory = async (req, res) => {
     if (description !== undefined) category.description = description;
     if (order !== undefined) category.order = order;
     if (status) category.status = status;
+
+    if (category.status === 'inactive') {
+      category.showInMovingFast = false;
+      category.movingFastOrder = 0;
+    }
 
     if (parent) {
       const p = await Category.findById(parent);
@@ -334,10 +393,14 @@ const updateCategory = async (req, res) => {
       }
     }
 
+    if (category.showInMovingFast && !categoryHasDisplayImage(category)) {
+      category.showInMovingFast = false;
+      category.movingFastOrder = 0;
+    }
+
     await category.save();
 
-    //  INVALIDATE CATEGORY CACHE AFTER UPDATE
-    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+    await invalidateCategoryCaches(category._id);
 
     return res.status(200).json({ success: true, message: 'Category updated', category });
   } catch (error) {
@@ -391,6 +454,8 @@ const deleteCategory = async (req, res) => {
     const previousPublicId = category.image?.publicId;
     category.status = 'inactive';
     category.showInMenu = false;
+    category.showInMovingFast = false;
+    category.movingFastOrder = 0;
     category.image = { url: '', publicId: '' };
     await category.save();
 
@@ -404,7 +469,7 @@ const deleteCategory = async (req, res) => {
     }
 
     //  INVALIDATE CATEGORY CACHE AFTER DELETE
-    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+    await invalidateCategoryCaches(category._id);
 
     return res.status(200).json({
       success: true,
@@ -477,7 +542,7 @@ const hardDeleteCategory = async (req, res) => {
       }
     }
 
-    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+    await invalidateCategoryCaches(category._id);
 
     return res.status(200).json({
       success: true,
@@ -515,7 +580,7 @@ const reorderCategories = async (req, res) => {
     await Category.bulkWrite(bulkOps);
 
     //  INVALIDATE CATEGORY CACHE AFTER REORDER
-    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+    await invalidateCategoryCaches(category._id);
 
     const updatedCategories = await Category.find()
       .sort({ order: 1, name: 1 })
@@ -550,10 +615,14 @@ const toggleCategoryVisibility = async (req, res) => {
     }
 
     category.status = isHidden ? 'inactive' : 'active';
+    if (isHidden) {
+      category.showInMovingFast = false;
+      category.movingFastOrder = 0;
+    }
     await category.save();
 
     //  INVALIDATE CATEGORY CACHE AFTER TOGGLE
-    await cacheService.forget(`${cacheConfig.prefixes.CATEGORY}:*`);
+    await invalidateCategoryCaches(category._id);
 
     return res.status(200).json({
       success: true,
@@ -566,6 +635,79 @@ const toggleCategoryVisibility = async (req, res) => {
       success: false,
       message: 'Error toggling category visibility',
       error: error.message
+    });
+  }
+};
+
+const toggleCategoryMovingFast = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { showInMovingFast } = req.body;
+
+    if (typeof showInMovingFast !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'showInMovingFast must be a boolean',
+      });
+    }
+
+    const category = await Category.findById(id);
+    if (!category) {
+      return res.status(404).json({
+        success: false,
+        message: 'Category not found',
+      });
+    }
+
+    if (showInMovingFast && category.status !== 'active') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only active categories can appear in Moving Fast. Show the category first.',
+      });
+    }
+
+    if (showInMovingFast && !categoryHasDisplayImage(category)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Upload a category image before adding it to Moving Fast.',
+      });
+    }
+
+    if (showInMovingFast) {
+      if (!category.showInMovingFast) {
+        await assertMovingFastCapacity(category._id);
+        await assignMovingFastOrder(category);
+        category.showInMovingFast = true;
+      }
+    } else {
+      category.showInMovingFast = false;
+      category.movingFastOrder = 0;
+    }
+
+    await category.save();
+
+    await invalidateCategoryCaches(category._id);
+
+    return res.status(200).json({
+      success: true,
+      message: category.showInMovingFast
+        ? 'Category added to Moving Fast'
+        : 'Category removed from Moving Fast',
+      category,
+    });
+  } catch (error) {
+    if (error?.statusCode === 400) {
+      return res.status(400).json({
+        success: false,
+        message: error.message,
+        code: error.code || 'MOVING_FAST_ERROR',
+      });
+    }
+    console.error('Toggle moving fast category error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error updating Moving Fast category',
+      error: error.message,
     });
   }
 };
@@ -611,6 +753,7 @@ const getAllCategoriesAdmin = async (req, res) => {
 
 module.exports = {
   getAllCategories,
+  getMovingFastCategories,
   getCategoryById,
   createCategory,
   updateCategory,
@@ -618,6 +761,7 @@ module.exports = {
   hardDeleteCategory,
   reorderCategories,
   toggleCategoryVisibility,
+  toggleCategoryMovingFast,
   getAllCategoriesAdmin,
   getAdminAllCategories
 };
