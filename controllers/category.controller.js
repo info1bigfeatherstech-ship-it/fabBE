@@ -562,25 +562,63 @@ const hardDeleteCategory = async (req, res) => {
 const reorderCategories = async (req, res) => {
   try {
     const { categories } = req.body;
-    
+
     if (!categories || !Array.isArray(categories)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid request. Expected { categories: [{ id, order }] }"
+        message: 'Invalid request. Expected { categories: [{ id, order }] }',
       });
     }
 
-    const bulkOps = categories.map(cat => ({
-      updateOne: {
-        filter: { _id: cat.id },
-        update: { order: cat.order }
+    if (categories.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'At least one category is required to reorder',
+      });
+    }
+
+    const bulkOps = [];
+    const seenIds = new Set();
+
+    for (const cat of categories) {
+      const id = cat?.id ?? cat?._id;
+      const idStr = id != null ? String(id) : '';
+
+      if (!idStr || !mongoose.Types.ObjectId.isValid(idStr)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid category id: ${idStr || 'missing'}`,
+        });
       }
-    }));
+
+      if (seenIds.has(idStr)) {
+        return res.status(400).json({
+          success: false,
+          message: `Duplicate category id in reorder payload: ${idStr}`,
+        });
+      }
+      seenIds.add(idStr);
+
+      const order = cat?.order;
+      if (typeof order !== 'number' || !Number.isFinite(order) || order < 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid order for category ${idStr}. Expected a non-negative number.`,
+        });
+      }
+
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: idStr },
+          update: { order: Math.floor(order) },
+        },
+      });
+    }
 
     await Category.bulkWrite(bulkOps);
 
-    //  INVALIDATE CATEGORY CACHE AFTER REORDER
-    await invalidateCategoryCaches(category._id);
+    // Reorder affects the full category list — no single category scope.
+    await invalidateCategoryCaches();
 
     const updatedCategories = await Category.find()
       .sort({ order: 1, name: 1 })
@@ -588,15 +626,15 @@ const reorderCategories = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Categories reordered successfully",
-      categories: updatedCategories
+      message: 'Categories reordered successfully',
+      categories: updatedCategories,
     });
   } catch (error) {
     console.error('Reorder categories error:', error);
     return res.status(500).json({
       success: false,
       message: 'Error reordering categories',
-      error: error.message
+      error: error.message,
     });
   }
 };
