@@ -4713,6 +4713,47 @@ const updateProduct = async (req, res) => {
         variant.minimumOrderQuantity = moq;
       }
 
+      // Apply price (incl. wholesaleBase) before channelVisibility so same-request
+      // wholesale ON + base price + visibility active validates against new values.
+      if (updates.price !== undefined) {
+        const parsedPrice = parseIfString(updates.price, {});
+        const base =
+          parsedPrice.base !== undefined
+            ? Number(parsedPrice.base)
+            : variant.price.base;
+        const sale =
+          parsedPrice.sale !== undefined
+            ? parsedPrice.sale != null
+              ? Number(parsedPrice.sale)
+              : null
+            : variant.price.sale;
+
+        if (isNaN(base) || base <= 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Variant base price must be a number greater than 0"
+          });
+        }
+        if (sale != null && (isNaN(sale) || sale >= base)) {
+          return res.status(400).json({
+            success: false,
+            message: "Sale price must be less than base price"
+          });
+        }
+
+        variant.price.base = base;
+        variant.price.sale = sale;
+
+        if (parsedPrice.wholesaleBase !== undefined) {
+          variant.price.wholesaleBase =
+            parsedPrice.wholesaleBase != null ? Number(parsedPrice.wholesaleBase) : null;
+        }
+        if (parsedPrice.wholesaleSale !== undefined) {
+          variant.price.wholesaleSale =
+            parsedPrice.wholesaleSale != null ? Number(parsedPrice.wholesaleSale) : null;
+        }
+      }
+
       const activeFlag =
         updates.variantIsActive !== undefined ? updates.variantIsActive : updates.isActive;
       if (activeFlag !== undefined) {
@@ -4751,45 +4792,6 @@ const updateProduct = async (req, res) => {
         variant.attributes = Array.isArray(parsed)
           ? parsed.filter((a) => a && a.key && a.value).map((a) => ({ key: a.key, value: a.value }))
           : [];
-      }
-
-      if (updates.price !== undefined) {
-        const parsedPrice = parseIfString(updates.price, {});
-        const base =
-          parsedPrice.base !== undefined
-            ? Number(parsedPrice.base)
-            : variant.price.base;
-        const sale =
-          parsedPrice.sale !== undefined
-            ? parsedPrice.sale != null
-              ? Number(parsedPrice.sale)
-              : null
-            : variant.price.sale;
-
-        if (isNaN(base) || base <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Variant base price must be a number greater than 0"
-          });
-        }
-        if (sale != null && (isNaN(sale) || sale >= base)) {
-          return res.status(400).json({
-            success: false,
-            message: "Sale price must be less than base price"
-          });
-        }
-
-        variant.price.base = base;
-        variant.price.sale = sale;
-
-        if (parsedPrice.wholesaleBase !== undefined) {
-          variant.price.wholesaleBase =
-            parsedPrice.wholesaleBase != null ? Number(parsedPrice.wholesaleBase) : null;
-        }
-        if (parsedPrice.wholesaleSale !== undefined) {
-          variant.price.wholesaleSale =
-            parsedPrice.wholesaleSale != null ? Number(parsedPrice.wholesaleSale) : null;
-        }
       }
 
       if (updates.inventory !== undefined) {
