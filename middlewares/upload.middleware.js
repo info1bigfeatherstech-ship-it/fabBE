@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');  // ✅ ADD THIS - Required for file system operations
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+/** Category tile + banner uploads (banner designs are often larger). */
+const MAX_CATEGORY_IMAGE_BYTES = 10 * 1024 * 1024;
 const RETURN_PROOF_MAX_BYTES = 60 * 1024 * 1024;
 
 // ===============================
@@ -39,9 +41,20 @@ const imageUpload = multer({
   limits: { fileSize: MAX_IMAGE_BYTES }
 });
 
+const categoryImageUpload = multer({
+  storage: imageStorage,
+  fileFilter: imageFileFilter,
+  limits: { fileSize: MAX_CATEGORY_IMAGE_BYTES, files: 4 },
+});
+
 const uploadProductImages = imageUpload.any();
 const uploadSingleImage = imageUpload.single('image');
-                
+
+/**
+ * Category admin uploads — `.any()` so both `image` and `bannerImage` are accepted.
+ * Max 10 MB per file (banner-friendly). Controller picks files by `fieldname`.
+ */
+const uploadCategoryImages = categoryImageUpload.any();
 
 // ===============================
 // CSV / EXCEL UPLOAD
@@ -220,6 +233,7 @@ const uploadLabelLogoFile = labelLogoUpload.single('logo');
 module.exports = {
   uploadProductImages,
   uploadSingleImage,
+  uploadCategoryImages,
   uploadCSVFile,
   uploadBulkNewProductFiles,
   uploadWholesalerProofs,

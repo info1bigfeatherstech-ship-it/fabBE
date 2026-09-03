@@ -22,7 +22,14 @@ const categorySchema = new mongoose.Schema(
       default: ''
     },
 
+    /** Card / tile / Moving Fast thumbnail (usually square or portrait). */
     image: {
+      url: { type: String, default: '' },
+      publicId: { type: String, default: '' }
+    },
+
+    /** Category PLP page banner background (wide landscape, e.g. ~5:1). */
+    bannerImage: {
       url: { type: String, default: '' },
       publicId: { type: String, default: '' }
     },

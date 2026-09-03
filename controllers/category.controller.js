@@ -26,6 +26,12 @@ const CATEGORY_IMAGE_MAX_WIDTH = Math.min(
   Math.max(400, Number(process.env.CATEGORY_IMAGE_MAX_WIDTH) || 1200)
 );
 
+/** Wide PLP banner backgrounds (override via env). */
+const CATEGORY_BANNER_IMAGE_MAX_WIDTH = Math.min(
+  3200,
+  Math.max(800, Number(process.env.CATEGORY_BANNER_IMAGE_MAX_WIDTH) || 2400)
+);
+
 function getCategoryImageOptimizeOptions() {
   const opts = { maxWidth: CATEGORY_IMAGE_MAX_WIDTH };
   const q = process.env.CATEGORY_IMAGE_WEBP_QUALITY;
@@ -35,19 +41,71 @@ function getCategoryImageOptimizeOptions() {
   return opts;
 }
 
+function getCategoryBannerImageOptimizeOptions() {
+  const opts = { maxWidth: CATEGORY_BANNER_IMAGE_MAX_WIDTH };
+  const q = process.env.CATEGORY_BANNER_IMAGE_WEBP_QUALITY || process.env.CATEGORY_IMAGE_WEBP_QUALITY;
+  if (q !== undefined && q !== '' && !Number.isNaN(Number(q))) {
+    opts.quality = Math.min(100, Math.max(50, Number(q)));
+  }
+  return opts;
+}
+
+function getUploadedFile(req, fieldName) {
+  if (!req) return null;
+
+  // multer.any() → req.files is an array of files with fieldname
+  if (Array.isArray(req.files)) {
+    return req.files.find((f) => f && f.fieldname === fieldName) || null;
+  }
+
+  // multer.fields() → req.files is a map of field → file[]
+  const fromFields = req.files?.[fieldName];
+  if (Array.isArray(fromFields) && fromFields[0]) return fromFields[0];
+
+  // multer.single('image') legacy
+  if (fieldName === 'image' && req.file) return req.file;
+  return null;
+}
+
+function isTruthyFlag(value) {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'true' || normalized === '1' || normalized === 'yes';
+  }
+  return false;
+}
+
+async function safeDeleteCloudinary(publicId) {
+  if (!publicId) return;
+  try {
+    await deleteFromCloudinary(publicId);
+  } catch (mediaErr) {
+    console.error('Category media cleanup failed:', mediaErr.message);
+  }
+}
+
 /**
- * EXIF-safe resize, WebP encode, upload to Cloudinary `categories` folder with a stable public_id.
+ * Optimize + upload category tile OR banner via shared media helper.
+ * Provider is NEVER hardcoded: follows MEDIA_PROVIDER_DEFAULT / MEDIA_STORAGE_MODE
+ * (cloudinary | r2) — same path as product images. `kind` only affects resize + publicId tag.
  * @param {Buffer} buffer — multer memory buffer
- * @param {{ nameHint: string, uniqueSuffix: string }} meta
+ * @param {{ nameHint: string, uniqueSuffix: string, kind?: 'image' | 'banner' }} meta
  */
-async function processAndUploadCategoryImage(buffer, { nameHint, uniqueSuffix }) {
+async function processAndUploadCategoryImage(buffer, { nameHint, uniqueSuffix, kind = 'image' }) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw new Error('Invalid or empty image buffer');
   }
-  const optimized = await optimizeProductImageBuffer(buffer, getCategoryImageOptimizeOptions());
-  const base = slugify(String(nameHint || 'category'), { lower: true, strict: true }).slice(0, 72);
+  const isBanner = kind === 'banner';
+  const optimized = await optimizeProductImageBuffer(
+    buffer,
+    isBanner ? getCategoryBannerImageOptimizeOptions() : getCategoryImageOptimizeOptions()
+  );
+  const base = slugify(String(nameHint || 'category'), { lower: true, strict: true }).slice(0, 60);
   const suffix = String(uniqueSuffix || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '');
-  const publicId = `${base}-${suffix}`.slice(0, 120);
+  const kindTag = isBanner ? 'banner' : 'tile';
+  const publicId = `${base}-${kindTag}-${suffix}`.slice(0, 120);
+  // Env-driven: cloudinary or r2 — identical for tile + banner
   return uploadToCloudinary(optimized, 'categories', publicId);
 }
 
@@ -306,11 +364,21 @@ const createCategory = async (req, res) => {
       category.level = 0;
     }
 
-    if (req.file && req.file.buffer) {
+    console.info('[category.create] multipart', {
+      fileCount: Array.isArray(req.files) ? req.files.length : 0,
+      files: Array.isArray(req.files)
+        ? req.files.map((f) => `${f.fieldname}:${f.mimetype}:${f.size}`)
+        : [],
+      contentType: req.headers['content-type'],
+    });
+
+    const tileFile = getUploadedFile(req, 'image');
+    if (tileFile?.buffer) {
       try {
-        const { url, publicId } = await processAndUploadCategoryImage(req.file.buffer, {
+        const { url, publicId } = await processAndUploadCategoryImage(tileFile.buffer, {
           nameHint: name,
-          uniqueSuffix: `${Date.now()}`
+          uniqueSuffix: `${Date.now()}`,
+          kind: 'image',
         });
         category.image = { url, publicId };
       } catch (err) {
@@ -318,6 +386,25 @@ const createCategory = async (req, res) => {
         return res.status(400).json({
           success: false,
           message: 'Category image could not be processed or uploaded',
+          error: err.message
+        });
+      }
+    }
+
+    const bannerFile = getUploadedFile(req, 'bannerImage');
+    if (bannerFile?.buffer) {
+      try {
+        const { url, publicId } = await processAndUploadCategoryImage(bannerFile.buffer, {
+          nameHint: name,
+          uniqueSuffix: `${Date.now()}`,
+          kind: 'banner',
+        });
+        category.bannerImage = { url, publicId };
+      } catch (err) {
+        console.error('Category banner image upload failed:', err.message);
+        return res.status(400).json({
+          success: false,
+          message: 'Category banner image could not be processed or uploaded',
           error: err.message
         });
       }
@@ -347,10 +434,22 @@ const createCategory = async (req, res) => {
 const updateCategory = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, parent, order, status } = req.body;
+    const { name, description, parent, order, status, clearBannerImage, clearImage } = req.body;
 
     const category = await Category.findById(id);
     if (!category) return res.status(404).json({ success: false, message: 'Category not found' });
+
+    const receivedFields = Array.isArray(req.files)
+      ? req.files.map((f) => `${f.fieldname}:${f.mimetype}:${f.size}`)
+      : Object.keys(req.files || {});
+    // Always log — silent missing files was hard to debug in admin.
+    console.info('[category.update] multipart', {
+      id,
+      fileCount: Array.isArray(req.files) ? req.files.length : receivedFields.length,
+      files: receivedFields,
+      hasBannerFlag: Boolean(req.body?.clearBannerImage),
+      contentType: req.headers['content-type'],
+    });
 
     if (name) category.name = name;
     if (description !== undefined) category.description = description;
@@ -371,17 +470,21 @@ const updateCategory = async (req, res) => {
       category.level = 0;
     }
 
-    if (req.file && req.file.buffer) {
+    const displayName = name || category.name;
+    const tileFile = getUploadedFile(req, 'image');
+    const bannerFile = getUploadedFile(req, 'bannerImage');
+
+    if (tileFile?.buffer) {
       try {
-        const displayName = name || category.name;
-        const { url, publicId } = await processAndUploadCategoryImage(req.file.buffer, {
+        const { url, publicId } = await processAndUploadCategoryImage(tileFile.buffer, {
           nameHint: displayName,
-          uniqueSuffix: `${String(id)}-${Date.now()}`
+          uniqueSuffix: `${String(id)}-${Date.now()}`,
+          kind: 'image',
         });
         const previousPublicId = category.image?.publicId;
         category.image = { url, publicId };
         if (previousPublicId && previousPublicId !== publicId) {
-          await deleteFromCloudinary(previousPublicId);
+          await safeDeleteCloudinary(previousPublicId);
         }
       } catch (err) {
         console.error('Category image upload failed:', err.message);
@@ -391,6 +494,40 @@ const updateCategory = async (req, res) => {
           error: err.message
         });
       }
+    } else if (isTruthyFlag(clearImage)) {
+      const previousPublicId = category.image?.publicId;
+      category.image = { url: '', publicId: '' };
+      await safeDeleteCloudinary(previousPublicId);
+      if (category.showInMovingFast) {
+        category.showInMovingFast = false;
+        category.movingFastOrder = 0;
+      }
+    }
+
+    if (bannerFile?.buffer) {
+      try {
+        const { url, publicId } = await processAndUploadCategoryImage(bannerFile.buffer, {
+          nameHint: displayName,
+          uniqueSuffix: `${String(id)}-${Date.now()}`,
+          kind: 'banner',
+        });
+        const previousPublicId = category.bannerImage?.publicId;
+        category.bannerImage = { url, publicId };
+        if (previousPublicId && previousPublicId !== publicId) {
+          await safeDeleteCloudinary(previousPublicId);
+        }
+      } catch (err) {
+        console.error('Category banner image upload failed:', err.message);
+        return res.status(400).json({
+          success: false,
+          message: 'Category banner image could not be processed or uploaded',
+          error: err.message
+        });
+      }
+    } else if (isTruthyFlag(clearBannerImage)) {
+      const previousPublicId = category.bannerImage?.publicId;
+      category.bannerImage = { url: '', publicId: '' };
+      await safeDeleteCloudinary(previousPublicId);
     }
 
     if (category.showInMovingFast && !categoryHasDisplayImage(category)) {
@@ -452,21 +589,17 @@ const deleteCategory = async (req, res) => {
     }
 
     const previousPublicId = category.image?.publicId;
+    const previousBannerPublicId = category.bannerImage?.publicId;
     category.status = 'inactive';
     category.showInMenu = false;
     category.showInMovingFast = false;
     category.movingFastOrder = 0;
     category.image = { url: '', publicId: '' };
+    category.bannerImage = { url: '', publicId: '' };
     await category.save();
 
-    if (previousPublicId) {
-      try {
-        await deleteFromCloudinary(previousPublicId);
-      } catch (mediaErr) {
-        // Non-fatal cleanup error: category state change should still succeed.
-        console.error('Category media cleanup failed:', mediaErr.message);
-      }
-    }
+    await safeDeleteCloudinary(previousPublicId);
+    await safeDeleteCloudinary(previousBannerPublicId);
 
     //  INVALIDATE CATEGORY CACHE AFTER DELETE
     await invalidateCategoryCaches(category._id);
@@ -530,17 +663,13 @@ const hardDeleteCategory = async (req, res) => {
     }
 
     const previousPublicId = category.image?.publicId;
+    const previousBannerPublicId = category.bannerImage?.publicId;
     const deletedSnapshot = category.toObject();
 
     await Category.findByIdAndDelete(id);
 
-    if (previousPublicId) {
-      try {
-        await deleteFromCloudinary(previousPublicId);
-      } catch (mediaErr) {
-        console.error('Category media cleanup failed:', mediaErr.message);
-      }
-    }
+    await safeDeleteCloudinary(previousPublicId);
+    await safeDeleteCloudinary(previousBannerPublicId);
 
     await invalidateCategoryCaches(category._id);
 
