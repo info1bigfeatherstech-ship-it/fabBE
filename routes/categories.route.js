@@ -2,8 +2,13 @@ const express = require('express');
 const router = express.Router();
 const { verifyToken } = require('../middlewares/auth.middleware');
 const { authorizeRoles } = require('../middlewares/authorize-roles.middleware');
-const { uploadCategoryImages } = require('../middlewares/upload.middleware');
+const {
+  uploadCategoryImages,
+  MAX_CATEGORY_IMAGE_BYTES,
+} = require('../middlewares/upload.middleware');
 const categoryController = require('../controllers/category.controller');
+
+const CATEGORY_IMAGE_MAX_MB = Math.round(MAX_CATEGORY_IMAGE_BYTES / (1024 * 1024));
 
 function runCategoryUpload(req, res, next) {
   uploadCategoryImages(req, res, (err) => {
@@ -11,7 +16,7 @@ function runCategoryUpload(req, res, next) {
     const isMulter = err.name === 'MulterError' || err.code === 'LIMIT_FILE_SIZE';
     const message = isMulter
       ? err.code === 'LIMIT_FILE_SIZE'
-        ? 'Image must be under 10 MB'
+        ? `Image must be under ${CATEGORY_IMAGE_MAX_MB} MB`
         : `Upload failed: ${err.message}`
       : err.message || 'Invalid image upload';
     console.error('[category.upload] multer error', {

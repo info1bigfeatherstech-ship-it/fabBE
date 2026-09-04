@@ -4,7 +4,7 @@ const fs = require('fs');  // ✅ ADD THIS - Required for file system operations
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 /** Category tile + banner uploads (banner designs are often larger). */
-const MAX_CATEGORY_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_CATEGORY_IMAGE_BYTES = 20 * 1024 * 1024;
 const RETURN_PROOF_MAX_BYTES = 60 * 1024 * 1024;
 
 // ===============================
@@ -52,7 +52,7 @@ const uploadSingleImage = imageUpload.single('image');
 
 /**
  * Category admin uploads — `.any()` so both `image` and `bannerImage` are accepted.
- * Max 10 MB per file (banner-friendly). Controller picks files by `fieldname`.
+ * Max 20 MB per file (banner-friendly). Controller picks files by `fieldname`.
  */
 const uploadCategoryImages = categoryImageUpload.any();
 
@@ -234,6 +234,7 @@ module.exports = {
   uploadProductImages,
   uploadSingleImage,
   uploadCategoryImages,
+  MAX_CATEGORY_IMAGE_BYTES,
   uploadCSVFile,
   uploadBulkNewProductFiles,
   uploadWholesalerProofs,
