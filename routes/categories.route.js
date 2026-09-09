@@ -33,6 +33,8 @@ function runCategoryUpload(req, res, next) {
 }
 
 // Public category endpoints
+// IMPORTANT: `/categories/moving-fast` MUST be registered before `/categories/:id`,
+// otherwise Express treats "moving-fast" as an ObjectId and returns CastError 500.
 router.get('/categories', categoryController.getAllCategories);
 router.get('/categories/moving-fast', categoryController.getMovingFastCategories);
 router.get('/admin/categories', categoryController.getAdminAllCategories);

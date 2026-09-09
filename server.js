@@ -745,6 +745,11 @@ app.get('/api', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/admin/products', adminProductsRoutes);
+// Explicit Moving Fast path (must not fall through to /categories/:id CastError).
+app.get(
+  '/api/categories/categories/moving-fast',
+  require('./controllers/category.controller').getMovingFastCategories
+);
 app.use('/api/categories', categoriesRoutes);
 app.use('/api/products', productsRoutes);
 app.use('/api/wishlist', wishlistRoutes);

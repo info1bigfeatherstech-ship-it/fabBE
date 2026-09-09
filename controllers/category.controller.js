@@ -259,8 +259,19 @@ const getMovingFastCategories = async (req, res) => {
 const getCategoryById = async (req, res) => {
   try {
     const { id } = req.params;
+    const idStr = String(id || '').trim();
+
+    // Strict 24-hex ObjectId — prevents CastError 500 if a slug like "moving-fast"
+    // ever hits this handler (reserved paths must use dedicated routes first).
+    if (!/^[a-fA-F0-9]{24}$/.test(idStr)) {
+      return res.status(404).json({
+        success: false,
+        message: 'Category not found',
+      });
+    }
+
     // Categories are shared across storefronts; keep one cache key for all panels.
-    const cacheKey = cacheConfig.generateKey('CATEGORY', { id });
+    const cacheKey = cacheConfig.generateKey('CATEGORY', { id: idStr });
 
     //  CHECK CACHE FIRST
     const cachedData = await cacheService.get(cacheKey);
@@ -271,7 +282,7 @@ const getCategoryById = async (req, res) => {
     }
 
     const category = await Category.findOne({
-      _id: id,
+      _id: idStr,
       status: 'active'
     }).lean();
 
@@ -295,6 +306,13 @@ const getCategoryById = async (req, res) => {
     return res.status(200).json(responseData);
 
   } catch (error) {
+    // Invalid ObjectId / cast errors → 404 (never 500 for bad public ids)
+    if (error?.name === 'CastError' || error?.name === 'BSONError') {
+      return res.status(404).json({
+        success: false,
+        message: 'Category not found',
+      });
+    }
     console.error('Get category error:', error);
     return res.status(500).json({
       success: false,
