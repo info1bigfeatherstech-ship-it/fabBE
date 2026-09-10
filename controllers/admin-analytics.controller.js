@@ -943,27 +943,41 @@ const getLeadsPushSettings = async (req, res) => {
 
 const updateLeadsPushSettings = async (req, res) => {
   try {
-    if (req.body?.autoPushEnabled === undefined) {
+    const hasCart = req.body?.autoPushEnabled !== undefined;
+    const hasWishlist = req.body?.autoWishlistPushEnabled !== undefined;
+    if (!hasCart && !hasWishlist) {
       return res.status(400).json({
         success: false,
-        code: 'AUTO_PUSH_ENABLED_REQUIRED',
-        message: 'autoPushEnabled is required',
+        code: 'PUSH_SETTINGS_PATCH_EMPTY',
+        message: 'Provide autoPushEnabled and/or autoWishlistPushEnabled',
       });
     }
 
     const storefront = scopeLabelFromReq(req);
-    const data = await leadsPushSettingsService.updateAutoPushEnabled(
+    const patch = {};
+    if (hasCart) patch.autoPushEnabled = req.body.autoPushEnabled;
+    if (hasWishlist) patch.autoWishlistPushEnabled = req.body.autoWishlistPushEnabled;
+
+    const data = await leadsPushSettingsService.updatePushSettings(
       storefront,
-      req.body.autoPushEnabled,
+      patch,
       req.user?._id || req.userId || null
     );
+
+    const parts = [];
+    if (hasCart) {
+      parts.push(data.autoPushEnabled ? 'Cart auto push on' : 'Cart auto push off');
+    }
+    if (hasWishlist) {
+      parts.push(
+        data.autoWishlistPushEnabled ? 'Wishlist auto push on' : 'Wishlist auto push off'
+      );
+    }
 
     return res.status(200).json({
       success: true,
       scope: storefront,
-      message: data.autoPushEnabled
-        ? 'Auto cart reminder push enabled'
-        : 'Auto cart reminder push disabled',
+      message: parts.join(' · ') || 'Push settings updated',
       data,
     });
   } catch (error) {

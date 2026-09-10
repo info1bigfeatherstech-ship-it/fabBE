@@ -15,6 +15,7 @@ const logger = require('../utils/logger');
 const { findCartForStorefront } = require('./cartStorefront.service');
 const { mergeCustomerStorefrontFilter, normalizeCustomerStorefront } = require('../utils/customerStorefrontScope');
 const { getAppName } = require('../utils/appBrand');
+const { resolveCartPageUrl } = require('../utils/storefrontFrontendUrl');
 
 const ADMIN_CART_PRODUCT_SELECT = 'name title slug variants';
 const ADMIN_CART_POPULATE = [
@@ -45,12 +46,8 @@ function ensureVapidConfigured() {
   vapidConfigured = true;
 }
 
-function getStorefrontCartUrl() {
-  const base = String(process.env.FRONTEND_URL || process.env.STORE_URL || '')
-    .split(',')[0]
-    .trim()
-    .replace(/\/$/, '');
-  return `${base}/account/usercart`;
+function getStorefrontCartUrl(storefront = 'ecomm') {
+  return resolveCartPageUrl(storefront);
 }
 
 function formatInr(amount) {
@@ -91,11 +88,11 @@ function applyPlaceholders(text, vars) {
   return out;
 }
 
-function buildPushPayload({ customerName, cartSummary }) {
+function buildPushPayload({ customerName, cartSummary, storefront = 'ecomm' }) {
   const { itemCount, totalAmount } = cartSummary;
   const itemLabel = itemCount === 1 ? 'item' : 'items';
   const displayName = customerName || 'there';
-  const cartUrl = getStorefrontCartUrl();
+  const cartUrl = getStorefrontCartUrl(storefront);
 
   const vars = {
     name: displayName,
@@ -111,10 +108,12 @@ function buildPushPayload({ customerName, cartSummary }) {
     icon: cartReminderPushTemplate.icon,
     badge: cartReminderPushTemplate.badge,
     tag: cartReminderPushTemplate.tag,
+    ctaLabel: cartReminderPushTemplate.ctaLabel,
     url: cartUrl,
     data: {
       type: 'cart-reminder',
       url: cartUrl,
+      ctaLabel: cartReminderPushTemplate.ctaLabel,
     },
   };
 }
@@ -156,6 +155,7 @@ async function sendPushToSubscription(subscriptionDoc, payload) {
     icon: payload.icon,
     badge: payload.badge,
     tag: payload.tag,
+    ctaLabel: payload.ctaLabel || payload.data?.ctaLabel,
     data: payload.data,
   });
 
@@ -215,6 +215,7 @@ async function sendCartReminderPushToUser({ userId, userName, scopeQuery = {}, e
   const payload = buildPushPayload({
     customerName: userName,
     cartSummary,
+    storefront: sf,
   });
 
   let sent = 0;

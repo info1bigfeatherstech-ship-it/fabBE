@@ -29,6 +29,8 @@ const gracefulShutdown = require('./services/shutdown.service');
 const cleanupService = require('./services/cleanup.service');
 const paymentHoldExpiryService = require('./services/paymentHoldExpiry.service');
 const cartReminderPushScheduler = require('./services/cartReminderPushScheduler.service');
+const wishlistReminderPushScheduler = require('./services/wishlistReminderPushScheduler.service');
+const newProductsDigestScheduler = require('./services/newProductsDigestScheduler.service');
 const rtoStatusSyncScheduler = require('./services/rtoStatusSyncScheduler.service');
 const logger = require('./utils/logger');
 const { CORS_STOREFRONT_ALLOWED_HEADERS } = require('./constants/storefrontHeaders');
@@ -859,9 +861,11 @@ async function startApplication() {
       cleanupService.start();
       paymentHoldExpiryService.start();
       cartReminderPushScheduler.start();
+      wishlistReminderPushScheduler.start();
+      newProductsDigestScheduler.start();
       rtoStatusSyncScheduler.start();
       logger.info(
-        '[Schedulers] cleanup + paymentHold + cartReminderPush + rtoStatusSync started on primary instance'
+        '[Schedulers] cleanup + paymentHold + cartReminderPush + wishlistReminderPush + newProductsDigest + rtoStatusSync started on primary instance'
       );
     } else {
       logger.info('[Schedulers] Skipping cleanup/paymentHold/rtoStatusSync on secondary worker', {
@@ -904,6 +908,14 @@ async function startApplication() {
 
       gracefulShutdown.registerConnection('CartReminderPushScheduler', async () => {
         cartReminderPushScheduler.stop();
+      });
+
+      gracefulShutdown.registerConnection('WishlistReminderPushScheduler', async () => {
+        wishlistReminderPushScheduler.stop();
+      });
+
+      gracefulShutdown.registerConnection('NewProductsDigestScheduler', async () => {
+        newProductsDigestScheduler.stop();
       });
 
       gracefulShutdown.registerConnection('RtoStatusSyncScheduler', async () => {

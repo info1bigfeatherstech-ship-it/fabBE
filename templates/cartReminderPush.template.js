@@ -1,13 +1,20 @@
 /**
- * Cart reminder web push copy — edit for all manual + auto push sends.
- * Placeholders replaced at send time: {{name}}, {{appName}}, {{itemCount}}, {{itemLabel}}, {{cartTotal}}
+ * Cart reminder web push — Fabuniqo brand copy (manual + auto).
+ * Placeholders (optional legacy): {{name}}, {{appName}}, {{itemCount}}, {{itemLabel}}, {{cartTotal}}
  */
 
+const { resolvePushBrandIconUrl } = require('../utils/storefrontFrontendUrl');
+
 module.exports = {
-  title: 'Your cart is waiting',
+  title: 'Still Thinking About It?',
   body:
-    'Hi {{name}}, you have {{itemCount}} {{itemLabel}} ({{cartTotal}}) in your cart on {{appName}}. Complete your order before they go out of stock!',
-  icon: '/pwa-192x192.png',
-  badge: '/pwa-192x192.png',
+    'You have items waiting in your cart. Complete your order before they’re gone.',
+  ctaLabel: 'View Cart',
+  get icon() {
+    return resolvePushBrandIconUrl();
+  },
+  get badge() {
+    return resolvePushBrandIconUrl();
+  },
   tag: 'cart-reminder',
 };

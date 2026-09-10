@@ -239,7 +239,7 @@ const productSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: ['draft', 'active', 'archived'],
-      default: 'draft'
+      default: 'active'
     },
 
     /** Per-storefront lifecycle; falls back to status when unset (read-side). */

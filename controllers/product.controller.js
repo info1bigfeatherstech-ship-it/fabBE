@@ -17,6 +17,13 @@ const axios = require('axios');
 const AdmZip = require("adm-zip");
 const { Parser } = require("json2csv");   //  ADD THIS
 const { generateSEOData } = require("../utils/seoUtils");
+const { enqueueNewProductForDigest } = require('../services/newProductsDigest.service');
+
+function queueNewProductDigestSafe(product) {
+  Promise.resolve()
+    .then(() => enqueueNewProductForDigest(product, 'ecomm'))
+    .catch(() => {});
+}
 const {
   applyVariantCatalogFieldsToTarget,
   buildVariantCatalogFieldsFromImportRow,
@@ -1306,14 +1313,40 @@ const createProduct = async (req, res) => {
     // =============================
     const finalIsFragile = isFragile === true || isFragile === "true";
 
+    // Single listing defaults to active so completed creates go live unless
+    // the admin explicitly sends draft/archived. Keep wholesale off unless
+    // requested or a variant is wholesale-eligible (legacy derive mirrors
+    // status onto both channels and would otherwise 400 most ecomm creates).
     const resolvedStatus =
       status && ["draft", "active", "archived"].includes(String(status).toLowerCase())
         ? String(status).toLowerCase()
-        : "draft";
+        : "active";
+
+    let channelStatusInput = req.body.channelStatus;
+    if (typeof channelStatusInput === "string" && channelStatusInput.trim()) {
+      try {
+        channelStatusInput = JSON.parse(channelStatusInput);
+      } catch {
+        channelStatusInput = null;
+      }
+    }
+
     const channelStatus = deriveProductChannelStatusFromLegacy(
       resolvedStatus,
-      req.body.channelStatus
+      channelStatusInput
     );
+
+    const wholesaleExplicitlySet =
+      channelStatusInput != null &&
+      typeof channelStatusInput === "object" &&
+      channelStatusInput.wholesale != null;
+    if (
+      !wholesaleExplicitlySet &&
+      channelStatus.wholesale === "active" &&
+      !hasWholesalePricingEligibleVariant(variants)
+    ) {
+      channelStatus.wholesale = "draft";
+    }
 
     // =============================
     //  CREATE PRODUCT
@@ -1375,6 +1408,7 @@ const createProduct = async (req, res) => {
     product.seo = seoData;
 
     await product.save();
+    queueNewProductDigestSafe(product);
     const warnings = collectWholesaleInventoryWarnings(product.variants);
 
     return res.status(201).json({
@@ -2478,7 +2512,9 @@ async function buildNewProductWithVariants(productName, productRows, variants) {
   });
   productObj.seo = seoData;
   
-  return await Product.create(productObj);
+  const created = await Product.create(productObj);
+  queueNewProductDigestSafe(created);
+  return created;
 }
 // =============================================
 // HELPER: Flush batch to database (FIXED - No updatedAt conflict)
@@ -2500,8 +2536,11 @@ async function flushBatch(batch, batchNumber, stats) {
     
     // Insert new products
     if (newProducts.length > 0) {
-      await Product.insertMany(newProducts, { ordered: false });
+      const inserted = await Product.insertMany(newProducts, { ordered: false });
       console.log(`✅ Batch ${batchNumber}: ${newProducts.length} new products inserted`);
+      for (const doc of inserted) {
+        queueNewProductDigestSafe(doc);
+      }
     }
     
     // Update existing products individually (to avoid updatedAt conflict)
@@ -4534,23 +4573,30 @@ const updateProduct = async (req, res) => {
     if (updates.brand !== undefined) {
       doc.brand = updates.brand;
     }
+    // Legacy `status` drives ecomm only. Wholesale must change via explicit
+    // channelStatus.wholesale (or bulk channel toggle) — never mirror status
+    // onto wholesale (that 400s stock/attr saves when wholesale pricing is unset).
+    let wholesaleExplicitlySetInRequest = false;
+    let channelStatusParsedInRequest = null;
     if (updates.status !== undefined) {
       const normalizedStatus = normalizeLifecycleValue(updates.status) || 'draft';
       doc.status = normalizedStatus;
       doc.channelStatus = mergeProductChannelStatus(doc, {
-        ecomm: normalizedStatus,
-        wholesale: normalizedStatus
+        ecomm: normalizedStatus
       });
       propagateProductChannelStatusToVariants(doc, {
-        ecomm: normalizedStatus,
-        wholesale: normalizedStatus
+        ecomm: normalizedStatus
       });
       doc.markModified('channelStatus');
     }
     if (updates.channelStatus !== undefined) {
-      const parsed = parseIfString(updates.channelStatus, {});
-      doc.channelStatus = mergeProductChannelStatus(doc, parsed);
-      propagateProductChannelStatusToVariants(doc, parsed);
+      channelStatusParsedInRequest = parseIfString(updates.channelStatus, {});
+      wholesaleExplicitlySetInRequest =
+        channelStatusParsedInRequest != null &&
+        typeof channelStatusParsedInRequest === 'object' &&
+        channelStatusParsedInRequest.wholesale != null;
+      doc.channelStatus = mergeProductChannelStatus(doc, channelStatusParsedInRequest);
+      propagateProductChannelStatusToVariants(doc, channelStatusParsedInRequest);
       doc.markModified('channelStatus');
     }
     if (updates.isFeatured !== undefined) {
@@ -4931,11 +4977,24 @@ const updateProduct = async (req, res) => {
       doc.channelStatus?.wholesale === "active" &&
       !hasWholesalePricingEligibleVariant(doc)
     ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Wholesale storefront is active but no eligible wholesale variant is available. Add/update at least one variant with wholesale=true and wholesaleBase > 0."
-      });
+      const wholesaleRequestedActive =
+        wholesaleExplicitlySetInRequest &&
+        normalizeLifecycleValue(channelStatusParsedInRequest?.wholesale) ===
+          "active";
+
+      if (wholesaleRequestedActive) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Wholesale storefront is active but no eligible wholesale variant is available. Add/update at least one variant with wholesale=true and wholesaleBase > 0."
+        });
+      }
+
+      // Stale / inconsistent catalog state (or older clients): demote wholesale
+      // instead of blocking ecomm edits when admin did not ask to activate it.
+      doc.channelStatus = mergeProductChannelStatus(doc, { wholesale: "draft" });
+      propagateProductChannelStatusToVariants(doc, { wholesale: "draft" });
+      doc.markModified("channelStatus");
     }
 
     recomputeProductAggregates(doc);
@@ -5296,9 +5355,11 @@ function parseWholesaleConfigForImportRow(row) {
 
 /**
  * Bulk set lifecycle status for many products (admin list multi-select).
- * - active: visible on storefront (same as restore flow)
+ * - Prefer channelStatus: { ecomm?, wholesale? } for per-storefront control
+ * - Legacy status maps to ecomm only (wholesale unchanged unless channelStatus.wholesale set)
+ * - active: visible on that storefront
  * - draft: hidden, not deleted
- * - archived: soft-delete (sets archivedAt like bulk archive)
+ * - archived: soft-delete when both channels archived (sets archivedAt like bulk archive)
  */
 const bulkUpdateProductStatus = async (req, res) => {
   try {
@@ -5359,35 +5420,47 @@ const bulkUpdateProductStatus = async (req, res) => {
         ...normalizedChannelStatus
       };
 
-      // Backward compatibility: legacy `status` can still drive both channels in bulk.
+      // Legacy `status` maps to ecomm only (same as single-product update).
+      // Wholesale changes require explicit channelStatus.wholesale.
       if (hasLegacyStatus) {
         nextChannelStatus.ecomm = normalizedLegacyStatus;
-        nextChannelStatus.wholesale = normalizedLegacyStatus;
       }
 
       if (
         nextChannelStatus.wholesale === 'active' &&
         !hasWholesalePricingEligibleVariant(doc)
       ) {
-        skipped.push({
-          slug: doc.slug,
-          name: doc.name,
-          reasonCode: 'WHOLESALE_ELIGIBILITY_MISSING',
-          reason:
-            'Wholesale activation skipped: no variant has wholesale=true and wholesaleBase > 0.'
-        });
-        continue;
+        if (
+          normalizeLifecycleValue(normalizedChannelStatus.wholesale) === 'active'
+        ) {
+          skipped.push({
+            slug: doc.slug,
+            name: doc.name,
+            reasonCode: 'WHOLESALE_ELIGIBILITY_MISSING',
+            reason:
+              'Wholesale activation skipped: no variant has wholesale=true and wholesaleBase > 0.'
+          });
+          continue;
+        }
+        // Keep ecomm update; demote stale wholesale when not explicitly requested.
+        nextChannelStatus.wholesale = 'draft';
       }
 
       const propagatePartial = {};
       if (hasLegacyStatus) {
         propagatePartial.ecomm = normalizedLegacyStatus;
-        propagatePartial.wholesale = normalizedLegacyStatus;
-      } else {
-        if (normalizedChannelStatus.ecomm != null) propagatePartial.ecomm = normalizedChannelStatus.ecomm;
-        if (normalizedChannelStatus.wholesale != null) {
-          propagatePartial.wholesale = normalizedChannelStatus.wholesale;
-        }
+      }
+      if (normalizedChannelStatus.ecomm != null) {
+        propagatePartial.ecomm = normalizedChannelStatus.ecomm;
+      }
+      if (normalizedChannelStatus.wholesale != null) {
+        propagatePartial.wholesale = normalizedChannelStatus.wholesale;
+      } else if (
+        nextChannelStatus.wholesale === 'draft' &&
+        currentChannelStatus.wholesale === 'active' &&
+        !hasWholesalePricingEligibleVariant(doc)
+      ) {
+        propagatePartial.wholesale = 'draft';
       }
 
       doc.channelStatus = nextChannelStatus;

@@ -1,7 +1,8 @@
 const mongoose = require('mongoose');
 
 /**
- * Per-storefront leads push policy (admin-controlled auto cart reminder).
+ * Per-storefront leads push policy (admin-controlled auto reminders).
+ * Cart and wishlist are independent so either can be toggled alone.
  */
 const leadsPushSettingsSchema = new mongoose.Schema(
   {
@@ -12,8 +13,13 @@ const leadsPushSettingsSchema = new mongoose.Schema(
       unique: true,
       index: true,
     },
-    /** When true, daily auto cart-reminder push runs for users with cart + subscription. */
+    /** Daily auto cart-reminder push (users with cart + subscription). */
     autoPushEnabled: {
+      type: Boolean,
+      default: false,
+    },
+    /** Daily auto wishlist-reminder push (users with wishlist + subscription). */
+    autoWishlistPushEnabled: {
       type: Boolean,
       default: false,
     },

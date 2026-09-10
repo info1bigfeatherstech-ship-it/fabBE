@@ -1,22 +1,11 @@
 const logger = require('../utils/logger');
 const { isPushConfigured, sendAutoCartReminderPushes } = require('./cartReminderPush.service');
 const leadsPushSettingsService = require('./leadsPushSettings.service');
-
-function getIstHourAndDateKey(now = new Date()) {
-  const formatter = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    hour12: false,
-  });
-  const parts = formatter.formatToParts(now);
-  const map = Object.fromEntries(parts.filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]));
-  const hour = Number(map.hour);
-  const dateKey = `${map.year}-${map.month}-${map.day}`;
-  return { hour, dateKey };
-}
+const {
+  getIstCalendarParts,
+  isCartReminderDayIst,
+  cartReminderDaysLabel,
+} = require('../utils/reminderPushSchedule');
 
 function getAutoRunHour() {
   return leadsPushSettingsService.getAutoPushHourIst();
@@ -44,8 +33,17 @@ class CartReminderPushSchedulerService {
       return { skipped: true, reason: 'AUTO_DISABLED' };
     }
 
-    const { hour, dateKey } = getIstHourAndDateKey();
+    const { hour, dateKey, weekdayName } = getIstCalendarParts();
     const targetHour = getAutoRunHour();
+
+    if (!isCartReminderDayIst()) {
+      return {
+        skipped: true,
+        reason: 'NOT_SCHEDULED_WEEKDAY',
+        weekdayName,
+        allowedDays: cartReminderDaysLabel(),
+      };
+    }
 
     if (hour !== targetHour) {
       return { skipped: true, reason: 'NOT_SCHEDULED_HOUR', hour, targetHour };
@@ -102,6 +100,7 @@ class CartReminderPushSchedulerService {
     logger.info('[cartReminderPushScheduler] started', {
       scanMinutes,
       autoHourIst: getAutoRunHour(),
+      weekdaysIst: cartReminderDaysLabel(),
       autoEnabledSource: 'admin_leads_push_settings',
     });
   }
