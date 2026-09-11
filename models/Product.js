@@ -58,9 +58,9 @@ const variantSchema = new mongoose.Schema(
       type: [imageSchema],
       validate: [
         function (val) {
-          return !val || val.length <= 5;
+          return !val || val.length <= 10;
         },
-        'A variant can have at most 5 images'
+        'A variant can have at most 10 images'
       ]
     },
     wholesale: {
