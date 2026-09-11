@@ -191,6 +191,64 @@ function collectWholesaleInventoryWarnings(variants = []) {
 const SUFFIXED_PRODUCT_CODE_REGEX = /^([A-Z0-9]+)-(\d+)$/;
 /** Max images allowed on a single product variant (create / update / bulk ZIP / CSV URLs). */
 const MAX_VARIANT_IMAGES = 10;
+/** Parallel product BASE groups during ZIP bulk (same BASE stays serial). */
+const ZIP_BULK_PRODUCT_CONCURRENCY = 3;
+/** Parallel Cloudinary uploads within one variant folder. */
+const ZIP_BULK_IMAGE_UPLOAD_CONCURRENCY = 8;
+
+/**
+ * Run async work over `items` with a fixed worker pool (order of completion is not guaranteed).
+ * Safe for Node's single-threaded event loop; keep `limit` modest for DB/Cloudinary.
+ */
+async function mapPool(items, limit, workerFn) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return [];
+  const concurrency = Math.max(1, Math.min(Number(limit) || 1, list.length));
+  const results = new Array(list.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= list.length) return;
+      results[index] = await workerFn(list[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  return results;
+}
+
+function createCategoryByNameCache() {
+  const cache = new Map();
+  return async function getCategoryByName(rawName) {
+    const name = String(rawName || '').trim();
+    if (!name) return null;
+    const key = name.toLowerCase();
+    if (cache.has(key)) return cache.get(key);
+    const doc = await Category.findOne({
+      name: { $regex: new RegExp(`^${escapeRegex(name)}$`, 'i') }
+    });
+    cache.set(key, doc || null);
+    return doc || null;
+  };
+}
+
+function sortBulkRowsByVariantSequence(rows) {
+  return [...(rows || [])].sort((a, b) => {
+    try {
+      const pa = parseProductCodeParts(normalizeProductCode(a.productCode), 'productCode');
+      const pb = parseProductCodeParts(normalizeProductCode(b.productCode), 'productCode');
+      const seqA = pa.sequence != null ? pa.sequence : 0;
+      const seqB = pb.sequence != null ? pb.sequence : 0;
+      if (seqA !== seqB) return seqA - seqB;
+    } catch {
+      // fall through
+    }
+    return (a.rowNumber || 0) - (b.rowNumber || 0);
+  });
+}
 
 function normalizeProductCode(value) {
   const s = String(value ?? "").trim().toUpperCase();
@@ -3155,7 +3213,7 @@ async function uploadSingleImageWithRetry(filePath, productName, productCode, in
 // =============================================
 // HELPER: Upload variant images with concurrency limit
 // =============================================
-async function uploadVariantImages(imageFolder, productName, productCode, concurrencyLimit = 5) {
+async function uploadVariantImages(imageFolder, productName, productCode, concurrencyLimit = ZIP_BULK_IMAGE_UPLOAD_CONCURRENCY) {
   if (!fs.existsSync(imageFolder)) {
     throw new Error(`Image folder not found for productCode ${productCode}`);
   }
@@ -3471,8 +3529,6 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       });
     }
 
-    const BATCH_SIZE = 50;
-    const BATCH_DELAY_MS = 1000;
     // Track side effects for rollback if an unexpected runtime error occurs
     // after preflight (keeps batch all-or-nothing even then).
     const runSideEffects = {
@@ -3481,186 +3537,192 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       uploadedPublicIds: []
     };
 
-    // =============================================
-    // Process rows sequentially within batch (avoids same-product race on -1/-2)
-    // =============================================
+    const getCategoryByName = createCategoryByNameCache();
+
+    // Group by productCode BASE: same BASE variants stay serial (-1 then -2…);
+    // different BASE products run in a small parallel pool for speed.
+    const productGroups = Array.from(groupBulkImportRowsByCodeBase(rows).values()).map((g) => ({
+      ...g,
+      rows: sortBulkRowsByVariantSequence(g.rows)
+    }));
+
+    console.log(
+      `🚀 ZIP bulk processing ${rows.length} row(s) as ${productGroups.length} product group(s) ` +
+      `(concurrency=${ZIP_BULK_PRODUCT_CONCURRENCY}, imageUploadConcurrency=${ZIP_BULK_IMAGE_UPLOAD_CONCURRENCY})`
+    );
+
     let runtimeAbort = false;
-    for (let i = 0; i < rows.length && !runtimeAbort; i += BATCH_SIZE) {
-      const batch = rows.slice(i, i + BATCH_SIZE);
-      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-      
-      console.log(`🔄 Processing batch ${batchNumber}/${Math.ceil(rows.length / BATCH_SIZE)} (${batch.length} products)`);
-      
-      for (const row of batch) {
-        try {
-          if (row._preValidationError) {
-            throw new Error(row._preValidationError);
-          }
-          const rawCode = normalizeProductCode(row.productCode);
-          if (!rawCode) {
-            throw new Error(
-              `productCode is missing in row ${row.rowNumber || "?"}. Use column "productCode" (aliases supported: productcode/prodcutCode).`
-            );
-          }
-          const parsedCode = parseProductCodeParts(row.productCode, `row "${row.name || 'Unknown'}"`);
-          const productCode = parsedCode.normalized;
 
-          // Validate category
-          const categoryDoc = await Category.findOne({ 
-            name: { $regex: new RegExp(`^${row.category}$`, 'i') }
-          });
-          
-          if (!categoryDoc) {
-            throw new Error(`Category not found: ${row.category}`);
-          }
+    const processZipBulkRow = async (row) => {
+      if (row._preValidationError) {
+        throw new Error(row._preValidationError);
+      }
+      const rawCode = normalizeProductCode(row.productCode);
+      if (!rawCode) {
+        throw new Error(
+          `productCode is missing in row ${row.rowNumber || "?"}. Use column "productCode" (aliases supported: productcode/prodcutCode).`
+        );
+      }
+      const parsedCode = parseProductCodeParts(row.productCode, `row "${row.name || 'Unknown'}"`);
+      const productCode = parsedCode.normalized;
 
-          // Upload images from productCode folder.
-          // Folder names may use canonical or two-digit suffix (e.g. 83478-1 vs 83478-01).
-          //
-          // POLICY (client / production): missing or wrong ZIP folders are hard
-          // errors. Preflight already blocks the batch; here we still refuse to
-          // create products without images and never soft-skip uploads.
-          const folderCandidates = getImageFolderCandidatesForRow(row);
-          const { folderPath: imageFolder, matchedCode } = resolveImageFolderByCandidates(
-            rootFolder,
-            folderCandidates
-          );
+      const categoryDoc = await getCategoryByName(row.category);
+      if (!categoryDoc) {
+        throw new Error(`Category not found: ${row.category}`);
+      }
 
-          if (!imageFolder) {
-            throw new Error(
-              `Image folder not found for productCode ${productCode}. ` +
-              `Tried: ${folderCandidates.join(", ")}. ` +
-              `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
-            );
-          }
+      // Upload images from productCode folder.
+      // Folder names may use canonical or two-digit suffix (e.g. 83478-1 vs 83478-01).
+      //
+      // POLICY (client / production): missing or wrong ZIP folders are hard
+      // errors. Preflight already blocks the batch; here we still refuse to
+      // create products without images and never soft-skip uploads.
+      const folderCandidates = getImageFolderCandidatesForRow(row);
+      const { folderPath: imageFolder, matchedCode } = resolveImageFolderByCandidates(
+        rootFolder,
+        folderCandidates
+      );
 
-          const variantImages = await uploadVariantImages(
-            imageFolder,
-            row.name,
-            matchedCode || productCode
-          );
-          if (!variantImages.length) {
-            throw new Error(
-              `No images were uploaded for productCode ${productCode}. Refusing to create product without images.`
-            );
-          }
-          for (const img of variantImages) {
-            if (img?.publicId) runSideEffects.uploadedPublicIds.push(img.publicId);
-          }
+      if (!imageFolder) {
+        throw new Error(
+          `Image folder not found for productCode ${productCode}. ` +
+          `Tried: ${folderCandidates.join(", ")}. ` +
+          `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
+        );
+      }
 
-          // Resolve product before variant build — primary only when creating a new product (first row)
-          let product = await findProductForZipBulkRow(row, parsedCode);
-          await ensureMissingVariantProductCodes(product, parsedCode.base);
+      const variantImages = await uploadVariantImages(
+        imageFolder,
+        row.name,
+        matchedCode || productCode
+      );
+      if (!variantImages.length) {
+        throw new Error(
+          `No images were uploaded for productCode ${productCode}. Refusing to create product without images.`
+        );
+      }
+      for (const img of variantImages) {
+        if (img?.publicId) runSideEffects.uploadedPublicIds.push(img.publicId);
+      }
 
-          if (!product && parsedCode.sequence != null && parsedCode.sequence > 1) {
-            throw new Error(
-              `Cannot import variant ${productCode}: no product exists yet for base "${parsedCode.base}". ` +
-                `Import ${parsedCode.base}-1 (or bare ${parsedCode.base}) first, then add higher suffixes.`
-            );
-          }
+      // Resolve product before variant build — primary only when creating a new product (first row)
+      let product = await findProductForZipBulkRow(row, parsedCode);
+      await ensureMissingVariantProductCodes(product, parsedCode.base);
 
-          const isPrimaryVariantRow = !product;
-          const newVariant = await buildCompleteVariant(row, row.name, variantImages, {
-            isPrimary: isPrimaryVariantRow
-          });
+      if (!product && parsedCode.sequence != null && parsedCode.sequence > 1) {
+        throw new Error(
+          `Cannot import variant ${productCode}: no product exists yet for base "${parsedCode.base}". ` +
+            `Import ${parsedCode.base}-1 (or bare ${parsedCode.base}) first, then add higher suffixes.`
+        );
+      }
 
-          // Parse product-level fields
-          const finalHsnCode = row.hsnCode?.trim().toUpperCase() || null;
-          const finalgstRate = row.gstRate ? parseFloat(row.gstRate) : null;
-          const finalIsFragile = parseBoolean(row.isFragile);
-          const parseAttributes = (attrString) => {
-            if (!attrString) return [];
-            return attrString.split("|").map(item => {
-              const [key, value] = item.split(":");
-              return { key: key?.trim(), value: value?.trim() };
-            }).filter(attr => attr.key && attr.value);
-          };
-          const productAttributes = parseAttributes(row.productAttributes);
+      const isPrimaryVariantRow = !product;
+      const newVariant = await buildCompleteVariant(row, row.name, variantImages, {
+        isPrimary: isPrimaryVariantRow
+      });
 
-          if (product) {
-            // If product already has variants, incoming productCode base must match existing base.
-            if (Array.isArray(product.variants) && product.variants.length > 0) {
-              const existingCode = normalizeProductCode(product.variants[0].productCode);
-              if (existingCode) {
-                try {
-                  const existingParts = parseProductCodeParts(existingCode, `existing variant of ${product.name}`);
-                  if (parsedCode.base !== existingParts.base) {
-                    throw new Error(
-                      `productCode base mismatch for "${row.name}". Expected ${existingParts.base}-N, got ${productCode}`
-                    );
-                  }
-                } catch (_) {
-                  // Legacy productCode format found on existing product; skip base-series enforcement for backward compatibility.
-                }
+      // Parse product-level fields
+      const finalHsnCode = row.hsnCode?.trim().toUpperCase() || null;
+      const finalgstRate = row.gstRate ? parseFloat(row.gstRate) : null;
+      const finalIsFragile = parseBoolean(row.isFragile);
+      const parseAttributes = (attrString) => {
+        if (!attrString) return [];
+        return attrString.split("|").map(item => {
+          const [key, value] = item.split(":");
+          return { key: key?.trim(), value: value?.trim() };
+        }).filter(attr => attr.key && attr.value);
+      };
+      const productAttributes = parseAttributes(row.productAttributes);
+
+      if (product) {
+        // If product already has variants, incoming productCode base must match existing base.
+        if (Array.isArray(product.variants) && product.variants.length > 0) {
+          const existingCode = normalizeProductCode(product.variants[0].productCode);
+          if (existingCode) {
+            try {
+              const existingParts = parseProductCodeParts(existingCode, `existing variant of ${product.name}`);
+              if (parsedCode.base !== existingParts.base) {
+                throw new Error(
+                  `productCode base mismatch for "${row.name}". Expected ${existingParts.base}-N, got ${productCode}`
+                );
               }
+            } catch (baseErr) {
+              if (String(baseErr?.message || '').includes('productCode base mismatch')) {
+                throw baseErr;
+              }
+              // Legacy productCode format found on existing product; skip base-series enforcement for backward compatibility.
             }
+          }
+        }
 
-            // Check for duplicate variant attributes
-            const variantExists = product.variants.some(v => 
-              JSON.stringify(v.attributes) === JSON.stringify(newVariant.attributes)
-            );
-            
-            if (variantExists) {
-              throw new Error(`Variant with same attributes already exists for product ${row.name}`);
-            }
+        // Check for duplicate variant attributes
+        const variantExists = product.variants.some(v =>
+          JSON.stringify(v.attributes) === JSON.stringify(newVariant.attributes)
+        );
 
-            const duplicateCodeInSameProduct = product.variants.some(
-              (v) => normalizeProductCode(v.productCode) === productCode
-            );
-            if (duplicateCodeInSameProduct) {
-              const suggested = suggestNextVariantCodeForProduct(product, productCode);
-              const seriesInfo = getExistingSeriesInfo(product, productCode);
-              const entered = normalizeProductCode(row._productCodeAdjustedFrom);
-              throw new Error(
-                entered && entered !== productCode
-                  ? seriesInfo?.hasSuffixed
-                    ? `You entered ${entered}. This maps to existing code ${productCode}. Variants already exist till ${seriesInfo.lastCode}.`
-                    : `You entered ${entered}. This maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
-                  : seriesInfo?.hasSuffixed
-                    ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}.`
-                    : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
-              );
-            }
-            
-            const shippingCheck = validateVariantsResolvableShipping(product.shipping, [
-              ...product.variants,
-              newVariant
-            ], product);
-            if (!shippingCheck.valid) {
-              throw new Error(shippingCheck.message || 'Variant shipping weight and dimensions are required.');
-            }
+        if (variantExists) {
+          throw new Error(`Variant with same attributes already exists for product ${row.name}`);
+        }
 
-            product.variants.push(newVariant);
-            
-            // Update product-level fields if not set
-            if (finalHsnCode && !product.hsnCode) product.hsnCode = finalHsnCode;
-            if (finalgstRate !== null && !product.gstRate) product.gstRate = finalgstRate;
-            if (finalIsFragile && !product.isFragile) product.isFragile = finalIsFragile;
-            if (productAttributes.length && !product.attributes?.length) {
-              product.attributes = productAttributes;
-            }
+        const duplicateCodeInSameProduct = product.variants.some(
+          (v) => normalizeProductCode(v.productCode) === productCode
+        );
+        if (duplicateCodeInSameProduct) {
+          const suggested = suggestNextVariantCodeForProduct(product, productCode);
+          const seriesInfo = getExistingSeriesInfo(product, productCode);
+          const entered = normalizeProductCode(row._productCodeAdjustedFrom);
+          throw new Error(
+            entered && entered !== productCode
+              ? seriesInfo?.hasSuffixed
+                ? `You entered ${entered}. This maps to existing code ${productCode}. Variants already exist till ${seriesInfo.lastCode}.`
+                : `You entered ${entered}. This maps to existing code ${productCode}. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
+              : seriesInfo?.hasSuffixed
+                ? `productCode ${productCode} already exists on this product. Variants already exist till ${seriesInfo.lastCode}.`
+                : `productCode ${productCode} already exists on this product. To add a new variant, use ${seriesInfo?.nextCode || suggested || "the next sequential BASE-N code for this product"}.`
+          );
+        }
 
-            reconcileProductCatalogState(product);
-            await product.save();
-            stats.successful++;
-            stats.products.push({ name: row.name, productCode, action: 'updated' });
-            runSideEffects.updatedVariantRemovals.push({
-              productId: product._id,
-              productCode
-            });
-          } else {
-            const existingProductWithCode = await Product.findOne({
-              "variants.productCode": productCodeToDbQuery(productCode)
-            }).select("name");
-            if (existingProductWithCode) {
-              throw new Error(
-                `productCode ${productCode} belongs to product "${existingProductWithCode.name}". Please use a different productCode for "${row.name}".`
-              );
-            }
-            // Create new product
+        const shippingCheck = validateVariantsResolvableShipping(product.shipping, [
+          ...product.variants,
+          newVariant
+        ], product);
+        if (!shippingCheck.valid) {
+          throw new Error(shippingCheck.message || 'Variant shipping weight and dimensions are required.');
+        }
+
+        product.variants.push(newVariant);
+
+        // Update product-level fields if not set
+        if (finalHsnCode && !product.hsnCode) product.hsnCode = finalHsnCode;
+        if (finalgstRate !== null && !product.gstRate) product.gstRate = finalgstRate;
+        if (finalIsFragile && !product.isFragile) product.isFragile = finalIsFragile;
+        if (productAttributes.length && !product.attributes?.length) {
+          product.attributes = productAttributes;
+        }
+
+        reconcileProductCatalogState(product);
+        await product.save();
+        stats.successful++;
+        stats.products.push({ name: row.name, productCode, action: 'updated' });
+        runSideEffects.updatedVariantRemovals.push({
+          productId: product._id,
+          productCode
+        });
+      } else {
+        const existingProductWithCode = await Product.findOne({
+          "variants.productCode": productCodeToDbQuery(productCode)
+        }).select("name");
+        if (existingProductWithCode) {
+          throw new Error(
+            `productCode ${productCode} belongs to product "${existingProductWithCode.name}". Please use a different productCode for "${row.name}".`
+          );
+        }
+        // Create new product (retry on rare parallel slug collisions)
+        let inserted = false;
+        let lastInsertErr = null;
+        for (let attempt = 1; attempt <= 3 && !inserted; attempt++) {
+          try {
             const slug = await generateSlug(row.name);
-            
-            // Generate SEO
             const seoData = generateSEOData({
               name: row.name,
               title: row.title || row.name,
@@ -3668,7 +3730,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
               category: { name: categoryDoc.name },
               variants: [newVariant]
             });
-            
+
             product = new Product({
               name: row.name,
               title: row.title || row.name,
@@ -3685,14 +3747,14 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
               hsnCode: finalHsnCode,
               gstRate: finalgstRate,
               isFragile: finalIsFragile,
-                shipping: {
-    weight: Number(row.weight) || 0,
-    dimensions: {
-      length: Number(row.length) || 0,
-      width: Number(row.width) || 0,
-      height: Number(row.height) || 0,
-    }
-  },
+              shipping: {
+                weight: Number(row.weight) || 0,
+                dimensions: {
+                  length: Number(row.length) || 0,
+                  width: Number(row.width) || 0,
+                  height: Number(row.height) || 0,
+                }
+              },
               soldInfo: {
                 enabled: parseBoolean(row.soldEnabled),
                 count: Number(row.soldCount) || 0,
@@ -3706,11 +3768,37 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
             }
             reconcileProductCatalogState(product);
             await product.save();
-            stats.successful++;
-            stats.products.push({ name: row.name, productCode, action: 'inserted' });
-            runSideEffects.insertedProductIds.push(product._id);
+            inserted = true;
+          } catch (insertErr) {
+            lastInsertErr = insertErr;
+            const msg = String(insertErr?.message || '');
+            const isDupSlug = insertErr?.code === 11000 && /slug/i.test(msg);
+            if (!isDupSlug || attempt === 3) {
+              throw insertErr;
+            }
+            console.warn(`⚠️ Slug collision on create (attempt ${attempt}), retrying…`);
           }
-          
+        }
+        if (!inserted) {
+          throw lastInsertErr || new Error('Failed to insert product');
+        }
+        stats.successful++;
+        stats.products.push({ name: row.name, productCode, action: 'inserted' });
+        runSideEffects.insertedProductIds.push(product._id);
+      }
+    };
+
+    await mapPool(productGroups, ZIP_BULK_PRODUCT_CONCURRENCY, async (groupData) => {
+      if (runtimeAbort) return;
+      const groupRows = groupData.rows || [];
+      console.log(
+        `🔄 Processing product group base=${groupData.codeBase || 'n/a'} ` +
+        `name="${groupData.name}" rows=${groupRows.length}`
+      );
+      for (const row of groupRows) {
+        if (runtimeAbort) return;
+        try {
+          await processZipBulkRow(row);
         } catch (err) {
           stats.failed++;
           stats.errors.push({
@@ -3721,17 +3809,14 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           });
           console.error(`❌ Failed to process ${row.name}:`, err.message);
           runtimeAbort = true;
-          break;
+          return;
         }
       }
-      
-      if (!runtimeAbort && i + BATCH_SIZE < rows.length) {
-        console.log(`⏳ Waiting ${BATCH_DELAY_MS}ms before next batch...`);
-        await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
-      }
-      
-      console.log(`📊 Batch ${batchNumber} completed. Success: ${stats.successful}, Failed: ${stats.failed}`);
-    }
+    });
+
+    console.log(
+      `📊 ZIP bulk row pass done. Success: ${stats.successful}, Failed: ${stats.failed}`
+    );
 
     // =============================================
     // If any runtime failure after preflight: roll back this run's side
