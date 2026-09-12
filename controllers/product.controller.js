@@ -6213,26 +6213,62 @@ const bulkHardDelete = async (req, res) => {
   }
 };
 
+function buildAdminCatalogListFilter({ search = "", status = "", category = "" } = {}) {
+  const clauses = [];
+  const trimmedSearch = String(search || "").trim().slice(0, 100);
+  if (trimmedSearch) {
+    clauses.push({
+      $or: [
+        { name: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+        { title: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+        { brand: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+        { "variants.productCode": { $regex: escapeRegex(trimmedSearch), $options: "i" } },
+      ],
+    });
+  }
+
+  const statusKey = String(status || "").trim().toLowerCase();
+  if (statusKey === "archived") {
+    clauses.push({ status: "archived" });
+  } else if (statusKey === "active") {
+    clauses.push(buildEcommActiveCountQuery());
+  } else if (statusKey === "draft") {
+    clauses.push({
+      status: { $ne: "archived" },
+      $or: [
+        { "channelStatus.ecomm": "draft" },
+        {
+          $and: [
+            { "channelStatus.ecomm": { $nin: ["draft", "archived", "active"] } },
+            { status: "draft" },
+          ],
+        },
+      ],
+    });
+  } else {
+    // Main catalog never lists archived rows — those live on /archived.
+    clauses.push({ status: { $ne: "archived" } });
+  }
+
+  const categoryId = String(category || "").trim();
+  if (categoryId && mongoose.Types.ObjectId.isValid(categoryId)) {
+    clauses.push({ category: categoryId });
+  }
+
+  if (clauses.length === 0) return {};
+  if (clauses.length === 1) return clauses[0];
+  return { $and: clauses };
+}
+
 const getAllProductsAdmin = async (req, res) => {
   try {
-    let { page = 1, limit = 20, search = "" } = req.query;
+    let { page = 1, limit = 20, search = "", status = "", category = "" } = req.query;
 
     page = Number(page);
     limit = Math.min(100, Math.max(1, Number(limit)));
 
     const skip = (page - 1) * limit;
-
-    const trimmedSearch = String(search || "").trim().slice(0, 100);
-    const searchFilter = trimmedSearch
-      ? {
-          $or: [
-            { name: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-            { title: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-            { brand: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-            { "variants.productCode": { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-          ],
-        }
-      : {};
+    const listFilter = buildAdminCatalogListFilter({ search, status, category });
 
     const [
       products,
@@ -6243,14 +6279,14 @@ const getAllProductsAdmin = async (req, res) => {
       featuredCount,
       lowStockCount,
     ] = await Promise.all([
-      Product.find(searchFilter)
+      Product.find(listFilter)
         .populate("category", "name slug status")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
         .lean({ virtuals: true }),
 
-      Product.countDocuments(searchFilter),
+      Product.countDocuments(listFilter),
       Product.countDocuments({}),
       Product.countDocuments(buildEcommActiveCountQuery()),
       Product.countDocuments({ status: "archived" }),
