@@ -5777,6 +5777,47 @@ const updateVariantChannelVisibility = async (req, res) => {
 
 // Get low stock products
 // Get low stock products
+function buildAdminLowStockQuery() {
+  return {
+    status: "active",
+    $expr: {
+      $anyElementTrue: {
+        $map: {
+          input: "$variants",
+          as: "variant",
+          in: {
+            $and: [
+              { $eq: ["$$variant.inventory.trackInventory", true] },
+              {
+                $lte: [
+                  "$$variant.inventory.quantity",
+                  "$$variant.inventory.lowStockThreshold"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  };
+}
+
+/** Ecom-active catalog: channelStatus.ecomm=active, else fallback to product.status. */
+function buildEcommActiveCountQuery() {
+  return {
+    status: { $ne: "archived" },
+    $or: [
+      { "channelStatus.ecomm": "active" },
+      {
+        $and: [
+          { "channelStatus.ecomm": { $nin: ["draft", "archived", "active"] } },
+          { status: "active" }
+        ]
+      }
+    ]
+  };
+}
+
 const getLowStockProducts = async (req, res) => {
   try {
     let { page = 1, limit = 20 } = req.query;
@@ -5785,28 +5826,7 @@ const getLowStockProducts = async (req, res) => {
     const limitNumber = Math.min(100, Number(limit));
     const skip = (pageNumber - 1) * limitNumber;
 
-    const query = {
-      status: "active",
-      $expr: {
-        $anyElementTrue: {
-          $map: {
-            input: "$variants",
-            as: "variant",
-            in: {
-              $and: [
-                { $eq: ["$$variant.inventory.trackInventory", true] },
-                {
-                  $lte: [
-                    "$$variant.inventory.quantity",
-                    "$$variant.inventory.lowStockThreshold"
-                  ]
-                }
-              ]
-            }
-          }
-        }
-      }
-    };
+    const query = buildAdminLowStockQuery();
 
     const [products, total] = await Promise.all([
       Product.find(query)
@@ -6214,7 +6234,15 @@ const getAllProductsAdmin = async (req, res) => {
         }
       : {};
 
-    const [products, totalProducts] = await Promise.all([
+    const [
+      products,
+      totalProducts,
+      catalogTotal,
+      activeCount,
+      archivedCount,
+      featuredCount,
+      lowStockCount,
+    ] = await Promise.all([
       Product.find(searchFilter)
         .populate("category", "name slug status")
         .sort({ createdAt: -1 })
@@ -6223,7 +6251,14 @@ const getAllProductsAdmin = async (req, res) => {
         .lean({ virtuals: true }),
 
       Product.countDocuments(searchFilter),
+      Product.countDocuments({}),
+      Product.countDocuments(buildEcommActiveCountQuery()),
+      Product.countDocuments({ status: "archived" }),
+      Product.countDocuments({ isFeatured: true, status: { $ne: "archived" } }),
+      Product.countDocuments(buildAdminLowStockQuery()),
     ]);
+
+    const inactiveCount = Math.max(0, catalogTotal - activeCount - archivedCount);
 
     // get ids
     const productIds = products.map((p) => p._id);
@@ -6270,6 +6305,14 @@ const getAllProductsAdmin = async (req, res) => {
       totalPages: Math.ceil(totalProducts / limit),
       currentPage: page,
       products: finalProducts, // <- THIS
+      counts: {
+        total: catalogTotal,
+        active: activeCount,
+        inactive: inactiveCount,
+        archived: archivedCount,
+        featured: featuredCount,
+        lowStock: lowStockCount,
+      },
     });
   } catch (error) {
     console.error("Get all products error:", error);
