@@ -2,6 +2,7 @@
  * Ecomm security-question helpers.
  * User picks exactly one catalog question at register; answer is bcrypt-hashed.
  */
+const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const {
   SECURITY_QUESTIONS,
@@ -141,6 +142,32 @@ const getStoredPublicQuestion = (storedAnswers) => {
   return null;
 };
 
+/**
+ * Stable dummy question for unknown / ineligible identifiers.
+ * Same identifier always gets the same catalog item so we never leak
+ * "everyone unknown sees nickname" while still avoiding account enumeration.
+ */
+const getAntiEnumerationPublicQuestion = (identifier) => {
+  const questions = getPublicSecurityQuestions();
+  if (!questions.length) return null;
+  const key = String(identifier || '').trim().toLowerCase();
+  if (!key) return questions[0];
+  const digest = crypto.createHash('sha256').update(`owb-reset-q:${key}`).digest();
+  return questions[digest.readUInt32BE(0) % questions.length];
+};
+
+/**
+ * Verify against the question we actually issued on the challenge,
+ * not whatever questionId the client chooses to send.
+ */
+const bindSubmittedAnswerToQuestion = (rawAnswers, questionId) => {
+  const forcedId = String(questionId || '').trim();
+  if (!forcedId || !QUESTION_ID_SET.has(forcedId)) return rawAnswers;
+  const list = coerceAnswerPayload(rawAnswers);
+  const answer = list?.[0]?.answer;
+  return [{ questionId: forcedId, answer }];
+};
+
 let dummyAnswerHashPromise = null;
 const getDummyAnswerHash = () => {
   if (!dummyAnswerHashPromise) {
@@ -184,6 +211,8 @@ module.exports = {
   getPublicSecurityQuestions,
   getQuestionById,
   getStoredPublicQuestion,
+  getAntiEnumerationPublicQuestion,
+  bindSubmittedAnswerToQuestion,
   normalizeAnswer,
   parseSingleSubmittedAnswer,
   validateCompleteAnswers,

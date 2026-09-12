@@ -19,6 +19,7 @@ const {
   normalizeTagSlugs,
   buildTagFilterClause,
 } = require('../utils/productTagQuery');
+const { buildNameAndProductCodeSearch } = require('../utils/productCode');
 
 const storefrontFrom = (req) => req.storefront || 'ecomm';
 const useWholesalePricing = (storefront) => storefront === 'wholesale';
@@ -240,22 +241,18 @@ const getProducts = async (req, res) => {
       extraClauses.push(tagClause);
     }
 
-    // search
+    // search — name + productCode only (same rules as /products/search)
     let sortOption = { createdAt: -1 };
 
     if (req.query.q) {
-      extraClauses.push({
-        $text: { $search: String(req.query.q) },
-      });
-
-      sortOption = {
-        score: { $meta: "textScore" },
-      };
+      const searchClause = buildNameAndProductCodeSearch(req.query.q);
+      if (searchClause) extraClauses.push(searchClause);
     }
 
     const filters = mongoCatalogAnd(storefront, ...extraClauses);
 
     const cacheKey = cacheConfig.generateKey("PRODUCT", {
+      v: "name-code-v3",
       page,
       limit,
       category: req.query.category,
@@ -283,13 +280,9 @@ const getProducts = async (req, res) => {
       return res.json(withLiveStock);
     }
 
-    const projection = req.query.q
-      ? { score: { $meta: 'textScore' } }
-      : undefined;
-
     const [total, products] = await Promise.all([
       Product.countDocuments(filters),
-      Product.find(filters, projection)
+      Product.find(filters)
         .sort(sortOption)
         .skip(skip)
         .limit(limit)
@@ -450,7 +443,7 @@ const searchProducts= async (req, res) => {
     const tagsFilter = normalizeTagSlugs(req.query.tags);
 
     const cacheKey = cacheConfig.generateKey("SEARCH", {
-      v: "code-prefix-v2",
+      v: "name-code-v3",
       q,
       page,
       limit,
@@ -476,34 +469,16 @@ const searchProducts= async (req, res) => {
       return res.json(withLiveStock);
     }
 
-    // Build search filter.
-    // If query looks like a product code (e.g. 0053 / 0053-1), prefer productCode-family match.
-    const escapeRegex = (value) =>
-      String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const escapedQ = escapeRegex(q);
-    const searchRegex = { $regex: escapedQ, $options: "i" };
-    const baseCode = q.split("-")[0].trim();
-    const escapedBaseCode = escapeRegex(baseCode);
-    const productCodePrefixRegex = {
-      $regex: `^${escapedBaseCode}(?:-|$)`,
-      $options: "i",
-    };
-    const looksLikeProductCode = /^[a-z0-9-]+$/i.test(q) && /\d/.test(q);
+    // Name + productCode only. Codes may omit a 2-letter prefix (FU2311 ↔ 2311).
+    const searchClause = buildNameAndProductCodeSearch(q);
+    if (!searchClause) {
+      return res.status(400).json({
+        success: false,
+        message: "Query required",
+      });
+    }
 
-    const searchOrClauses = looksLikeProductCode
-      ? [{ "variants.productCode": productCodePrefixRegex }]
-      : [
-          { name: searchRegex },
-          { title: searchRegex },
-          { "variants.productCode": searchRegex },
-          { "variants.productCode": productCodePrefixRegex },
-        ];
-
-    const extraClauses = [
-      {
-        $or: searchOrClauses,
-      },
-    ];
+    const extraClauses = [searchClause];
 
     // tag filter
     if (tagsFilter.length > 0) {

@@ -10,8 +10,8 @@
 
 const crypto = require('crypto');
 
-const PREFIX_WHOLESALE = 'OWB-WH-';
-const PREFIX_ECOMM = 'OWB-ECOMM-';
+const PREFIX_WHOLESALE = 'FAB-WH-';
+const PREFIX_ECOMM = 'FAB-ECOMM-';
 const ORDER_ID_DIGIT_LEN = 6;
 const ORDER_ID_DIGIT_MOD = 10 ** ORDER_ID_DIGIT_LEN;
 const DEFAULT_ALLOCATE_ATTEMPTS = 32;

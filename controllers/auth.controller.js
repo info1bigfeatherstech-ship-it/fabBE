@@ -318,6 +318,23 @@ const isEcommCustomerSecurityResetAllowed = (user) => {
   return true;
 };
 
+/** Re-fetch select:false hashes if the first query omitted them. */
+const hydrateSecurityAnswers = async (user) => {
+  if (!user) return null;
+  if (securityQuestionsService.hasCompleteStoredAnswers(user.securityAnswers)) {
+    return user;
+  }
+  try {
+    const fresh = await User.findById(user._id).select('+securityAnswers').lean();
+    if (Array.isArray(fresh?.securityAnswers) && fresh.securityAnswers.length) {
+      user.securityAnswers = fresh.securityAnswers;
+    }
+  } catch (hydrateErr) {
+    console.error('[ForgotPassword] securityAnswers hydrate failed:', hydrateErr?.message || hydrateErr);
+  }
+  return user;
+};
+
 const issuePasswordResetChallengeToken = async (payload) => {
   if (!redisManager.isReady()) {
     const err = new Error('Password reset is temporarily unavailable. Please try again in a moment.');
@@ -1164,27 +1181,34 @@ const findUserForPasswordReset = async (req, res) => {
       );
     }
 
-    const user = await User.findOne(
+    let user = await User.findOne(
       buildCustomerContactLookup(parsed.lookup, ACCOUNT_SCOPES.ECOMM)
     ).select('_id phone email name status userType role accountScope isPhoneVerified isEmailVerified +securityAnswers');
+    user = await hydrateSecurityAnswers(user);
 
-    const eligible =
-      user &&
-      isVerifiedUserRecord(user) &&
+    const allowedForCustomerReset =
+      Boolean(user) &&
       !isCustomerPasswordResetBlocked(user) &&
-      isEcommCustomerSecurityResetAllowed(user) &&
-      securityQuestionsService.hasCompleteStoredAnswers(user.securityAnswers);
+      isEcommCustomerSecurityResetAllowed(user);
 
-    if (user && (isCustomerPasswordResetBlocked(user) || !isEcommCustomerSecurityResetAllowed(user))) {
+    if (user && !allowedForCustomerReset) {
       logPrivilegedPasswordResetBlocked('find-user', user);
     }
 
-    const storedQuestion = eligible
+    // Real stored question whenever this ecomm customer has one.
+    // Dummy catalog item only for unknown / ineligible identifiers (anti-enum).
+    const storedQuestion = allowedForCustomerReset
       ? securityQuestionsService.getStoredPublicQuestion(user.securityAnswers)
       : null;
 
     const question =
-      storedQuestion || securityQuestionsService.getPublicSecurityQuestions()[0] || null;
+      storedQuestion ||
+      securityQuestionsService.getAntiEnumerationPublicQuestion(parsed.identifier);
+
+    const eligible =
+      allowedForCustomerReset &&
+      isVerifiedUserRecord(user) &&
+      Boolean(storedQuestion);
 
     let challengeToken;
     try {
@@ -1341,6 +1365,7 @@ const verifySecurityAnswersForPasswordReset = async (req, res) => {
         user = await User.findById(challenge.stored.userId).select(
           '_id phone email status userType role accountScope isPhoneVerified isEmailVerified +securityAnswers +passwordResetOTP +passwordResetOTPExpires'
         );
+        user = await hydrateSecurityAnswers(user);
       } catch (lookupErr) {
         console.error('[ForgotPassword] Challenge user lookup failed:', lookupErr?.message || lookupErr);
         user = null;
@@ -1352,6 +1377,11 @@ const verifySecurityAnswersForPasswordReset = async (req, res) => {
       !isCustomerPasswordResetBlocked(user) &&
       isEcommCustomerSecurityResetAllowed(user) &&
       securityQuestionsService.hasCompleteStoredAnswers(user.securityAnswers);
+
+    const boundAnswers = securityQuestionsService.bindSubmittedAnswerToQuestion(
+      answers,
+      challenge.stored?.questionId
+    );
 
     const attempts = Number(challenge.stored?.attempts || 0) + 1;
 
@@ -1374,7 +1404,7 @@ const verifySecurityAnswersForPasswordReset = async (req, res) => {
     try {
       matched = await securityQuestionsService.verifyStoredAnswer(
         canUseSecurityReset ? user.securityAnswers : [],
-        answers
+        boundAnswers
       );
     } catch (secErr) {
       if (secErr instanceof securityQuestionsService.SecurityQuestionError) {

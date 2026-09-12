@@ -17,6 +17,7 @@ const axios = require('axios');
 const AdmZip = require("adm-zip");
 const { Parser } = require("json2csv");   //  ADD THIS
 const { generateSEOData } = require("../utils/seoUtils");
+const { buildNameAndProductCodeSearch } = require('../utils/productCode');
 const { enqueueNewProductForDigest } = require('../services/newProductsDigest.service');
 
 function queueNewProductDigestSafe(product) {
@@ -6217,14 +6218,8 @@ function buildAdminCatalogListFilter({ search = "", status = "", category = "" }
   const clauses = [];
   const trimmedSearch = String(search || "").trim().slice(0, 100);
   if (trimmedSearch) {
-    clauses.push({
-      $or: [
-        { name: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-        { title: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-        { brand: { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-        { "variants.productCode": { $regex: escapeRegex(trimmedSearch), $options: "i" } },
-      ],
-    });
+    const searchClause = buildNameAndProductCodeSearch(trimmedSearch);
+    if (searchClause) clauses.push(searchClause);
   }
 
   const statusKey = String(status || "").trim().toLowerCase();
