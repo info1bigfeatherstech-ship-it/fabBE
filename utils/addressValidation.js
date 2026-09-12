@@ -9,6 +9,8 @@
  * We enforce the same combined cap at save time (customer + admin) so Ship Now cannot fail later.
  */
 
+const { parsePersonName } = require('./personName');
+
 const MIN_ADDRESS_LINE1_LEN = 10;
 /** Per stored addressLine field (form fields); courier combined cap is stricter. */
 const MAX_ADDRESS_LINE_LEN = 200;
@@ -122,12 +124,17 @@ function validateStreetLines(line1Raw, line2Raw) {
  * Full payload validation for create or merged document on update.
  *
  * @param {object} body — raw fields
+ * @param {{ skipPersonNameRules?: boolean }} [opts] — keep legacy names valid on admin/order paths
  * @returns {{ ok: true, data: object } | { ok: false, code: string, message: string, errors: Array<{field: string, code: string, message: string}> }}
  */
-function validatePhysicalAddressForSave(body) {
+function validatePhysicalAddressForSave(body, opts = {}) {
   const errors = [];
 
-  const fullName = trimStr(body.fullName);
+  const skipPersonNameRules = Boolean(opts.skipPersonNameRules);
+  const nameCheck = skipPersonNameRules
+    ? { ok: Boolean(trimStr(body.fullName)), value: trimStr(body.fullName), code: 'REQUIRED', message: 'Full name is required.' }
+    : parsePersonName(body.fullName);
+  const fullName = nameCheck.ok ? nameCheck.value : trimStr(body.fullName);
   const phoneRaw = trimStr(body.phone);
   const phoneDigits = phoneRaw.replace(/\D/g, '');
   const houseNumber = trimStr(body.houseNumber);
@@ -140,8 +147,8 @@ function validatePhysicalAddressForSave(body) {
   const postalCode = trimStr(body.postalCode);
   const country = trimStr(body.country) || 'India';
 
-  if (!fullName) {
-    errors.push({ field: 'fullName', code: 'REQUIRED', message: 'Full name is required.' });
+  if (!nameCheck.ok) {
+    errors.push({ field: 'fullName', code: nameCheck.code, message: nameCheck.message });
   }
   if (!phoneRaw) {
     errors.push({ field: 'phone', code: 'REQUIRED', message: 'Phone number is required.' });

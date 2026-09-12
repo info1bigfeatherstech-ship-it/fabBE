@@ -86,10 +86,49 @@ function testAcceptReasonableAddress() {
   assert.ok(courier.combinedLength <= MAX_COURIER_COMBINED_STREET_CHARS);
 }
 
+function testRejectInvalidPersonName() {
+  const base = {
+    phone: '9876543210',
+    houseNumber: '42B',
+    building: 'Sunrise',
+    floor: '4',
+    addressLine1: 'MG Road near metro station',
+    area: 'Andheri East',
+    city: 'Mumbai',
+    state: 'Maharashtra',
+    postalCode: '400069',
+    country: 'India'
+  };
+
+  const badNames = [
+    'Rahul123',
+    'राहुल शर्मा',
+    'Rahul Kumar Singh Verma',
+    'Mr Rahul',
+    'Al',
+    'A B',
+    'Rahul@Sharma'
+  ];
+
+  for (const fullName of badNames) {
+    const res = validatePhysicalAddressForSave({ ...base, fullName });
+    assert.strictEqual(res.ok, false, `expected reject for "${fullName}"`);
+    assert.ok(
+      res.errors.some((e) => e.field === 'fullName'),
+      `expected fullName error for "${fullName}"`
+    );
+  }
+
+  const good = validatePhysicalAddressForSave({ ...base, fullName: '  Rahul   Kumar Sharma  ' });
+  assert.strictEqual(good.ok, true, good.message);
+  assert.strictEqual(good.data.fullName, 'Rahul Kumar Sharma');
+}
+
 function run() {
   testComposeMatchesShiprocketShape();
   testRejectLongAddressOnSave();
   testAcceptReasonableAddress();
+  testRejectInvalidPersonName();
   console.log('All address validation tests passed.');
 }
 

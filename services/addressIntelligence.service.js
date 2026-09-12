@@ -48,7 +48,7 @@ function computeLocalAddressQuality(addr) {
     state: a.state,
     postalCode: a.postalCode,
     country: a.country || 'India'
-  });
+  }, { skipPersonNameRules: true });
 
   let score = 100;
   const reasons = [];

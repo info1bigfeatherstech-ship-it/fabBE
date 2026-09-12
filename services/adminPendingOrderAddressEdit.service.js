@@ -118,7 +118,7 @@ async function previewOrApplyPendingAddressEdit(opts) {
     ...mergedRaw,
     fullName: beforeSnap.fullName,
     phone: beforeSnap.phone
-  });
+  }, { skipPersonNameRules: true });
   if (!validated.ok) {
     throw createEditError(400, validated.code || 'ADDRESS_VALIDATION_FAILED', validated.message, {
       errors: validated.errors

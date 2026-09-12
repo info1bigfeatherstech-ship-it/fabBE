@@ -12,6 +12,7 @@ const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 const refreshTokenSession = require('../services/refreshTokenSession.service');
 const { setOrUnsetUniqueString } = require('../utils/optionalUniqueContact');
 const securityQuestionsService = require('../services/securityQuestions.service');
+const { parsePersonName } = require('../utils/personName');
 const { getAppName, getAppSignature } = require('../utils/appBrand');
 const {
   ACCOUNT_SCOPES,
@@ -775,6 +776,11 @@ const register = async (req, res) => {
 
     const { email, password, name, phone, confirmPassword, securityAnswers, securityQuestion } = req.body;
 
+    const nameCheck = parsePersonName(name);
+    if (!nameCheck.ok) {
+      return respondAuthError(res, 400, 'INVALID_NAME', nameCheck.message);
+    }
+
     const normalizedEmail = String(email || '').trim().toLowerCase();
     const normalizedPhone = String(phone || '').trim();
 
@@ -867,7 +873,7 @@ const register = async (req, res) => {
       accountScope: ACCOUNT_SCOPES.ECOMM
     });
 
-    user.name = name;
+    user.name = nameCheck.value;
     setOrUnsetUniqueString(user, 'email', normalizedEmail);
     user.phone = normalizedPhone;
     user.password = password;

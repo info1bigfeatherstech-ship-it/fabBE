@@ -3,6 +3,7 @@
 
 const express = require('express');
 const { body } = require('express-validator');
+const { parsePersonName } = require('../utils/personName');
 const { 
     register,
     getSecurityQuestions,
@@ -45,8 +46,11 @@ router.post(
             .trim()
             .notEmpty()
             .withMessage('Name is required')
-            .isLength({ min: 2 })
-            .withMessage('Name must be at least 2 characters'),
+            .custom((value) => {
+                const parsed = parsePersonName(value);
+                if (!parsed.ok) throw new Error(parsed.message);
+                return true;
+            }),
         body('email')
             .trim()
             .notEmpty()
