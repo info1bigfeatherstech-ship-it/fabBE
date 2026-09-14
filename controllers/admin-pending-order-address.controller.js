@@ -4,7 +4,8 @@
 const { getAddressIntelligenceForOrder } = require('../services/addressIntelligence.service');
 const {
   previewOrApplyPendingAddressEdit,
-  EDITABLE_ADDRESS_FIELDS
+  EDITABLE_ADDRESS_FIELDS,
+  EDITABLE_CONTACT_FIELDS
 } = require('../services/adminPendingOrderAddressEdit.service');
 const { createEditError } = require('../services/adminPendingOrderEdit.service');
 const { getAdminOrderMatch, mergeOrderScopeFilter } = require('../utils/adminOrderScope');
@@ -74,7 +75,8 @@ exports.previewPendingAddressEdit = async (req, res) => {
       message: 'Address edit preview calculated',
       data: {
         ...result.preview,
-        editableFields: EDITABLE_ADDRESS_FIELDS
+        editableFields: EDITABLE_ADDRESS_FIELDS,
+        editableContactFields: EDITABLE_CONTACT_FIELDS
       }
     });
   } catch (err) {
@@ -101,9 +103,11 @@ exports.applyPendingAddressEdit = async (req, res) => {
     });
     return res.json({
       success: true,
-      message: result.refundInr > 0
-        ? 'Address updated and refund initiated where applicable.'
-        : 'Address updated successfully.',
+      message: result.nameOnly
+        ? 'Recipient name updated. Shipping was not re-quoted.'
+        : result.refundInr > 0
+          ? 'Address updated and refund initiated where applicable.'
+          : 'Address updated successfully.',
       data: result
     });
   } catch (err) {

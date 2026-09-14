@@ -14,8 +14,10 @@ const {
 } = require('../services/addressIntelligence.service');
 const {
   pickEditableAddressPatch,
+  pickRecipientNamePatch,
   buildMergedAddressCandidate,
   EDITABLE_ADDRESS_FIELDS,
+  EDITABLE_CONTACT_FIELDS,
   FROZEN_CONTACT_FIELDS
 } = require('../services/adminPendingOrderAddressEdit.service');
 
@@ -97,8 +99,9 @@ function testLocalQuality() {
 
 function testAddressPatchFreeze() {
   assert.ok(EDITABLE_ADDRESS_FIELDS.includes('postalCode'));
-  assert.ok(FROZEN_CONTACT_FIELDS.includes('fullName'));
+  assert.ok(EDITABLE_CONTACT_FIELDS.includes('fullName'));
   assert.ok(FROZEN_CONTACT_FIELDS.includes('phone'));
+  assert.ok(!FROZEN_CONTACT_FIELDS.includes('fullName'));
 
   const patch = pickEditableAddressPatch({
     city: 'Pune',
@@ -110,6 +113,15 @@ function testAddressPatchFreeze() {
   assert.strictEqual(patch.postalCode, '411001');
   assert.strictEqual(patch.fullName, undefined);
   assert.strictEqual(patch.phone, undefined);
+
+  const namePatch = pickRecipientNamePatch({
+    city: 'Pune',
+    fullName: 'Anita Sharma',
+    phone: '1111111111'
+  });
+  assert.strictEqual(namePatch.fullName, 'Anita Sharma');
+  assert.strictEqual(namePatch.phone, undefined);
+  assert.strictEqual(namePatch.city, undefined);
 
   const merged = buildMergedAddressCandidate(
     {
@@ -128,6 +140,19 @@ function testAddressPatchFreeze() {
   assert.strictEqual(merged.phone, '9876543210');
   assert.strictEqual(merged.city, 'Pune');
   assert.strictEqual(merged.postalCode, '411001');
+
+  const mergedName = buildMergedAddressCandidate(
+    {
+      fullName: 'Real Name',
+      phone: '9876543210',
+      city: 'Mumbai'
+    },
+    {},
+    { fullName: 'Anita Sharma' }
+  );
+  assert.strictEqual(mergedName.fullName, 'Anita Sharma');
+  assert.strictEqual(mergedName.phone, '9876543210');
+  assert.strictEqual(mergedName.city, 'Mumbai');
 }
 
 function run() {

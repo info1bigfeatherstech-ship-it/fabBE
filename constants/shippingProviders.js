@@ -46,6 +46,11 @@ function isShiprocketOrder(order) {
   return resolveOrderShippingProvider(order) === SHIPPING_PROVIDERS.SHIPROCKET;
 }
 
+/** User-facing partner name from the order stamp (never invent a third brand). */
+function shippingProviderDisplayName(order) {
+  return isShipmozoOrder(order) ? 'Shipmozo' : 'Shiprocket';
+}
+
 module.exports = {
   SHIPPING_PROVIDERS,
   SHIPPING_PROVIDER_SET,
@@ -53,5 +58,6 @@ module.exports = {
   normalizeShippingProvider,
   resolveOrderShippingProvider,
   isShipmozoOrder,
-  isShiprocketOrder
+  isShiprocketOrder,
+  shippingProviderDisplayName
 };

@@ -13,6 +13,7 @@ const { evaluateOrderPaymentForShiprocketFulfillment } = require('../utils/order
 const { ensureShipmentForOrderExport } = require('../controllers/order.controller');
 const { mergeReturnInfo } = require('./rtoRefund.service');
 const { mergeOrderScopeFilter } = require('../utils/adminOrderScope');
+const { shippingProviderDisplayName } = require('../constants/shippingProviders');
 
 const FULFILLMENT_ITEM_POPULATE = { path: 'items.productId', select: 'name slug shipping' };
 
@@ -206,6 +207,7 @@ async function runAdminApproveOrderSingle(orderId, opts = {}) {
     });
 
     const fresh = await Order.findOne({ orderId: id }).populate(FULFILLMENT_ITEM_POPULATE);
+    const partnerName = shippingProviderDisplayName(fresh || order);
 
     if (!shipmentResult.success) {
       return {
@@ -213,8 +215,7 @@ async function runAdminApproveOrderSingle(orderId, opts = {}) {
         success: true,
         skipped: false,
         code: 'CONFIRMED_SHIPMENT_DEFERRED',
-        message:
-          'Order confirmed. Shiprocket create did not complete — retry Ship now or ensure shipment from order detail.',
+        message: `Order confirmed. ${partnerName} create did not complete — retry Ship now or ensure shipment from order detail.`,
         orderStatus: fresh?.orderStatus || 'confirmed',
         shipment: {
           success: false,
@@ -230,8 +231,8 @@ async function runAdminApproveOrderSingle(orderId, opts = {}) {
       skipped: false,
       code: null,
       message: shipmentResult.alreadyExists
-        ? 'Order confirmed. Shiprocket order already exists.'
-        : 'Order confirmed and Shiprocket order created.',
+        ? `Order confirmed. ${partnerName} order already exists.`
+        : `Order confirmed and ${partnerName} order created.`,
       orderStatus: fresh?.orderStatus || 'confirmed',
       shipment: { success: true, alreadyExists: Boolean(shipmentResult.alreadyExists) }
     };
