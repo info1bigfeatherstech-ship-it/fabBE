@@ -196,6 +196,41 @@ const MAX_VARIANT_IMAGES = 10;
 const ZIP_BULK_PRODUCT_CONCURRENCY = 3;
 /** Parallel Cloudinary uploads within one variant folder. */
 const ZIP_BULK_IMAGE_UPLOAD_CONCURRENCY = 8;
+/**
+ * CSV+URL bulk: parallel image fetch/optimize/upload within one variant.
+ * Env override: CSV_BULK_IMAGE_UPLOAD_CONCURRENCY (1–12). Default matches ZIP image concurrency.
+ */
+const CSV_BULK_IMAGE_UPLOAD_CONCURRENCY = Math.max(
+  1,
+  Math.min(12, Number(process.env.CSV_BULK_IMAGE_UPLOAD_CONCURRENCY) || ZIP_BULK_IMAGE_UPLOAD_CONCURRENCY)
+);
+/**
+ * CSV+URL bulk: parallel variant builds within one product (each variant may upload several images).
+ * Env override: CSV_BULK_VARIANT_BUILD_CONCURRENCY (1–6).
+ */
+const CSV_BULK_VARIANT_BUILD_CONCURRENCY = Math.max(
+  1,
+  Math.min(6, Number(process.env.CSV_BULK_VARIANT_BUILD_CONCURRENCY) || 3)
+);
+/**
+ * CSV+URL bulk: parallel product groups. Default 1 preserves serial DB/slug safety;
+ * raise via env only after verifying unique indexes handle races.
+ * Env override: CSV_BULK_PRODUCT_CONCURRENCY (1–4).
+ */
+const CSV_BULK_PRODUCT_CONCURRENCY = Math.max(
+  1,
+  Math.min(4, Number(process.env.CSV_BULK_PRODUCT_CONCURRENCY) || 1)
+);
+/** Per-image HTTP download timeout for CSV URL import (ms). */
+const CSV_BULK_IMAGE_DOWNLOAD_TIMEOUT_MS = Math.max(
+  5000,
+  Math.min(60000, Number(process.env.CSV_BULK_IMAGE_DOWNLOAD_TIMEOUT_MS) || 15000)
+);
+/** Reject oversized remote images before buffering (bytes). */
+const CSV_BULK_IMAGE_MAX_BYTES = Math.max(
+  1 * 1024 * 1024,
+  Math.min(25 * 1024 * 1024, Number(process.env.CSV_BULK_IMAGE_MAX_BYTES) || 15 * 1024 * 1024)
+);
 
 /**
  * Run async work over `items` with a fixed worker pool (order of completion is not guaranteed).
@@ -219,6 +254,163 @@ async function mapPool(items, limit, workerFn) {
 
   await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
   return results;
+}
+
+/**
+ * If CSV already points at our Cloudinary/R2 CDN, reuse the URL (skip download+re-upload).
+ * Returns null when the URL must be fetched and re-hosted.
+ */
+function tryReuseAlreadyHostedCsvImageUrl(rawUrl, productName, order) {
+  const url = String(rawUrl || '').trim();
+  if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return null;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const cloudName = String(process.env.CLOUDINARY_CLOUD_NAME || '').trim().toLowerCase();
+    const isCloudinary =
+      host === 'res.cloudinary.com' ||
+      host.endsWith('.cloudinary.com') ||
+      (cloudName && host.includes(cloudName));
+
+    let isR2 = false;
+    const r2Base = String(process.env.R2_PUBLIC_BASE_URL || '').trim().replace(/\/$/, '');
+    if (r2Base) {
+      try {
+        isR2 = host === new URL(r2Base).hostname.toLowerCase();
+      } catch (_) {
+        isR2 = false;
+      }
+    }
+
+    if (!isCloudinary && !isR2) return null;
+    return {
+      url,
+      publicId: null,
+      altText: productName,
+      order,
+      _reusedHosted: true,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Download (or decode) one CSV image URL, optimize, upload to media store. Retries with backoff.
+ * On total failure returns null so caller can fall back to the original URL.
+ */
+async function uploadOneCsvImageUrlWithRetry(url, productName, rowNumber, imageIndex, maxRetries = 3) {
+  const safeName = slugify(String(productName || 'product'), { lower: true, strict: true }) || 'product';
+  const publicIdName = `csv-${safeName}-r${rowNumber}-img${imageIndex}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      let optimizedBuffer;
+
+      if (url.startsWith('data:image')) {
+        const base64Data = url.split(',')[1];
+        if (!base64Data) throw new Error('Invalid data:image payload');
+        const imageBuffer = Buffer.from(base64Data, 'base64');
+        if (!imageBuffer.length) throw new Error('Empty data:image buffer');
+        if (imageBuffer.length > CSV_BULK_IMAGE_MAX_BYTES) {
+          throw new Error(`data:image exceeds max size (${CSV_BULK_IMAGE_MAX_BYTES} bytes)`);
+        }
+        optimizedBuffer = await optimizeProductImageBuffer(imageBuffer);
+      } else if (url.startsWith('http://') || url.startsWith('https://')) {
+        const response = await axios({
+          method: 'GET',
+          url,
+          responseType: 'arraybuffer',
+          timeout: CSV_BULK_IMAGE_DOWNLOAD_TIMEOUT_MS,
+          maxContentLength: CSV_BULK_IMAGE_MAX_BYTES,
+          maxBodyLength: CSV_BULK_IMAGE_MAX_BYTES,
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FabUniqoBulkImport/1.0)' },
+          validateStatus: (status) => status >= 200 && status < 300,
+        });
+        const raw = Buffer.from(response.data);
+        if (!raw.length) throw new Error('Empty image response');
+        optimizedBuffer = await optimizeProductImageBuffer(raw);
+      } else {
+        throw new Error('Unsupported image reference (expected http(s) or data:image)');
+      }
+
+      const uploadResult = await uploadToCloudinary(optimizedBuffer, 'products', publicIdName);
+      return {
+        url: uploadResult.url,
+        publicId: uploadResult.publicId,
+        altText: productName,
+        order: imageIndex,
+      };
+    } catch (err) {
+      const msg = err?.message || String(err);
+      console.log(`⚠️ CSV image upload attempt ${attempt}/${maxRetries} failed for ${url}: ${msg}`);
+      if (attempt >= maxRetries) {
+        console.log(`❌ CSV image upload failed after ${maxRetries} attempts: ${url}`);
+        return null;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+  return null;
+}
+
+/**
+ * Build variant.images from CSV image column — parallel uploads with stable order.
+ * Failed uploads keep the original URL as fallback (same behaviour as before).
+ */
+async function buildImagesFromCsvUrls(rawImagesCell, productName, rowNumber) {
+  if (!rawImagesCell) return [];
+  const imageUrls = String(rawImagesCell)
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean)
+    .slice(0, MAX_VARIANT_IMAGES);
+
+  if (!imageUrls.length) return [];
+
+  const results = await mapPool(
+    imageUrls,
+    CSV_BULK_IMAGE_UPLOAD_CONCURRENCY,
+    async (url, index) => {
+      try {
+        if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('data:image')) {
+          // Preserve prior behaviour: ignore relative / unknown image refs.
+          return null;
+        }
+        const reused = tryReuseAlreadyHostedCsvImageUrl(url, productName, index);
+        if (reused) {
+          const { _reusedHosted, ...imageDoc } = reused;
+          void _reusedHosted;
+          return imageDoc;
+        }
+        const uploaded = await uploadOneCsvImageUrlWithRetry(url, productName, rowNumber, index);
+        if (uploaded) return uploaded;
+        console.log(`⚠️ Using original URL as fallback: ${url}`);
+        return {
+          url,
+          publicId: null,
+          altText: productName,
+          order: index,
+        };
+      } catch (err) {
+        console.log(
+          `⚠️ Unexpected CSV image worker error for ${url}:`,
+          err?.message || err
+        );
+        return {
+          url,
+          publicId: null,
+          altText: productName,
+          order: index,
+        };
+      }
+    }
+  );
+
+  return results.filter(Boolean).map((img, order) => ({
+    ...img,
+    order,
+  }));
 }
 
 function createCategoryByNameCache() {
@@ -1777,64 +1969,89 @@ const importProductsFromCSV = async (req, res) => {
     const runInsertedProductIds = [];
     
     // =============================================
-    // STEP 4: Process products (SYNCHRONOUSLY) — only after clean preflight
+    // STEP 4: Process products (bounded concurrency) — only after clean preflight
+    // Products already persist inside processProductWithRollback; flushBatch stays as
+    // a post-pass for digest/update hygiene. Abort + rollback semantics unchanged.
     // =============================================
     let batchNumber = 0;
     let currentBatch = [];
-    
+    let completedCount = 0;
+
     const productsArray = Array.from(productMap.values());
-    
-    for (let i = 0; i < productsArray.length; i++) {
-      const { name: productName, rows: productRows, codeBase, nameConflict } = productsArray[i];
-      
+    const abortState = { reason: null };
+
+    console.log(
+      `🚀 CSV import starting: ${productsArray.length} products ` +
+      `(productConcurrency=${CSV_BULK_PRODUCT_CONCURRENCY}, ` +
+      `variantConcurrency=${CSV_BULK_VARIANT_BUILD_CONCURRENCY}, ` +
+      `imageConcurrency=${CSV_BULK_IMAGE_UPLOAD_CONCURRENCY})`
+    );
+
+    await mapPool(productsArray, CSV_BULK_PRODUCT_CONCURRENCY, async (productEntry) => {
+      if (abortState.reason) return;
+
+      const { name: productName, rows: productRows, codeBase, nameConflict } = productEntry;
+
       try {
         const preValidationError = productRows.find((r) => r._preValidationError)?._preValidationError;
         if (preValidationError) {
-          // Should be unreachable after preflight; treat as hard abort signal.
           throw new Error(preValidationError);
         }
-        // Process single product with all its variants
+
         const result = await processProductWithRollback(productName, productRows, stats, {
           codeBase,
           nameConflict
         });
-        
-        if (result.success) {
-          if (result.action === 'inserted') {
-            stats.inserted++;
-            if (result.product?._id) runInsertedProductIds.push(result.product._id);
-          } else if (result.action === 'updated') {
-            stats.updated++;
-          }
-          currentBatch.push(result.product);
-        } else {
+
+        if (!result.success) {
           throw new Error(result.error || 'Product processing failed');
         }
-        
-        // Insert batch when full
-        if (currentBatch.length >= BATCH_SIZE) {
-          batchNumber++;
-          await flushBatch(currentBatch, batchNumber, stats);
-          currentBatch = [];
+
+        // Always track inserts first so abort/rollback cannot miss in-flight saves.
+        if (result.action === 'inserted') {
+          stats.inserted++;
+          if (result.product?._id) runInsertedProductIds.push(result.product._id);
+        } else if (result.action === 'updated') {
+          stats.updated++;
         }
-        
-        const progress = ((i + 1) / productsArray.length * 100).toFixed(2);
-        console.log(`📈 Progress: ${progress}% | Inserted: ${stats.inserted} | Updated: ${stats.updated}`);
-        
+
+        if (abortState.reason) return;
+
+        if (result.product) {
+          currentBatch.push(result.product);
+        }
+
+        completedCount += 1;
+        const progress = ((completedCount / productsArray.length) * 100).toFixed(2);
+        console.log(
+          `📈 Progress: ${progress}% (${completedCount}/${productsArray.length}) | ` +
+          `Inserted: ${stats.inserted} | Updated: ${stats.updated}`
+        );
+
+        if (currentBatch.length >= BATCH_SIZE && stats.failed.length === 0 && !abortState.reason) {
+          const toFlush = currentBatch.splice(0, currentBatch.length);
+          batchNumber += 1;
+          await flushBatch(toFlush, batchNumber, stats);
+        }
       } catch (productError) {
-        console.error(`❌ Error processing ${productName}:`, productError.message);
-        // Unexpected runtime failure: do not continue partial import.
-        stats.failed.push({
-          product: productName,
-          reason: productError.message,
-          rows: productRows.map(r => r.rowNumber),
-          productCode: productRows.map((r) => normalizeProductCode(r.productCode)).filter(Boolean).join(' | ')
-        });
-        break;
+        const message = productError?.message || String(productError);
+        console.error(`❌ Error processing ${productName}:`, message);
+        if (!abortState.reason) {
+          abortState.reason = message;
+          stats.failed.push({
+            product: productName,
+            reason: message,
+            rows: productRows.map((r) => r.rowNumber),
+            productCode: productRows
+              .map((r) => normalizeProductCode(r.productCode))
+              .filter(Boolean)
+              .join(' | ')
+          });
+        }
       }
-    }
-    
-    // Final batch
+    });
+
+    // Final batch (only when import fully succeeded)
     if (currentBatch.length > 0 && stats.failed.length === 0) {
       batchNumber++;
       await flushBatch(currentBatch, batchNumber, stats);
@@ -2368,13 +2585,16 @@ async function processProductWithRollback(productName, productRows, stats, optio
       }
     }
     
-    // SECOND: Build all variants (validation passed)
-    for (let i = 0; i < productRows.length; i++) {
-      const row = productRows[i];
-      const isPrimary = !existingProduct && i === 0;
-      const variant = await buildVariantWithValidation(row, productName, { isPrimary });
-      variants.push(variant);
-    }
+    // SECOND: Build all variants (validation passed) — parallel within product (images dominate)
+    const builtVariants = await mapPool(
+      productRows,
+      CSV_BULK_VARIANT_BUILD_CONCURRENCY,
+      async (row, i) => {
+        const isPrimary = !existingProduct && i === 0;
+        return buildVariantWithValidation(row, productName, { isPrimary });
+      }
+    );
+    variants.push(...builtVariants);
     
     // THIRD: Save to database
     if (existingProduct) {
@@ -2474,72 +2694,8 @@ async function buildVariantWithValidation(row, productName, options = {}) {
       }).filter(attr => attr.key && attr.value)
     : [];
   
-  // Images with retry
-  let imagesArr = [];
-  if (row.images) {
-    const imageUrls = row.images.split(",").map((u) => u.trim()).filter(Boolean).slice(0, MAX_VARIANT_IMAGES);
-    
-    for (let url of imageUrls) {
-      if (!url) continue;
-      
-      let uploadSuccess = false;
-      
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          let uploadResult;
-          
-          if (url.startsWith("data:image")) {
-            const base64Data = url.split(',')[1];
-            const imageBuffer = Buffer.from(base64Data, 'base64');
-            const optimizedBuffer = await optimizeProductImageBuffer(imageBuffer);
-            const publicIdName = `csv-${slugify(String(productName), { lower: true, strict: true })}-r${row.rowNumber}-img${imagesArr.length}-${Date.now()}`;
-            uploadResult = await uploadToCloudinary(optimizedBuffer, 'products', publicIdName);
-          } else if (url.startsWith("http")) {
-            const response = await axios({
-              method: "GET",
-              url: url,
-              responseType: "arraybuffer",
-              timeout: 15000,
-              headers: { "User-Agent": "Mozilla/5.0" },
-            });
-            const optimizedBuffer = await optimizeProductImageBuffer(Buffer.from(response.data));
-            const publicIdName = `csv-${slugify(String(productName), { lower: true, strict: true })}-r${row.rowNumber}-img${imagesArr.length}-${Date.now()}`;
-            uploadResult = await uploadToCloudinary(optimizedBuffer, 'products', publicIdName);
-          } else {
-            continue;
-          }
-          
-          imagesArr.push({
-            url: uploadResult.url,
-            publicId: uploadResult.publicId,
-            altText: productName,
-            order: imagesArr.length,
-          });
-          
-          uploadSuccess = true;
-          break;
-          
-        } catch (err) {
-          console.log(`⚠️ Image upload attempt ${attempt} failed for ${url}:`, err.message);
-          if (attempt === 3) {
-            console.log(`❌ Image upload failed after 3 attempts: ${url}`);
-          } else {
-            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-          }
-        }
-      }
-      
-      if (!uploadSuccess) {
-        console.log(`⚠️ Using original URL as fallback: ${url}`);
-        imagesArr.push({
-          url: url,
-          publicId: null,
-          altText: productName,
-          order: imagesArr.length,
-        });
-      }
-    }
-  }
+  // Images: parallel download/optimize/upload (ZIP-style concurrency; stable order)
+  const imagesArr = await buildImagesFromCsvUrls(row.images, productName, row.rowNumber);
   
   // productCode must come from input CSV (never backend-generated)
   const parsedCode = parseProductCodeParts(row.productCode, `CSV row for ${productName}`);
