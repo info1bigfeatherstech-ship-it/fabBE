@@ -97,27 +97,56 @@ function resolveProductName(item) {
 }
 
 function paymentAndCollectable(order) {
-  const payMethod = String(order?.paymentInfo?.method || order?.paymentMethod || '')
-    .toLowerCase()
-    .trim();
-  const balanceViaCod =
-    String(order?.paymentInfo?.balanceCollectionMethod || '').toLowerCase() === 'cod';
-  const totalInr = roundMoney2(Number(order?.totalAmount) || 0);
-  const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
-  let balanceDue = roundMoney2(Math.max(0, Number(order?.balanceDueInr) || 0));
-  if (!(balanceDue > 0.005) && paidInr > 0.005 && totalInr > 0.005) {
-    balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
+  try {
+    const {
+      hasCourierCollectableLock,
+      getCustomerFacingCollectableInr,
+      getCustomerFacingDeliveryInr,
+      getCustomerFacingOrderTotalInr,
+      computeLiveCourierCollectable
+    } = require('./courierCollectableLock.service');
+
+    if (hasCourierCollectableLock(order)) {
+      const collectable = getCustomerFacingCollectableInr(order);
+      return {
+        paymentMode: collectable > 0.005 ? 'COD' : 'PREPAID',
+        collectable,
+        orderTotal: getCustomerFacingOrderTotalInr(order),
+        shippingCharges: getCustomerFacingDeliveryInr(order)
+      };
+    }
+
+    const live = computeLiveCourierCollectable(order);
+    return {
+      paymentMode: live.paymentMode,
+      collectable: live.collectable,
+      orderTotal: live.orderTotal,
+      shippingCharges: live.shippingCharges
+    };
+  } catch {
+    // Fallback: previous live math (never break label generation)
+    const payMethod = String(order?.paymentInfo?.method || order?.paymentMethod || '')
+      .toLowerCase()
+      .trim();
+    const balanceViaCod =
+      String(order?.paymentInfo?.balanceCollectionMethod || '').toLowerCase() === 'cod';
+    const totalInr = roundMoney2(Number(order?.totalAmount) || 0);
+    const paidInr = roundMoney2(Number(order?.amountPaidInr) || 0);
+    let balanceDue = roundMoney2(Math.max(0, Number(order?.balanceDueInr) || 0));
+    if (!(balanceDue > 0.005) && paidInr > 0.005 && totalInr > 0.005) {
+      balanceDue = roundMoney2(Math.max(0, totalInr - paidInr));
+    }
+    const unpaidInr = roundMoney2(Math.max(0, totalInr - paidInr));
+    if (balanceDue > unpaidInr + 0.005) balanceDue = unpaidInr;
+    const useCodAtDoor = payMethod === 'cod' || (balanceViaCod && balanceDue > 0.005);
+    const collectable = useCodAtDoor ? (payMethod === 'cod' ? totalInr : balanceDue) : 0;
+    return {
+      paymentMode: useCodAtDoor ? 'COD' : 'PREPAID',
+      collectable,
+      orderTotal: totalInr,
+      shippingCharges: roundMoney2(Number(order?.deliveryCharges) || 0)
+    };
   }
-  const unpaidInr = roundMoney2(Math.max(0, totalInr - paidInr));
-  if (balanceDue > unpaidInr + 0.005) balanceDue = unpaidInr;
-  const useCodAtDoor = payMethod === 'cod' || (balanceViaCod && balanceDue > 0.005);
-  const collectable = useCodAtDoor ? (payMethod === 'cod' ? totalInr : balanceDue) : 0;
-  return {
-    paymentMode: useCodAtDoor ? 'COD' : 'PREPAID',
-    collectable,
-    orderTotal: totalInr,
-    shippingCharges: roundMoney2(Number(order?.deliveryCharges) || 0)
-  };
 }
 
 /** Assigned courier for the label header. Skip aggregator brand; keep original casing. */

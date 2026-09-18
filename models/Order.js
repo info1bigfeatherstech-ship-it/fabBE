@@ -179,7 +179,18 @@ const orderSchema = new mongoose.Schema(
       addressScoreSyncedAt: { type: Date, default: null },
       /** Shiprocket RTO reverse freight (₹), when known from billing/shipment APIs */
       rtoFreightCharge: { type: Number, default: null },
-      rtoFreightSyncedAt: { type: Date, default: null }
+      rtoFreightSyncedAt: { type: Date, default: null },
+      /**
+       * Push-time courier collectable freeze (partial COD / Ship Now freight).
+       * null = legacy live balanceDueInr behaviour. 0 = prepaid / nothing to collect (locked).
+       */
+      courierCollectableInr: { type: Number, default: null },
+      /** Push-time deliveryCharges snapshot for customer/label when lock is set */
+      courierDeliveryInr: { type: Number, default: null },
+      /** Push-time order total snapshot for customer/label when lock is set */
+      courierFacingTotalInr: { type: Number, default: null },
+      codLockedAt: { type: Date, default: null },
+      codLockSource: { type: String, default: null }
     },
 
     /** Cached shipment ops view (list/detail actions + provider state classification) */

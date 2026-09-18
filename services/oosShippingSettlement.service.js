@@ -662,12 +662,37 @@ async function settleOosShippingAfterActualFreight(order, opts = {}) {
       };
     }
 
-    const noteMsg =
-      math.refundInr > 0.005
-        ? `Your order was updated after courier assignment. A refund of ₹${math.refundInr.toFixed(2)} has been processed.`
-        : math.balanceDueInr > 0.005
-          ? `Your order was updated after courier assignment. Balance due is now ₹${math.balanceDueInr.toFixed(2)}.`
-          : `Your order was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+    const noteMsg = (() => {
+      try {
+        if (math.refundInr > 0.005) {
+          return `Your order was updated after courier assignment. A refund of ₹${math.refundInr.toFixed(2)} has been processed.`;
+        }
+        const {
+          hasCourierCollectableLock,
+          getCustomerFacingCollectableInr
+        } = require('./courierCollectableLock.service');
+        // When COD is frozen on the courier, do not tell the customer a new "balance due".
+        if (hasCourierCollectableLock(order)) {
+          const lockedCod = getCustomerFacingCollectableInr(order);
+          if (lockedCod > 0.005) {
+            return `Your order was updated after courier assignment. Please pay ₹${lockedCod.toFixed(2)} to the courier on delivery (amount set when your shipment was created). Final shipping on our side is ₹${math.customerDelivery.toFixed(2)}.`;
+          }
+          return `Your order was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+        }
+        if (math.balanceDueInr > 0.005) {
+          return `Your order was updated after courier assignment. Balance due is now ₹${math.balanceDueInr.toFixed(2)}.`;
+        }
+        return `Your order was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+      } catch {
+        if (math.refundInr > 0.005) {
+          return `Your order was updated after courier assignment. A refund of ₹${math.refundInr.toFixed(2)} has been processed.`;
+        }
+        if (math.balanceDueInr > 0.005) {
+          return `Your order was updated after courier assignment. Balance due is now ₹${math.balanceDueInr.toFixed(2)}.`;
+        }
+        return `Your order was updated after courier assignment. Final shipping is ₹${math.customerDelivery.toFixed(2)}.`;
+      }
+    })();
 
     try {
       const noteOrder = await Order.findById(order._id);

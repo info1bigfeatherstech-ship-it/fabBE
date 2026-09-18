@@ -663,6 +663,36 @@ async function upsertShipmentInfo({
         nextShipmentInfo.fulfillmentArtifactAwb = nextAwb || null;
     }
 
+    // Preserve / first-set push-time courier collectable lock (never wipe on sync).
+    try {
+        const {
+            mergeCourierCollectableLockIntoShipmentInfo
+        } = require('../services/courierCollectableLock.service');
+        mergeCourierCollectableLockIntoShipmentInfo({
+            prevSi,
+            nextShipmentInfo,
+            shipmentPayload
+        });
+    } catch (lockMergeErr) {
+        logger.warn('courierCollectableLock merge failed during upsertShipmentInfo', {
+            orderId: order?.orderId,
+            trigger,
+            message: lockMergeErr?.message || String(lockMergeErr)
+        });
+        // Belt-and-suspenders: restore prior lock if merge threw
+        try {
+            if (prevSi?.courierCollectableInr != null && Number.isFinite(Number(prevSi.courierCollectableInr))) {
+                nextShipmentInfo.courierCollectableInr = prevSi.courierCollectableInr;
+                if (prevSi.courierDeliveryInr != null) nextShipmentInfo.courierDeliveryInr = prevSi.courierDeliveryInr;
+                if (prevSi.courierFacingTotalInr != null) nextShipmentInfo.courierFacingTotalInr = prevSi.courierFacingTotalInr;
+                if (prevSi.codLockedAt) nextShipmentInfo.codLockedAt = prevSi.codLockedAt;
+                if (prevSi.codLockSource) nextShipmentInfo.codLockSource = prevSi.codLockSource;
+            }
+        } catch {
+            /* ignore */
+        }
+    }
+
     order.shipmentInfo = nextShipmentInfo;
     order.markModified('shipmentInfo');
     await order.save();
@@ -757,7 +787,19 @@ async function ensureShipmentForOrder({ order, trigger }) {
             shipmentPayload: {
                 ...result,
                 provider: SHIPPING_PROVIDERS.SHIPMOZO,
-                providerStatus: result.providerStatus || 'PUSHED'
+                providerStatus: result.providerStatus || 'PUSHED',
+                ...(() => {
+                    try {
+                        const {
+                            buildCourierLockShipmentPayloadFields
+                        } = require('../services/courierCollectableLock.service');
+                        return buildCourierLockShipmentPayloadFields(order, {
+                            source: 'shipmozo_push'
+                        });
+                    } catch {
+                        return {};
+                    }
+                })()
             },
             trigger,
             allowOrderStatusUpdate: false
@@ -844,7 +886,19 @@ async function ensureShipmentForOrder({ order, trigger }) {
             ...result,
             provider: SHIPPING_PROVIDERS.SHIPROCKET,
             // Do NOT force a "shipped-like" status here; let Shiprocket/tracking drive state.
-            providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null)
+            providerStatus: result.providerStatus || (result.mock ? 'mock_created' : null),
+            ...(() => {
+                try {
+                    const {
+                        buildCourierLockShipmentPayloadFields
+                    } = require('../services/courierCollectableLock.service');
+                    return buildCourierLockShipmentPayloadFields(order, {
+                        source: 'shiprocket_push'
+                    });
+                } catch {
+                    return {};
+                }
+            })()
         },
         trigger,
         // Advance orderStatus from carrier only when AWB exists (shipment_id alone = still "invoiced").
@@ -3117,6 +3171,26 @@ exports.getOrder = async (req, res) => {
             // Admin/RTO-only shipping split — never surface on customer order API.
             delete transformedOrder.deliveryFreightInr;
             delete transformedOrder.deliveryCodFeeInr;
+            try {
+                const {
+                    attachCustomerFacingMoneyFields
+                } = require('../services/courierCollectableLock.service');
+                attachCustomerFacingMoneyFields(transformedOrder);
+            } catch {
+                /* ignore — customer still gets raw order fields */
+            }
+        } else {
+            try {
+                const {
+                    attachCustomerFacingMoneyFields,
+                    getAdminCollectableLockDiffHint
+                } = require('../services/courierCollectableLock.service');
+                attachCustomerFacingMoneyFields(transformedOrder);
+                const hint = getAdminCollectableLockDiffHint(order);
+                if (hint) transformedOrder.courierCollectableLockHint = hint;
+            } catch {
+                /* ignore */
+            }
         }
 
         if (isOrderStaff && transformedOrder.userId && typeof transformedOrder.userId === 'object') {
@@ -3174,11 +3248,19 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();
             normalizeTerminalUnpaidFinancials(plain);
+            try {
+                const {
+                    attachCustomerFacingMoneyFields
+                } = require('../services/courierCollectableLock.service');
+                attachCustomerFacingMoneyFields(plain);
+            } catch {
+                /* ignore */
+            }
             return plain;
         });
 
