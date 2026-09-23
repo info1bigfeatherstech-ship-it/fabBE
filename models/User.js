@@ -228,6 +228,21 @@ const userSchema = new mongoose.Schema(
       type: [String],
       enum: ["ecomm", "wholesale"],
       default: ["ecomm"]
+    },
+
+    // ===== LOYALTY (cached; recomputed from qualifying orders) =====
+    loyalty: {
+      lifetimeSpendInr: { type: Number, default: 0, min: 0 },
+      lifetimeOrderCount: { type: Number, default: 0, min: 0 },
+      /** LoyaltyBadge._id */
+      badgeId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyBadge', default: null },
+      badgeSlug: { type: String, default: null, trim: true, lowercase: true },
+      badgeName: { type: String, default: null, trim: true },
+      badgeColor: { type: String, default: null, trim: true },
+      badgeRank: { type: Number, default: 0, min: 0 },
+      /** When the current badge was first granted (kept across recomputes of same badge). */
+      badgeGrantedAt: { type: Date, default: null },
+      recomputedAt: { type: Date, default: null }
     }
   },
   { timestamps: true }
@@ -271,6 +286,8 @@ userSchema.index(
 userSchema.index({ email: 1, phone: 1 });
 userSchema.index({ registrationMethod: 1 });
 userSchema.index({ accountScope: 1, userType: 1 });
+userSchema.index({ 'loyalty.badgeSlug': 1 });
+userSchema.index({ 'loyalty.lifetimeSpendInr': -1 });
 
 /**
  * Never persist empty/null on unique contact fields — otherwise a legacy

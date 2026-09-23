@@ -116,7 +116,7 @@ async function buildFinalTotals({
       evaluated.subtotal,
       finalUserType,
       null,
-      { consumeUsage: false }
+      { consumeUsage: false, userId: cartDoc?.userId || req?.userId || null }
     );
     let deliveryCharges = roundMoney2(35 + Math.floor(Math.random() * 56));
     const originalDeliveryCharges = deliveryCharges;

@@ -4,6 +4,8 @@
  */
 const crypto = require('crypto');
 const Coupon = require('../models/Coupon');
+const User = require('../models/User');
+const { couponLoyaltyEligible } = require('./loyalty.service');
 const Product = require('../models/Product');
 const {
   checkDeliveryAvailabilityForActiveProvider
@@ -253,7 +255,7 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
   };
 }
 
-async function resolveCouponDiscount(couponCode, subtotal, finalUserType, session, { consumeUsage }) {
+async function resolveCouponDiscount(couponCode, subtotal, finalUserType, session, { consumeUsage, userId } = {}) {
   let discount = 0;
   let appliedCouponCode = null;
   if (!couponCode || !String(couponCode).trim()) {
@@ -275,7 +277,20 @@ async function resolveCouponDiscount(couponCode, subtotal, finalUserType, sessio
   const isUsageLimited = Number.isFinite(usageLimit) && usageLimit > 0;
   const hasUsageLeft = !isUsageLimited || Number(coupon.usedCount || 0) < usageLimit;
 
-  if (!isExpired && meetsMinOrder && isUserEligible && hasUsageLeft) {
+  let loyaltyOk = true;
+  const allowedBadges = Array.isArray(coupon.allowedLoyaltyBadges) ? coupon.allowedLoyaltyBadges : [];
+  if (allowedBadges.length > 0) {
+    let userLoyaltySlug = null;
+    if (userId) {
+      let uq = User.findById(userId).select('loyalty.badgeSlug');
+      if (session) uq = uq.session(session);
+      const userDoc = await uq.lean();
+      userLoyaltySlug = userDoc?.loyalty?.badgeSlug || null;
+    }
+    loyaltyOk = couponLoyaltyEligible(coupon, userLoyaltySlug);
+  }
+
+  if (!isExpired && meetsMinOrder && isUserEligible && hasUsageLeft && loyaltyOk) {
     if (coupon.discountType === 'percentage') {
       discount = (subtotal * coupon.discountValue) / 100;
       if (coupon.maxDiscountAmount && discount > coupon.maxDiscountAmount) {
@@ -321,15 +336,17 @@ async function computeCheckoutTotals({
   consumeCoupon,
   codAmountForShiprocket = 0,
   deliveryChargesOverride = null,
-  deliveryMetaOverride = null
+  deliveryMetaOverride = null,
+  userId = null
 }) {
   const evaluated = await evaluateCartForCheckout(cart, finalUserType, session, storefront);
+  const resolvedUserId = userId || cart?.userId || null;
   const { discount, appliedCouponCode } = await resolveCouponDiscount(
     couponCode,
     evaluated.subtotal,
     finalUserType,
     session,
-    { consumeUsage: consumeCoupon }
+    { consumeUsage: consumeCoupon, userId: resolvedUserId }
   );
 
   let deliveryCharges;

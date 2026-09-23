@@ -24,6 +24,7 @@ const {
   buildStaffContactLookup,
   customerScopeFromStorefront
 } = require('../utils/accountScope');
+const { publicLoyaltyView } = require('../services/loyalty.service');
 
 // Import from OTP service
 const {
@@ -2088,7 +2089,8 @@ const me = async (req, res) => {
         status: user.status,
         isPhoneVerified: user.isPhoneVerified,
          isEmailVerified: user.isEmailVerified,  // ✅ Add this too
-        isProfileComplete: user.isProfileComplete  // ✅ Add this too
+        isProfileComplete: user.isProfileComplete,  // ✅ Add this too
+        loyalty: publicLoyaltyView(user)
       }
     });
   } catch (error) {

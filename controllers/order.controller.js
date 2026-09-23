@@ -36,6 +36,7 @@ const { findCartForStorefront } = require('../services/cartStorefront.service');
 const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const { scheduleLoyaltyRecomputeForOrder } = require('../services/loyalty.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
     buildShippingWeightSnapshotFromCheckoutLines,
@@ -179,6 +180,7 @@ async function applySuccessfulOnlineCaptureSideEffects(order, trigger) {
         });
     }
 
+    // Loyalty is scheduled by callers AFTER order.save() — never here (DB race).
     return { dirty, recovery: recovery.changed ? recovery : null };
 }
 
@@ -410,6 +412,7 @@ async function upsertShipmentInfo({
     allowOrderStatusUpdate = true
 }) {
     if (!order || !shipmentPayload) return false;
+    let loyaltyAfterSave = false;
     const prevSi = order.shipmentInfo || {};
     const prevAwb = String(prevSi.awbCode || prevSi.trackingNumber || '').trim();
     const prevCourierId = String(prevSi.assignedCourierId || '').trim();
@@ -600,6 +603,14 @@ async function upsertShipmentInfo({
             if (mappedOrderStatus === 'delivered' && !nextShipmentInfo.deliveredAt) {
                 nextShipmentInfo.deliveredAt = new Date();
             }
+            // Loyalty after order.save() below (COD / spend refresh) — flag only here.
+            if (
+                mappedOrderStatus === 'delivered' &&
+                previousOrderStatus !== 'delivered' &&
+                order.userId
+            ) {
+                loyaltyAfterSave = true;
+            }
             // Clear false delivery latch when Shiprocket corrects to NDR / transit / OFD / RTO.
             if (previousOrderStatus === 'delivered' && mappedOrderStatus !== 'delivered') {
                 nextShipmentInfo.deliveredAt = null;
@@ -696,6 +707,10 @@ async function upsertShipmentInfo({
     order.shipmentInfo = nextShipmentInfo;
     order.markModified('shipmentInfo');
     await order.save();
+
+    if (loyaltyAfterSave) {
+        scheduleLoyaltyRecomputeForOrder(order, { reason: `shipment_${trigger || 'upsert'}_delivered` });
+    }
 
     try {
         const { evaluateAndPersistShipmentOps } = require('../services/shipmentOps');
@@ -1978,6 +1993,7 @@ exports.verifyPayment = async (req, res) => {
             if (dirty) {
                 await order.save();
             }
+            scheduleLoyaltyRecomputeForOrder(order, { reason: 'verify_idempotent' });
             return res.json({
                 success: true,
                 message: 'Payment already verified',
@@ -2007,6 +2023,7 @@ exports.verifyPayment = async (req, res) => {
             if (dirty) {
                 await order.save();
             }
+            scheduleLoyaltyRecomputeForOrder(order, { reason: 'verify_already_confirmed' });
             return res.json({
                 success: true,
                 message: 'Payment verified successfully',
@@ -2028,6 +2045,7 @@ exports.verifyPayment = async (req, res) => {
                 order.markModified('paymentInfo');
                 await order.save();
             }
+            scheduleLoyaltyRecomputeForOrder(order, { reason: 'verify_already_paid' });
             return res.json({
                 success: true,
                 message: 'Payment already verified',
@@ -2128,6 +2146,7 @@ exports.verifyPayment = async (req, res) => {
 
         order.markModified('paymentInfo');
         await order.save();
+        scheduleLoyaltyRecomputeForOrder(order, { reason: 'payment_verified' });
 
         const shouldEnqueueShipmentAfterVerify =
             isLegacyAutoFulfillOnCheckout() &&
@@ -2218,6 +2237,7 @@ exports.razorpayWebhook = async (req, res) => {
                     if (dirty) {
                         await order.save();
                     }
+                    scheduleLoyaltyRecomputeForOrder(order, { reason: 'webhook_already_paid' });
                     break;
                 }
 
@@ -2231,6 +2251,7 @@ exports.razorpayWebhook = async (req, res) => {
                     if (dirty) {
                         await order.save();
                     }
+                    scheduleLoyaltyRecomputeForOrder(order, { reason: 'webhook_idempotent' });
                     break;
                 }
 
@@ -2274,6 +2295,7 @@ exports.razorpayWebhook = async (req, res) => {
 
                 order.markModified('paymentInfo');
                 await order.save();
+                scheduleLoyaltyRecomputeForOrder(order, { reason: 'razorpay_webhook_payment_captured' });
 
                 const shouldEnqueueShipmentAfterWebhook =
                     isLegacyAutoFulfillOnCheckout() &&
@@ -2319,6 +2341,9 @@ exports.razorpayWebhook = async (req, res) => {
                     if (dirty) {
                         await failedOrder.save();
                     }
+                    scheduleLoyaltyRecomputeForOrder(failedOrder, {
+                        reason: 'webhook_failed_ignored_already_paid'
+                    });
                     logger.info('[paymentState] Ignored payment.failed — order already has capture', {
                         orderId: failedOrder.orderId,
                         paymentStatus: failedOrder.paymentStatus,
@@ -3038,6 +3063,8 @@ exports.getOrder = async (req, res) => {
                 const { dirty } = await applySuccessfulOnlineCaptureSideEffects(order, 'get_order_self_heal');
                 if (dirty) {
                     await order.save();
+                    // Only when payment/orderStatus was healed — avoid recompute on every order view.
+                    scheduleLoyaltyRecomputeForOrder(order, { reason: 'get_order_self_heal' });
                 }
             } catch (healErr) {
                 logger.warn('[getOrder] payment state self-heal skipped', {

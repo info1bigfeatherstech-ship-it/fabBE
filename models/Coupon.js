@@ -40,6 +40,14 @@ const couponSchema = new mongoose.Schema({
         enum: ['user', 'wholesaler', 'admin'],
         default: ['user', 'wholesaler']
     },
+    /**
+     * Empty / omitted = all loyalty badges (including users with no badge).
+     * Non-empty = user must currently hold one of these badge slugs.
+     */
+    allowedLoyaltyBadges: {
+        type: [String],
+        default: [],
+    },
     usageLimit: {
         type: Number,
         default: null  // Total times coupon can be used

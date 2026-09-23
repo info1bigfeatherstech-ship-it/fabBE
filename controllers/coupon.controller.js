@@ -1,8 +1,13 @@
 // controllers/coupon.controller.js
 const Coupon = require('../models/Coupon');
 const Order = require('../models/Order');
+const User = require('../models/User');
 const { evaluateCartForCheckout, couponUserEligible } = require('../services/checkoutComputation.service');
 const { findCartForStorefront } = require('../services/cartStorefront.service');
+const {
+  couponLoyaltyEligible,
+  normalizeSlug
+} = require('../services/loyalty.service');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const FIRST_ORDER_COUPON_CODE = 'WELC01';
@@ -42,6 +47,7 @@ const createCoupon = async (req, res) => {
             maxDiscountAmount,
             minOrderValue,
             applicableUsers,
+            allowedLoyaltyBadges,
             usageLimit,
             perUserLimit,
             expiryDate,
@@ -66,6 +72,9 @@ const createCoupon = async (req, res) => {
             maxDiscountAmount: maxDiscountAmount || null,
             minOrderValue: minOrderValue || 0,
             applicableUsers: applicableUsers || ['user', 'wholesaler'],
+            allowedLoyaltyBadges: Array.isArray(allowedLoyaltyBadges)
+              ? allowedLoyaltyBadges.map((s) => normalizeSlug(s)).filter(Boolean)
+              : [],
             usageLimit: usageLimit || null,
             perUserLimit: perUserLimit || 1,
             expiryDate,
@@ -159,7 +168,7 @@ const getCouponById = async (req, res) => {
 const updateCoupon = async (req, res) => {
     try {
         const { id } = req.params;
-        const updates = req.body;
+        const updates = { ...(req.body || {}) };
 
         // Don't allow code change if already exists
         if (updates.code) {
@@ -174,6 +183,12 @@ const updateCoupon = async (req, res) => {
                     message: 'Coupon code already exists'
                 });
             }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(updates, 'allowedLoyaltyBadges')) {
+            updates.allowedLoyaltyBadges = Array.isArray(updates.allowedLoyaltyBadges)
+                ? updates.allowedLoyaltyBadges.map((s) => normalizeSlug(s)).filter(Boolean)
+                : [];
         }
 
         const coupon = await Coupon.findByIdAndUpdate(
@@ -312,6 +327,17 @@ const validateCoupon = async (req, res) => {
             return couponError(res, 400, 'COUPON_NOT_ELIGIBLE', 'Coupon not applicable for your account type');
         }
 
+        // Loyalty badge targeting (empty list = all customers)
+        const userDoc = await User.findById(userId).select('loyalty.badgeSlug').lean();
+        if (!couponLoyaltyEligible(coupon, userDoc?.loyalty?.badgeSlug)) {
+            return couponError(
+                res,
+                400,
+                'COUPON_LOYALTY_NOT_ELIGIBLE',
+                'This coupon is only for selected loyalty members'
+            );
+        }
+
         // First-order only coupon guard (admin-managed by code)
         if (isFirstOrderCoupon(coupon)) {
             const alreadyPlacedOrder = await hasPlacedAnyOrder(userId);
@@ -393,7 +419,11 @@ const getAvailableCoupons = async (req, res) => {
             isActive: true,
             expiryDate: { $gt: now },
             applicableUsers: applicableFilter
-        }).select('code name description discountType discountValue maxDiscountAmount minOrderValue expiryDate');
+        }).select('code name description discountType discountValue maxDiscountAmount minOrderValue expiryDate allowedLoyaltyBadges');
+
+        const userDoc = await User.findById(req.userId).select('loyalty.badgeSlug').lean();
+        const userSlug = userDoc?.loyalty?.badgeSlug || null;
+        coupons = coupons.filter((coupon) => couponLoyaltyEligible(coupon, userSlug));
 
         const alreadyPlacedOrder = await hasPlacedAnyOrder(req.userId);
         if (alreadyPlacedOrder) {

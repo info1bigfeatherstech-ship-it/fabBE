@@ -24,6 +24,60 @@ const { buildNameAndProductCodeSearch } = require('../utils/productCode');
 const storefrontFrom = (req) => req.storefront || 'ecomm';
 const useWholesalePricing = (storefront) => storefront === 'wholesale';
 
+/** Max docs Mongo `$sample` may return in one storefront request (DoS / memory guard). */
+const RANDOM_SAMPLE_MAX = 100;
+/** Hard cap for any storefront list query. */
+const STOREFRONT_LIST_MAX = 200;
+
+function isRandomSortParam(sort) {
+  const s = String(sort || '').trim().toLowerCase();
+  return s === 'random' || s === 'shuffle';
+}
+
+/**
+ * Load storefront product docs: newest-first by default, or uniform random sample
+ * across the full matched set (not only the newest page).
+ * On `$sample` failure, falls back to newest-first so listings never hard-fail.
+ */
+async function fetchStorefrontProductDocs(filters, { sort, skip = 0, limit = 12 } = {}) {
+  const lim = Math.min(Math.max(1, Number(limit) || 12), STOREFRONT_LIST_MAX);
+  const sk = Math.max(0, Number(skip) || 0);
+
+  if (isRandomSortParam(sort)) {
+    try {
+      const sampleSize = Math.min(lim, RANDOM_SAMPLE_MAX);
+      const sampled = await Product.aggregate([
+        { $match: filters && typeof filters === 'object' ? filters : {} },
+        { $sample: { size: sampleSize } },
+        { $project: { _id: 1 } },
+      ]);
+      const ids = (Array.isArray(sampled) ? sampled : [])
+        .map((d) => d && d._id)
+        .filter(Boolean);
+      if (!ids.length) return [];
+
+      const docs = await Product.find({ _id: { $in: ids } })
+        .populate('category')
+        .lean({ virtuals: true });
+
+      const byId = new Map((docs || []).map((d) => [String(d._id), d]));
+      return ids.map((id) => byId.get(String(id))).filter(Boolean);
+    } catch (err) {
+      console.error(
+        '[products] random $sample failed, falling back to newest-first:',
+        err?.message || err
+      );
+    }
+  }
+
+  return Product.find(filters)
+    .sort({ createdAt: -1 })
+    .skip(sk)
+    .limit(lim)
+    .populate('category')
+    .lean({ virtuals: true });
+}
+
 /** Deep-clone cached JSON so inventory overlay never mutates Redis/memory cache entries. */
 function cloneCachedPayload(payload) {
   if (payload == null) return payload;
@@ -200,8 +254,10 @@ async function attachAppliedTagsToProduct(product) {
 const getProducts = async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit) || 12);
-    const skip = (page - 1) * limit;
+    const limit = Math.min(
+      STOREFRONT_LIST_MAX,
+      Math.max(1, parseInt(req.query.limit) || 12)
+    );
 
     const tagsFilter = normalizeTagSlugs(req.query.tags);
 
@@ -242,7 +298,10 @@ const getProducts = async (req, res) => {
     }
 
     // search — name + productCode only (same rules as /products/search)
-    let sortOption = { createdAt: -1 };
+    const sortParam = String(req.query.sort || '').trim().toLowerCase();
+    const useRandom = isRandomSortParam(sortParam);
+    // Random samples the full match set; page>1 still returns a fresh sample (browse variety).
+    const skip = useRandom ? 0 : (page - 1) * limit;
 
     if (req.query.q) {
       const searchClause = buildNameAndProductCodeSearch(req.query.q);
@@ -251,14 +310,19 @@ const getProducts = async (req, res) => {
 
     const filters = mongoCatalogAnd(storefront, ...extraClauses);
 
+    // Bucket random cache ~5 min so order rotates without bypassing cache entirely.
+    const randomBucket = useRandom ? Math.floor(Date.now() / (5 * 60 * 1000)) : null;
+
     const cacheKey = cacheConfig.generateKey("PRODUCT", {
       v: "name-code-v3",
-      page,
+      page: useRandom ? 1 : page,
       limit,
       category: req.query.category,
       featured: req.query.featured,
       q: req.query.q,
       tags: tagsFilter.join(","),
+      sort: useRandom ? 'random' : 'newest',
+      randomBucket,
       userType: currentUserType,
       storefront,
     });
@@ -282,12 +346,11 @@ const getProducts = async (req, res) => {
 
     const [total, products] = await Promise.all([
       Product.countDocuments(filters),
-      Product.find(filters)
-        .sort(sortOption)
-        .skip(skip)
-        .limit(limit)
-        .populate("category")
-        .lean({ virtuals: true }),
+      fetchStorefrontProductDocs(filters, {
+        sort: useRandom ? 'random' : undefined,
+        skip,
+        limit,
+      }),
     ]);
 
     const productsWithData = await attachAppliedTagsToProducts(
@@ -565,7 +628,10 @@ const getProductsByCategory = async (req, res) => {
     const { slug } = req.params;
 
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit) || 12);
+    const limit = Math.min(
+      STOREFRONT_LIST_MAX,
+      Math.max(1, parseInt(req.query.limit) || 12)
+    );
     const skip = (page - 1) * limit;
 
     const currentUserType = req.userType || "user";
@@ -579,6 +645,10 @@ const getProductsByCategory = async (req, res) => {
       page,
       limit,
       tags: tagsFilter.join(","),
+      sort: isRandomSortParam(req.query.sort) ? 'random' : 'newest',
+      randomBucket: isRandomSortParam(req.query.sort)
+        ? Math.floor(Date.now() / (5 * 60 * 1000))
+        : null,
       userType: currentUserType,
       storefront: currentStorefront,
     });
@@ -641,14 +711,14 @@ const getProductsByCategory = async (req, res) => {
       ...extraClauses
     );
 
+    const useRandom = isRandomSortParam(req.query.sort);
     const total = await Product.countDocuments(filters);
 
-    const products = await Product.find(filters)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate("category")
-      .lean({ virtuals: true });
+    const products = await fetchStorefrontProductDocs(filters, {
+      sort: useRandom ? 'random' : undefined,
+      skip: useRandom ? 0 : skip,
+      limit,
+    });
 
     const productsWithData = await attachAppliedTagsToProducts(
       products.map((product) =>
