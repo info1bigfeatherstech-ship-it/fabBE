@@ -130,6 +130,15 @@ class PaymentHoldExpiryService {
           session.endSession();
           processed += 1;
           logger.info('[paymentHold] Expired unpaid order', { orderId: order.orderId });
+
+          try {
+            const {
+              scheduleLoyaltyPointsSideEffectsForOrder
+            } = require('./loyaltyPoints.service');
+            scheduleLoyaltyPointsSideEffectsForOrder(order, { reason: 'payment_timeout' });
+          } catch (_) {
+            /* non-blocking */
+          }
         } catch (err) {
           await session.abortTransaction().catch(() => {});
           session.endSession();

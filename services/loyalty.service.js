@@ -254,6 +254,18 @@ function buildLoyaltyCache(stats, badge, { previousLoyalty = null } = {}) {
     }
   }
 
+  // Preserve redeemable points fields — badge recompute must NEVER wipe them.
+  // (Older code $set the whole `loyalty` object and zeroed balances after earn.)
+  const pointsBalance = Math.max(0, Math.floor(Number(previousLoyalty?.pointsBalance) || 0));
+  const pointsLifetimeEarned = Math.max(
+    0,
+    Math.floor(Number(previousLoyalty?.pointsLifetimeEarned) || 0)
+  );
+  const pointsLifetimeRedeemed = Math.max(
+    0,
+    Math.floor(Number(previousLoyalty?.pointsLifetimeRedeemed) || 0)
+  );
+
   return {
     lifetimeSpendInr: roundMoney2(stats.lifetimeSpendInr || 0),
     lifetimeOrderCount: Math.max(0, Math.floor(Number(stats.lifetimeOrderCount) || 0)),
@@ -263,7 +275,10 @@ function buildLoyaltyCache(stats, badge, { previousLoyalty = null } = {}) {
     badgeColor: badge?.color || null,
     badgeRank: badge ? Number(badge.rank || 0) : 0,
     badgeGrantedAt,
-    recomputedAt: new Date()
+    recomputedAt: new Date(),
+    pointsBalance,
+    pointsLifetimeEarned,
+    pointsLifetimeRedeemed
   };
 }
 
@@ -299,8 +314,26 @@ async function recomputeUserLoyalty(userId, options = {}) {
 
   const loyalty = buildLoyaltyCache(stats, badge, { previousLoyalty: previous.loyalty });
 
-  // updateOne avoids findByIdAndUpdate + conflicting exclude projections on refreshTokens.*
-  const updateResult = await User.updateOne({ _id: userId }, { $set: { loyalty } });
+  // Dot-path $set for badge/spend fields ONLY.
+  // Never touch loyalty.pointsBalance / lifetime earned|redeemed — those are owned by
+  // loyaltyPoints.service ledger writes. Replacing the whole `loyalty` subdoc previously
+  // wiped balances after payment earn (ledger still showed credits).
+  const updateResult = await User.updateOne(
+    { _id: userId },
+    {
+      $set: {
+        'loyalty.lifetimeSpendInr': loyalty.lifetimeSpendInr,
+        'loyalty.lifetimeOrderCount': loyalty.lifetimeOrderCount,
+        'loyalty.badgeId': loyalty.badgeId,
+        'loyalty.badgeSlug': loyalty.badgeSlug,
+        'loyalty.badgeName': loyalty.badgeName,
+        'loyalty.badgeColor': loyalty.badgeColor,
+        'loyalty.badgeRank': loyalty.badgeRank,
+        'loyalty.badgeGrantedAt': loyalty.badgeGrantedAt,
+        'loyalty.recomputedAt': loyalty.recomputedAt
+      }
+    }
+  );
   if (!updateResult || (updateResult.matchedCount === 0 && updateResult.n === 0)) {
     throw new Error('recomputeUserLoyalty: user not found');
   }

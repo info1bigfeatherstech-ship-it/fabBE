@@ -45,6 +45,31 @@ const orderSchema = new mongoose.Schema(
     tax: { type: Number, required: true, default: 0 },
     discount: { type: Number, default: 0 },
     totalAmount: { type: Number, required: true },
+
+    /**
+     * Loyalty points snapshot (separate from badge tiers).
+     * redeem debited at order create; earn on payment success; clawback on RTO/return.
+     */
+    loyaltyPoints: {
+      redeemed: { type: Number, default: 0, min: 0 },
+      discountInr: { type: Number, default: 0, min: 0 },
+      redeemStatus: {
+        type: String,
+        enum: ['none', 'pending', 'debited', 'restored'],
+        default: 'none'
+      },
+      earned: { type: Number, default: 0, min: 0 },
+      earnStatus: {
+        type: String,
+        enum: ['pending', 'credited', 'clawed_back', 'skipped', 'none'],
+        default: 'pending'
+      },
+      redeemLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyPointLedger', default: null },
+      earnLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyPointLedger', default: null },
+      clawbackLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: 'LoyaltyPointLedger', default: null },
+      earnCreditedAt: { type: Date, default: null },
+      clawedBackAt: { type: Date, default: null }
+    },
     
     address: { type: mongoose.Schema.Types.ObjectId, ref: 'Address', required: true },
     addressSnapshot: { type: Object, required: true },

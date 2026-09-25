@@ -37,6 +37,13 @@ const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
 const { scheduleLoyaltyRecomputeForOrder } = require('../services/loyalty.service');
+const {
+    scheduleLoyaltyPointsSideEffectsForOrder,
+    debitRedeemForOrder,
+    buildOrderLoyaltySnapshot,
+    getSettings: getLoyaltyPointsSettings,
+    computeEarnPointsForOrder
+} = require('../services/loyaltyPoints.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
     buildShippingWeightSnapshotFromCheckoutLines,
@@ -56,6 +63,16 @@ const {
     isCustomerProductReturnRequest,
     buildAdminProductReturnRequestMatch
 } = require('../utils/productReturnRequest');
+
+/** Badge recompute + points earn/clawback/restore — never throws into payment paths. */
+function scheduleLoyaltyAfterOrderPersist(order, options = {}) {
+    // Sequence: badge fields first (dot-path $set, does not touch points), then points ledger.
+    // Still fire-and-forget so payment / shipment paths never await.
+    void Promise.resolve(scheduleLoyaltyRecomputeForOrder(order, options))
+        .catch(() => null)
+        .then(() => scheduleLoyaltyPointsSideEffectsForOrder(order, options))
+        .catch(() => null);
+}
 const {
     normalizePaymentMethod,
     normalizePaymentPlan,
@@ -413,6 +430,7 @@ async function upsertShipmentInfo({
 }) {
     if (!order || !shipmentPayload) return false;
     let loyaltyAfterSave = false;
+    let loyaltyPointsRtoAfterSave = false;
     const prevSi = order.shipmentInfo || {};
     const prevAwb = String(prevSi.awbCode || prevSi.trackingNumber || '').trim();
     const prevCourierId = String(prevSi.assignedCourierId || '').trim();
@@ -611,6 +629,13 @@ async function upsertShipmentInfo({
             ) {
                 loyaltyAfterSave = true;
             }
+            if (
+                mappedOrderStatus === 'rto' &&
+                previousOrderStatus !== 'rto' &&
+                order.userId
+            ) {
+                loyaltyPointsRtoAfterSave = true;
+            }
             // Clear false delivery latch when Shiprocket corrects to NDR / transit / OFD / RTO.
             if (previousOrderStatus === 'delivered' && mappedOrderStatus !== 'delivered') {
                 nextShipmentInfo.deliveredAt = null;
@@ -618,6 +643,9 @@ async function upsertShipmentInfo({
         } else {
             if (repairOrderStatusForShiprocketRto(statusView)) {
                 order.orderStatus = statusView.orderStatus;
+                if (String(order.orderStatus || '').toLowerCase() === 'rto' && order.userId) {
+                    loyaltyPointsRtoAfterSave = true;
+                }
             }
             if (repairOrderStatusForFalseDeliveredNdr(statusView)) {
                 order.orderStatus = statusView.orderStatus;
@@ -709,7 +737,9 @@ async function upsertShipmentInfo({
     await order.save();
 
     if (loyaltyAfterSave) {
-        scheduleLoyaltyRecomputeForOrder(order, { reason: `shipment_${trigger || 'upsert'}_delivered` });
+        scheduleLoyaltyAfterOrderPersist(order, { reason: `shipment_${trigger || 'upsert'}_delivered` });
+    } else if (loyaltyPointsRtoAfterSave) {
+        scheduleLoyaltyPointsSideEffectsForOrder(order, { reason: `shipment_${trigger || 'upsert'}_rto` });
     }
 
     try {
@@ -929,8 +959,20 @@ function buildOrderResponsePayload(order, {
     advancePercent = null,
     appliedCouponCode,
     razorpayOrder = null,
-    idempotentReplay = false
+    idempotentReplay = false,
+    estimatedEarnPoints = null
 }) {
+    const lp = order.loyaltyPoints || {};
+    const redeemed = Math.max(0, Math.floor(Number(lp.redeemed) || 0));
+    const discountInr = roundMoney2(lp.discountInr || 0);
+    const earned = Math.max(0, Math.floor(Number(lp.earned) || 0));
+    const estimated =
+        estimatedEarnPoints != null
+            ? Math.max(0, Math.floor(Number(estimatedEarnPoints) || 0))
+            : earned > 0
+              ? earned
+              : null;
+
     return {
         success: true,
         message: normalizedPaymentMethod === 'cod' ? 'Order placed successfully' : 'Order created. Complete payment to confirm.',
@@ -940,6 +982,7 @@ function buildOrderResponsePayload(order, {
             subtotal: order.subtotal,
             tax: order.tax,
             discount: discount ?? order.discount ?? 0,
+            deliveryCharges: order.deliveryCharges,
             orderStatus: order.orderStatus,
             paymentStatus: order.paymentStatus,
             balanceDueInr: order.balanceDueInr,
@@ -947,7 +990,15 @@ function buildOrderResponsePayload(order, {
             paymentAdvancePercent:
                 advancePercent ??
                 order.paymentInfo?.advancePercent ??
-                null
+                null,
+            loyaltyPoints: {
+                redeemed,
+                discountInr,
+                redeemStatus: lp.redeemStatus || (redeemed > 0 ? 'debited' : 'none'),
+                earned,
+                earnStatus: lp.earnStatus || 'pending',
+                estimatedEarn: estimated
+            }
         },
         appliedCoupon: appliedCouponCode ?? order.appliedCoupon?.code ?? null,
         razorpayOrder: razorpayOrder ? {
@@ -1437,7 +1488,9 @@ exports.createOrder = async (req, res) => {
                 consumeCoupon,
                 codAmountForShiprocket: codAmt,
                 deliveryChargesOverride: deliveryOverride ? deliveryOverride.charges : null,
-                deliveryMetaOverride: deliveryOverride ? deliveryOverride.meta : null
+                deliveryMetaOverride: deliveryOverride ? deliveryOverride.meta : null,
+                userId,
+                loyaltyPointsToRedeem: Math.max(0, Math.floor(Number(quote.loyaltyPointsRedeemed) || 0))
             });
 
         const advancePercent =
@@ -1449,23 +1502,20 @@ exports.createOrder = async (req, res) => {
             if (normalizedPaymentMethod === 'cod') {
                 last = await buildTotals(false, 0);
                 for (let i = 0; i < 2; i++) {
-                    const codVal = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+                    const codVal = roundMoney2(last.totalAmount);
                     last = await buildTotals(false, codVal);
                 }
-                priced = await buildTotals(
-                    true,
-                    roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges)
-                );
+                priced = await buildTotals(true, roundMoney2(last.totalAmount));
             } else if (isAdvanceBalanceCod) {
                 last = await buildTotals(false, 0);
                 for (let i = 0; i < 2; i++) {
-                    const totalInr = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+                    const totalInr = roundMoney2(last.totalAmount);
                     const advInrRaw = roundMoney2((totalInr * advancePercent) / 100);
                     const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));
                     const balanceCod = roundMoney2(totalInr - advInr);
                     last = await buildTotals(false, balanceCod);
                 }
-                const totalInr = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+                const totalInr = roundMoney2(last.totalAmount);
                 const advInrRaw = roundMoney2((totalInr * advancePercent) / 100);
                 const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));
                 const finalBalanceCod = roundMoney2(totalInr - advInr);
@@ -1480,7 +1530,18 @@ exports.createOrder = async (req, res) => {
             return sendCheckoutFlowError(res, e, 'Checkout validation failed', 'ORDER_CHECKOUT_VALIDATION_FAILED');
         }
 
-        const { orderItems, subtotal, deliveryCharges, tax, discount, appliedCouponCode, totalAmount, lines } = priced;
+        const {
+            orderItems,
+            subtotal,
+            deliveryCharges,
+            tax,
+            discount,
+            appliedCouponCode,
+            totalAmount,
+            lines,
+            loyaltyDiscount,
+            loyaltyPointsRedeemed
+        } = priced;
         const orderItemsWithCodes = attachProductCodesToOrderItems(orderItems, lines);
         const shippingWeightSnapshot = buildShippingWeightSnapshotFromCheckoutLines({
             lines: priced.lines,
@@ -1519,6 +1580,9 @@ exports.createOrder = async (req, res) => {
             roundMoney2(quote.promotionDiscount) !== roundMoney2(discount) ||
             roundMoney2(quote.deliveryCharges) !== roundMoney2(deliveryCharges) ||
             roundMoney2(quote.taxes) !== roundMoney2(tax) ||
+            roundMoney2(quote.loyaltyDiscount || 0) !== roundMoney2(loyaltyDiscount || 0) ||
+            Math.floor(Number(quote.loyaltyPointsRedeemed) || 0) !==
+                Math.floor(Number(loyaltyPointsRedeemed) || 0) ||
             roundMoney2(quote.amountPayable) !== roundMoney2(totalAmount);
 
         if (quoteTotalsMismatch) {
@@ -1530,6 +1594,8 @@ exports.createOrder = async (req, res) => {
                         promotionDiscount: discount,
                         deliveryCharges,
                         taxes: tax,
+                        loyaltyDiscount: roundMoney2(loyaltyDiscount || 0),
+                        loyaltyPointsRedeemed: Math.floor(Number(loyaltyPointsRedeemed) || 0),
                         amountPayable: totalAmount,
                         codAvailable: quote.shippingMeta?.codAvailable !== false
                     }
@@ -1613,6 +1679,11 @@ exports.createOrder = async (req, res) => {
             tax: tax,
             discount: discount,
             totalAmount: totalAmount,
+            loyaltyPoints: buildOrderLoyaltySnapshot({
+                pointsRedeemed: loyaltyPointsRedeemed,
+                discountInr: loyaltyDiscount,
+                redeemStatus: Math.floor(Number(loyaltyPointsRedeemed) || 0) > 0 ? 'pending' : 'none'
+            }),
             address: addressId,
             addressSnapshot: address.toObject(),
             userType: finalUserType,
@@ -1747,6 +1818,27 @@ exports.createOrder = async (req, res) => {
                 });
             }
             throw saveError;
+        }
+
+        // Debit loyalty redeem inside the same transaction (idempotent).
+        try {
+            const redeemRes = await debitRedeemForOrder(order, { session });
+            if (!redeemRes.skipped) {
+                await order.save({ session });
+            }
+        } catch (loyaltyErr) {
+            if (loyaltyErr?.code === 'LOYALTY_INSUFFICIENT_POINTS' || loyaltyErr?.statusCode === 400) {
+                throw createCheckoutFlowError({
+                    statusCode: 400,
+                    code: loyaltyErr.code || 'LOYALTY_INSUFFICIENT_POINTS',
+                    message: loyaltyErr.message || 'Insufficient loyalty points. Please refresh checkout.'
+                });
+            }
+            logger.error('Loyalty redeem debit failed at order create', {
+                orderId: order.orderId,
+                message: loyaltyErr?.message || String(loyaltyErr)
+            });
+            throw loyaltyErr;
         }
 
         if (normalizedPaymentMethod === 'online') {
@@ -1886,7 +1978,15 @@ exports.createOrder = async (req, res) => {
             quoteId: String(quote._id),
             paymentMethod: normalizedPaymentMethod
         }));
-        
+
+        let estimatedEarnPoints = 0;
+        try {
+            const lpSettings = await getLoyaltyPointsSettings(storefront);
+            estimatedEarnPoints = computeEarnPointsForOrder(order, lpSettings);
+        } catch (_) {
+            estimatedEarnPoints = 0;
+        }
+
         return res.status(201).json(
             buildOrderResponsePayload(order, {
                 normalizedPaymentMethod,
@@ -1894,7 +1994,8 @@ exports.createOrder = async (req, res) => {
                 splitMode,
                 advancePercent: splitMode === 'advance' ? advancePercent : null,
                 appliedCouponCode,
-                razorpayOrder
+                razorpayOrder,
+                estimatedEarnPoints
             })
         );
 
@@ -1993,7 +2094,7 @@ exports.verifyPayment = async (req, res) => {
             if (dirty) {
                 await order.save();
             }
-            scheduleLoyaltyRecomputeForOrder(order, { reason: 'verify_idempotent' });
+            scheduleLoyaltyAfterOrderPersist(order, { reason: 'verify_idempotent' });
             return res.json({
                 success: true,
                 message: 'Payment already verified',
@@ -2023,7 +2124,7 @@ exports.verifyPayment = async (req, res) => {
             if (dirty) {
                 await order.save();
             }
-            scheduleLoyaltyRecomputeForOrder(order, { reason: 'verify_already_confirmed' });
+            scheduleLoyaltyAfterOrderPersist(order, { reason: 'verify_already_confirmed' });
             return res.json({
                 success: true,
                 message: 'Payment verified successfully',
@@ -2045,7 +2146,7 @@ exports.verifyPayment = async (req, res) => {
                 order.markModified('paymentInfo');
                 await order.save();
             }
-            scheduleLoyaltyRecomputeForOrder(order, { reason: 'verify_already_paid' });
+            scheduleLoyaltyAfterOrderPersist(order, { reason: 'verify_already_paid' });
             return res.json({
                 success: true,
                 message: 'Payment already verified',
@@ -2146,7 +2247,7 @@ exports.verifyPayment = async (req, res) => {
 
         order.markModified('paymentInfo');
         await order.save();
-        scheduleLoyaltyRecomputeForOrder(order, { reason: 'payment_verified' });
+        scheduleLoyaltyAfterOrderPersist(order, { reason: 'payment_verified' });
 
         const shouldEnqueueShipmentAfterVerify =
             isLegacyAutoFulfillOnCheckout() &&
@@ -2173,7 +2274,24 @@ exports.verifyPayment = async (req, res) => {
                 orderId: order.orderId,
                 orderStatus: order.orderStatus,
                 paymentStatus: order.paymentStatus,
-                balanceDueInr: order.balanceDueInr
+                balanceDueInr: order.balanceDueInr,
+                totalAmount: order.totalAmount,
+                loyaltyPoints: order.loyaltyPoints
+                    ? {
+                          redeemed: Math.max(0, Math.floor(Number(order.loyaltyPoints.redeemed) || 0)),
+                          discountInr: roundMoney2(order.loyaltyPoints.discountInr || 0),
+                          earned: Math.max(0, Math.floor(Number(order.loyaltyPoints.earned) || 0)),
+                          earnStatus: order.loyaltyPoints.earnStatus || 'pending',
+                          estimatedEarn: Math.max(
+                              0,
+                              Math.floor(
+                                  Number(order.loyaltyPoints.earned) ||
+                                      Number(order.loyaltyPoints.estimatedEarn) ||
+                                      0
+                              )
+                          )
+                      }
+                    : null
             }
         });
 
@@ -2237,7 +2355,7 @@ exports.razorpayWebhook = async (req, res) => {
                     if (dirty) {
                         await order.save();
                     }
-                    scheduleLoyaltyRecomputeForOrder(order, { reason: 'webhook_already_paid' });
+                    scheduleLoyaltyAfterOrderPersist(order, { reason: 'webhook_already_paid' });
                     break;
                 }
 
@@ -2251,7 +2369,7 @@ exports.razorpayWebhook = async (req, res) => {
                     if (dirty) {
                         await order.save();
                     }
-                    scheduleLoyaltyRecomputeForOrder(order, { reason: 'webhook_idempotent' });
+                    scheduleLoyaltyAfterOrderPersist(order, { reason: 'webhook_idempotent' });
                     break;
                 }
 
@@ -2295,7 +2413,7 @@ exports.razorpayWebhook = async (req, res) => {
 
                 order.markModified('paymentInfo');
                 await order.save();
-                scheduleLoyaltyRecomputeForOrder(order, { reason: 'razorpay_webhook_payment_captured' });
+                scheduleLoyaltyAfterOrderPersist(order, { reason: 'razorpay_webhook_payment_captured' });
 
                 const shouldEnqueueShipmentAfterWebhook =
                     isLegacyAutoFulfillOnCheckout() &&
@@ -2341,7 +2459,7 @@ exports.razorpayWebhook = async (req, res) => {
                     if (dirty) {
                         await failedOrder.save();
                     }
-                    scheduleLoyaltyRecomputeForOrder(failedOrder, {
+                    scheduleLoyaltyAfterOrderPersist(failedOrder, {
                         reason: 'webhook_failed_ignored_already_paid'
                     });
                     logger.info('[paymentState] Ignored payment.failed — order already has capture', {
@@ -3064,7 +3182,7 @@ exports.getOrder = async (req, res) => {
                 if (dirty) {
                     await order.save();
                     // Only when payment/orderStatus was healed — avoid recompute on every order view.
-                    scheduleLoyaltyRecomputeForOrder(order, { reason: 'get_order_self_heal' });
+                    scheduleLoyaltyAfterOrderPersist(order, { reason: 'get_order_self_heal' });
                 }
             } catch (healErr) {
                 logger.warn('[getOrder] payment state self-heal skipped', {
@@ -3275,7 +3393,7 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount loyaltyPoints appliedCoupon paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();
@@ -4242,6 +4360,8 @@ exports.adminInitiateReturnRefund = async (req, res) => {
         });
         order.markModified('returnInfo');
         await order.save();
+
+        scheduleLoyaltyAfterOrderPersist(order, { reason: 'return_refund' });
 
         return res.json({
             success: true,

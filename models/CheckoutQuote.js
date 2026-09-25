@@ -12,6 +12,9 @@ const checkoutQuoteSchema = new mongoose.Schema(
     itemCount: { type: Number, required: true, min: 1 },
     itemsSubtotal: { type: Number, required: true, min: 0 },
     promotionDiscount: { type: Number, required: true, min: 0, default: 0 },
+    /** Loyalty points redeemed on this quote (0 when disabled / not used). */
+    loyaltyPointsRedeemed: { type: Number, default: 0, min: 0 },
+    loyaltyDiscount: { type: Number, default: 0, min: 0 },
     deliveryCharges: { type: Number, required: true, min: 0, default: 0 },
     taxes: { type: Number, required: true, min: 0, default: 0 },
     amountPayable: { type: Number, required: true, min: 0 },

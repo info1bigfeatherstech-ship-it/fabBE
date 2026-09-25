@@ -242,7 +242,11 @@ const userSchema = new mongoose.Schema(
       badgeRank: { type: Number, default: 0, min: 0 },
       /** When the current badge was first granted (kept across recomputes of same badge). */
       badgeGrantedAt: { type: Date, default: null },
-      recomputedAt: { type: Date, default: null }
+      recomputedAt: { type: Date, default: null },
+      /** Redeemable points balance (ledger is source of audit; this is the fast balance). */
+      pointsBalance: { type: Number, default: 0, min: 0 },
+      pointsLifetimeEarned: { type: Number, default: 0, min: 0 },
+      pointsLifetimeRedeemed: { type: Number, default: 0, min: 0 }
     }
   },
   { timestamps: true }
@@ -288,6 +292,7 @@ userSchema.index({ registrationMethod: 1 });
 userSchema.index({ accountScope: 1, userType: 1 });
 userSchema.index({ 'loyalty.badgeSlug': 1 });
 userSchema.index({ 'loyalty.lifetimeSpendInr': -1 });
+userSchema.index({ 'loyalty.pointsBalance': -1 });
 
 /**
  * Never persist empty/null on unique contact fields — otherwise a legacy

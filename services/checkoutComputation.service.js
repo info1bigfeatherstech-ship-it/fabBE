@@ -337,7 +337,8 @@ async function computeCheckoutTotals({
   codAmountForShiprocket = 0,
   deliveryChargesOverride = null,
   deliveryMetaOverride = null,
-  userId = null
+  userId = null,
+  loyaltyPointsToRedeem = 0
 }) {
   const evaluated = await evaluateCartForCheckout(cart, finalUserType, session, storefront);
   const resolvedUserId = userId || cart?.userId || null;
@@ -348,6 +349,8 @@ async function computeCheckoutTotals({
     session,
     { consumeUsage: consumeCoupon, userId: resolvedUserId }
   );
+
+  const { attachLoyaltyDiscountToTotals } = require('./loyaltyPoints.service');
 
   let deliveryCharges;
   let deliveryMeta;
@@ -393,20 +396,27 @@ async function computeCheckoutTotals({
     };
 
     const tax = calculateTax(evaluated.lines);
-    const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
-    return {
-      ...evaluated,
-      lines: evaluated.lines,
-      discount,
-      appliedCouponCode,
-      deliveryCharges,
-      deliveryMeta,
-      tax,
-      totalAmount,
-      freeShippingApplied: Boolean(baseOverride.freeShippingApplied),
-      freeShippingOffer: baseOverride.freeShippingOffer || null,
-      originalDeliveryCharges: deliveryMeta.originalDeliveryCharges
-    };
+    const withLoyalty = await attachLoyaltyDiscountToTotals(
+      {
+        ...evaluated,
+        lines: evaluated.lines,
+        discount,
+        appliedCouponCode,
+        deliveryCharges,
+        deliveryMeta,
+        tax,
+        freeShippingApplied: Boolean(baseOverride.freeShippingApplied),
+        freeShippingOffer: baseOverride.freeShippingOffer || null,
+        originalDeliveryCharges: deliveryMeta.originalDeliveryCharges
+      },
+      {
+        storefront,
+        userId: resolvedUserId,
+        loyaltyPointsToRedeem,
+        session
+      }
+    );
+    return withLoyalty;
   } else {
     const ship = await checkDeliveryAvailabilityForActiveProvider(postalCode, {
       weightKg: evaluated.totalWeight,
@@ -503,7 +513,6 @@ async function computeCheckoutTotals({
   }
 
   const tax = calculateTax(evaluated.lines);
-  const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
 
   // Auto free-gift offer: independent of free shipping. Applies to every order when live.
   let freeGiftApplied = false;
@@ -523,21 +532,30 @@ async function computeCheckoutTotals({
     freeGiftOfferMeta = null;
   }
 
-  return {
-    ...evaluated,
-    lines: evaluated.lines,
-    discount,
-    appliedCouponCode,
-    deliveryCharges,
-    deliveryMeta,
-    tax,
-    totalAmount,
-    freeShippingApplied,
-    freeShippingOffer: freeShippingOfferMeta,
-    originalDeliveryCharges,
-    freeGiftApplied,
-    freeGiftOffer: freeGiftOfferMeta
-  };
+  const withLoyalty = await attachLoyaltyDiscountToTotals(
+    {
+      ...evaluated,
+      lines: evaluated.lines,
+      discount,
+      appliedCouponCode,
+      deliveryCharges,
+      deliveryMeta,
+      tax,
+      freeShippingApplied,
+      freeShippingOffer: freeShippingOfferMeta,
+      originalDeliveryCharges,
+      freeGiftApplied,
+      freeGiftOffer: freeGiftOfferMeta
+    },
+    {
+      storefront,
+      userId: resolvedUserId,
+      loyaltyPointsToRedeem,
+      session
+    }
+  );
+
+  return withLoyalty;
 }
 
 /**

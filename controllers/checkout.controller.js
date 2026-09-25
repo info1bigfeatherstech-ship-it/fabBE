@@ -34,6 +34,9 @@ const { sanitizeCartItems } = require('../services/cartSanitize.service');
 const { findCartForStorefront } = require('../services/cartStorefront.service');
 const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
 const logger = require('../utils/logger');
+const {
+  attachLoyaltyDiscountToTotals
+} = require('../services/loyaltyPoints.service');
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 
@@ -94,6 +97,24 @@ function buildFreeShippingClientFields(finalTotals) {
   };
 }
 
+function buildLoyaltyClientFields(totals) {
+  return {
+    loyaltyDiscount: roundMoney2(totals.loyaltyDiscount || 0),
+    loyaltyPointsRedeemed: Math.max(0, Math.floor(Number(totals.loyaltyPointsRedeemed) || 0)),
+    loyaltyPointsRequested: Math.max(0, Math.floor(Number(totals.loyaltyPointsRequested) || 0)),
+    loyaltyMaxRedeemable: Math.max(0, Math.floor(Number(totals.loyaltyMaxRedeemable) || 0)),
+    loyaltyBalance: Math.max(0, Math.floor(Number(totals.loyaltyBalance) || 0)),
+    loyaltyEnabled: Boolean(totals.loyaltyEnabled),
+    loyaltyRedeemReason: totals.loyaltyRedeemReason || null,
+    redeemRupeePerPoint: Math.max(0, Number(totals.redeemRupeePerPoint) || 0),
+    earnPointsPerRupee: Math.max(0, Number(totals.earnPointsPerRupee) || 0),
+    preLoyaltyAmount:
+      totals.preLoyaltyAmount != null
+        ? roundMoney2(totals.preLoyaltyAmount)
+        : roundMoney2(totals.totalAmount || 0)
+  };
+}
+
 /**
  * @param {'cod_full'|'online'|'advance_balance_cod'} shiprocketPricingMode — how Shiprocket COD amount is derived for quotes
  * @param {number|null} advancePercentForBalanceCod — admin advance % when mode is advance_balance_cod
@@ -107,8 +128,13 @@ async function buildFinalTotals({
   paymentMethodHint,
   req,
   shiprocketPricingMode = 'online',
-  advancePercentForBalanceCod = null
+  advancePercentForBalanceCod = null,
+  loyaltyPointsToRedeem = 0,
+  userId = null
 }) {
+  const resolvedUserId = userId || cartDoc?.userId || req?.userId || null;
+  const pointsReq = Math.max(0, Math.floor(Number(loyaltyPointsToRedeem) || 0));
+
   if (allowDemoMockShipping(req)) {
     const evaluated = await evaluateCartForCheckout(cartDoc, finalUserType, null, storefront);
     const { discount, appliedCouponCode } = await resolveCouponDiscount(
@@ -116,7 +142,7 @@ async function buildFinalTotals({
       evaluated.subtotal,
       finalUserType,
       null,
-      { consumeUsage: false, userId: cartDoc?.userId || req?.userId || null }
+      { consumeUsage: false, userId: resolvedUserId }
     );
     let deliveryCharges = roundMoney2(35 + Math.floor(Math.random() * 56));
     const originalDeliveryCharges = deliveryCharges;
@@ -151,33 +177,38 @@ async function buildFinalTotals({
       /* fail closed */
     }
     const tax = calculateTax(evaluated.lines);
-    const totalAmount = roundMoney2(evaluated.subtotal + deliveryCharges + tax - discount);
-    return {
-      ...evaluated,
-      discount,
-      appliedCouponCode,
-      deliveryCharges,
-      tax,
-      totalAmount,
-      freeShippingApplied,
-      freeShippingOffer: freeShippingOfferMeta,
-      originalDeliveryCharges,
-      freeGiftApplied,
-      freeGiftOffer: freeGiftOfferMeta,
-      deliveryMeta: {
-        estimatedDays: String(2 + Math.floor(Math.random() * 3)) + '-5',
-        courierName: 'Demo courier (Shiprocket off)',
-        courierCompanyId: null,
-        isDeliverable: true,
-        codAvailable: true,
-        mock: true,
-        freightInr,
-        codFeeInr,
-        originalDeliveryCharges,
+    return attachLoyaltyDiscountToTotals(
+      {
+        ...evaluated,
+        discount,
+        appliedCouponCode,
+        deliveryCharges,
+        tax,
         freeShippingApplied,
-        freeShippingOffer: freeShippingOfferMeta
+        freeShippingOffer: freeShippingOfferMeta,
+        originalDeliveryCharges,
+        freeGiftApplied,
+        freeGiftOffer: freeGiftOfferMeta,
+        deliveryMeta: {
+          estimatedDays: String(2 + Math.floor(Math.random() * 3)) + '-5',
+          courierName: 'Demo courier (Shiprocket off)',
+          courierCompanyId: null,
+          isDeliverable: true,
+          codAvailable: true,
+          mock: true,
+          freightInr,
+          codFeeInr,
+          originalDeliveryCharges,
+          freeShippingApplied,
+          freeShippingOffer: freeShippingOfferMeta
+        }
+      },
+      {
+        storefront,
+        userId: resolvedUserId,
+        loyaltyPointsToRedeem: pointsReq
       }
-    };
+    );
   }
 
   let last = await computeCheckoutTotals({
@@ -188,12 +219,15 @@ async function buildFinalTotals({
     couponCode,
     session: null,
     consumeCoupon: false,
-    codAmountForShiprocket: 0
+    codAmountForShiprocket: 0,
+    userId: resolvedUserId,
+    loyaltyPointsToRedeem: pointsReq
   });
 
   if (shiprocketPricingMode === 'cod_full') {
     for (let i = 0; i < 2; i++) {
-      const codVal = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+      // COD collectable = final payable after coupon + loyalty
+      const codVal = roundMoney2(last.totalAmount);
       last = await computeCheckoutTotals({
         cart: cartDoc,
         postalCode: pin,
@@ -202,7 +236,9 @@ async function buildFinalTotals({
         couponCode,
         session: null,
         consumeCoupon: false,
-        codAmountForShiprocket: codVal
+        codAmountForShiprocket: codVal,
+        userId: resolvedUserId,
+        loyaltyPointsToRedeem: pointsReq
       });
     }
   } else if (shiprocketPricingMode === 'advance_balance_cod') {
@@ -214,7 +250,7 @@ async function buildFinalTotals({
       throw err;
     }
     for (let i = 0; i < 2; i++) {
-      const totalInr = roundMoney2(last.subtotal + last.tax - last.discount + last.deliveryCharges);
+      const totalInr = roundMoney2(last.totalAmount);
       const advInrRaw = roundMoney2((totalInr * pct) / 100);
       const advInr = Math.max(1, Math.min(roundMoney2(totalInr - 0.01), advInrRaw));
       const balanceCod = roundMoney2(totalInr - advInr);
@@ -226,7 +262,9 @@ async function buildFinalTotals({
         couponCode,
         session: null,
         consumeCoupon: false,
-        codAmountForShiprocket: balanceCod
+        codAmountForShiprocket: balanceCod,
+        userId: resolvedUserId,
+        loyaltyPointsToRedeem: pointsReq
       });
     }
   }
@@ -249,9 +287,11 @@ exports.quoteCheckout = async (req, res) => {
       paymentPlan,
       paymentAdvancePercent,
       balanceCollection,
-      quotePurpose
+      quotePurpose,
+      loyaltyPointsToRedeem
     } = req.body || {};
     const isComparisonQuote = String(quotePurpose || '').toLowerCase() === 'cod_comparison';
+    const pointsToRedeem = Math.max(0, Math.floor(Number(loyaltyPointsToRedeem) || 0));
 
     const checkoutPolicy = await checkoutSettingsService.getPolicyForStorefront(storefront);
 
@@ -375,7 +415,9 @@ exports.quoteCheckout = async (req, res) => {
       paymentMethodHint,
       req,
       shiprocketPricingMode,
-      advancePercentForBalanceCod: advancePctForSr
+      advancePercentForBalanceCod: advancePctForSr,
+      loyaltyPointsToRedeem: pointsToRedeem,
+      userId
     });
 
     const fp = cartFingerprintFromItems(cartDoc.items);
@@ -402,6 +444,7 @@ exports.quoteCheckout = async (req, res) => {
         amountPayable: finalTotals.totalAmount,
         includesShippingAndHandling: true,
         couponApplied: finalTotals.appliedCouponCode,
+        ...buildLoyaltyClientFields(finalTotals),
         ...buildFreeShippingClientFields(finalTotals)
       });
     }
@@ -451,6 +494,8 @@ exports.quoteCheckout = async (req, res) => {
       itemCount: cartDoc.items.length,
       itemsSubtotal: finalTotals.subtotal,
       promotionDiscount: finalTotals.discount,
+      loyaltyPointsRedeemed: Math.max(0, Math.floor(Number(finalTotals.loyaltyPointsRedeemed) || 0)),
+      loyaltyDiscount: roundMoney2(finalTotals.loyaltyDiscount || 0),
       deliveryCharges: finalTotals.deliveryCharges,
       taxes: finalTotals.tax,
       amountPayable: finalTotals.totalAmount,
@@ -528,6 +573,7 @@ exports.quoteCheckout = async (req, res) => {
       quoteExpiresAt: quoteExpiresAt.toISOString(),
       cartFingerprint: fp,
       demoMockShipping: Boolean(allowDemoMockShipping(req)),
+      ...buildLoyaltyClientFields(finalTotals),
       ...buildFreeShippingClientFields(finalTotals),
       freeGiftApplied: Boolean(finalTotals.freeGiftApplied),
       freeGiftOffer: finalTotals.freeGiftApplied && finalTotals.freeGiftOffer
@@ -687,7 +733,9 @@ exports.confirmCheckout = async (req, res) => {
       paymentMethodHint: normalizedPaymentMethod === 'cod' ? 'cod' : 'online',
       req: { body: { demoMockShipping: Boolean(quote.shippingMeta?.mock) } },
       shiprocketPricingMode,
-      advancePercentForBalanceCod: isAdvanceBalanceCod ? effectiveAdvancePercent : null
+      advancePercentForBalanceCod: isAdvanceBalanceCod ? effectiveAdvancePercent : null,
+      loyaltyPointsToRedeem: Math.max(0, Math.floor(Number(quote.loyaltyPointsRedeemed) || 0)),
+      userId
     });
 
     const carrierCodCheck = validateCarrierCodForCheckout({
@@ -709,6 +757,9 @@ exports.confirmCheckout = async (req, res) => {
       roundMoney2(quote.promotionDiscount) !== roundMoney2(recomputed.discount) ||
       roundMoney2(quote.deliveryCharges) !== roundMoney2(recomputed.deliveryCharges) ||
       roundMoney2(quote.taxes) !== roundMoney2(recomputed.tax) ||
+      roundMoney2(quote.loyaltyDiscount || 0) !== roundMoney2(recomputed.loyaltyDiscount || 0) ||
+      Math.floor(Number(quote.loyaltyPointsRedeemed) || 0) !==
+        Math.floor(Number(recomputed.loyaltyPointsRedeemed) || 0) ||
       roundMoney2(quote.amountPayable) !== roundMoney2(recomputed.totalAmount);
 
     if (mismatch) {
@@ -721,6 +772,7 @@ exports.confirmCheckout = async (req, res) => {
             deliveryCharges: recomputed.deliveryCharges,
             taxes: recomputed.tax,
             amountPayable: recomputed.totalAmount,
+            ...buildLoyaltyClientFields(recomputed),
             codAvailable: recomputed.deliveryMeta?.codAvailable !== false
           }
         }
@@ -764,6 +816,7 @@ exports.confirmCheckout = async (req, res) => {
         deliveryCharges: recomputed.deliveryCharges,
         taxes: recomputed.tax,
         amountPayable: recomputed.totalAmount,
+        ...buildLoyaltyClientFields(recomputed),
         ...buildFreeShippingClientFields(recomputed),
         freeGiftApplied: Boolean(recomputed.freeGiftApplied),
         freeGiftOffer: recomputed.freeGiftApplied && recomputed.freeGiftOffer
