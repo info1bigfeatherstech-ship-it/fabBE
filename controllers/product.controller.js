@@ -17,7 +17,8 @@ const axios = require('axios');
 const AdmZip = require("adm-zip");
 const { Parser } = require("json2csv");   //  ADD THIS
 const { generateSEOData } = require("../utils/seoUtils");
-const { buildNameAndProductCodeSearch } = require('../utils/productCode');
+const { buildNameAndProductCodeSearch, applyConfiguredProductCodePrefix } = require('../utils/productCode');
+const productCodePrefixSettingsService = require('../services/productCodePrefixSettings.service');
 const { enqueueNewProductForDigest } = require('../services/newProductsDigest.service');
 
 function queueNewProductDigestSafe(product) {
@@ -533,7 +534,8 @@ function trimBulkImportRowStrings(row) {
 const BULK_IMPORT_INTERNAL_KEYS = new Set([
   'rowNumber',
   '_preValidationError',
-  '_productCodeAdjustedFrom'
+  '_productCodeAdjustedFrom',
+  '_productCodeAsEntered'
 ]);
 
 function isCompletelyBlankBulkImportRow(row) {
@@ -876,7 +878,9 @@ function getImageFolderCandidatesForRow(row) {
       if (k && !candidates.includes(k)) candidates.push(k);
     }
   };
+  // Prefixed stored code + original CSV/folder name (before prefix) + series-adjust provenance
   addVal(row?.productCode);
+  addVal(row?._productCodeAsEntered);
   addVal(row?._productCodeAdjustedFrom);
   return candidates;
 }
@@ -1123,6 +1127,45 @@ function normalizeBareProductCodesForBulkGroup(productRows) {
   }
 }
 
+function resolveListingStorefront(req) {
+  return productCodePrefixSettingsService.normalizeStorefront(
+    req?.adminScope?.storefront || req?.storefront || 'ecomm'
+  );
+}
+
+async function requireListingProductCodePrefix(req) {
+  return productCodePrefixSettingsService.requireConfiguredPrefix(resolveListingStorefront(req));
+}
+
+/**
+ * NEW listings only: prepend configured prefix.
+ * Keeps CSV/folder original on `_productCodeAsEntered` for ZIP folder matching
+ * (e.g. folder `789-1` while stored code becomes `FU789-1`).
+ * Does not rewrite codes already stored on existing products.
+ */
+function applyConfiguredPrefixToBulkRows(rows, prefix) {
+  if (!Array.isArray(rows)) return;
+  for (const row of rows) {
+    if (row == null || row.productCode == null || String(row.productCode).trim() === '') continue;
+    const before = normalizeProductCode(row.productCode);
+    if (!before) continue;
+    if (!row._productCodeAsEntered) {
+      row._productCodeAsEntered = before;
+    }
+    row.productCode = applyConfiguredProductCodePrefix(before, prefix);
+  }
+}
+
+function prefixRequiredErrorResponse(err) {
+  return {
+    success: false,
+    code: err?.code || 'PRODUCT_CODE_PREFIX_REQUIRED',
+    message:
+      err?.message ||
+      'Product code prefix is not configured. Set it in Admin → Settings → Product code prefix before listing products.'
+  };
+}
+
 function sanitizeBaseToken(rawBase) {
   const cleaned = String(rawBase || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   return cleaned || null;
@@ -1336,6 +1379,15 @@ const createProduct = async (req, res) => {
       });
     }
 
+    // NEW product: require configured prefix and apply to all variant codes before validation.
+    // Existing products are never rewritten when the admin later changes the prefix.
+    let listingPrefix;
+    try {
+      listingPrefix = await requireListingProductCodePrefix(req);
+    } catch (err) {
+      return res.status(err.statusCode || 400).json(prefixRequiredErrorResponse(err));
+    }
+
     // Validate productCode format + series before uploads. Same rules as addVariant: BASE-N (suffix ≥ 1),
     // shared base, continuous 01..N. Accept productCode or ProductCode on each row.
     const normalizedCodes = [];
@@ -1349,7 +1401,8 @@ const createProduct = async (req, res) => {
         });
       }
       try {
-        const parsed = parseProductCodeParts(codeRaw, `variant ${i} productCode`, { requireSuffix: true });
+        const prefixed = applyConfiguredProductCodePrefix(codeRaw, listingPrefix);
+        const parsed = parseProductCodeParts(prefixed, `variant ${i} productCode`, { requireSuffix: true });
         normalizedCodes.push(parsed.normalized);
         variantsInput[i].productCode = parsed.normalized;
         if (Object.prototype.hasOwnProperty.call(variantsInput[i], "ProductCode")) {
@@ -1358,7 +1411,7 @@ const createProduct = async (req, res) => {
       } catch (err) {
         return res.status(400).json({
           success: false,
-          code: "PRODUCT_CODE_INVALID",
+          code: err.code || "PRODUCT_CODE_INVALID",
           message: err.message || "Invalid productCode"
         });
       }
@@ -1810,6 +1863,15 @@ const importProductsFromCSV = async (req, res) => {
         skippedBlankRows
       });
     }
+
+    let listingPrefix;
+    try {
+      listingPrefix = await requireListingProductCodePrefix(req);
+    } catch (err) {
+      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(err.statusCode || 400).json(prefixRequiredErrorResponse(err));
+    }
+    applyConfiguredPrefixToBulkRows(rows, listingPrefix);
     
     // =============================================
     // STEP 2: Validate CSV structure
@@ -2411,6 +2473,17 @@ const previewImportProductsFromCSV = async (req, res) => {
         skippedBlankRows
       });
     }
+
+    let listingPrefix;
+    try {
+      listingPrefix = await requireListingProductCodePrefix(req);
+    } catch (err) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (_) {}
+      return res.status(err.statusCode || 400).json(prefixRequiredErrorResponse(err));
+    }
+    applyConfiguredPrefixToBulkRows(rows, listingPrefix);
 
     const requiredColumns = ['name', 'category', 'basePrice'];
     const firstRow = rows[0];
@@ -3579,6 +3652,19 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       });
     }
 
+    let listingPrefix;
+    try {
+      listingPrefix = await requireListingProductCodePrefix(req);
+    } catch (err) {
+      if (csvPath && fs.existsSync(csvPath)) fs.unlinkSync(csvPath);
+      if (zipPath && fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+      if (extractPath && fs.existsSync(extractPath)) {
+        fs.rmSync(extractPath, { recursive: true, force: true });
+      }
+      return res.status(err.statusCode || 400).json(prefixRequiredErrorResponse(err));
+    }
+    applyConfiguredPrefixToBulkRows(rows, listingPrefix);
+
     // Normalize and validate productCode series per product BASE upfront.
     // Example for 3 variants: 4321-1, 4321-2, 4321-3 (01, 02 also accepted on input)
     const rowsByCodeBase = groupBulkImportRowsByCodeBase(rows);
@@ -4222,6 +4308,14 @@ const previewBulkUpload = async (req, res) => {
         skippedBlankRows
       });
     }
+
+    let listingPrefix;
+    try {
+      listingPrefix = await requireListingProductCodePrefix(req);
+    } catch (err) {
+      return res.status(err.statusCode || 400).json(prefixRequiredErrorResponse(err));
+    }
+    applyConfiguredPrefixToBulkRows(rows, listingPrefix);
 
     if (skippedBlankRows > 0) {
       console.log(`ℹ️ Preview ignored ${skippedBlankRows} blank trailing/empty CSV row(s)`);
@@ -6562,6 +6656,8 @@ const addVariant = async (req, res) => {
     // =========================
     // 🔒 productCode VALIDATION
     // =========================
+    // addVariant: do NOT apply the configured listing prefix.
+    // Parent product series wins (e.g. existing FU243-1 → next must be FU243-2 even if prefix is now MTL).
     if (!variant.productCode) {
       return res.status(400).json({
         success: false,

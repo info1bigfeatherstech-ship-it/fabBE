@@ -532,7 +532,7 @@ const searchProducts= async (req, res) => {
       return res.json(withLiveStock);
     }
 
-    // Name + productCode only. Codes may omit a 2-letter prefix (FU2311 ↔ 2311).
+    // Name + productCode only. Codes may omit a 2–3 letter prefix (FU2311 ↔ 2311).
     const searchClause = buildNameAndProductCodeSearch(q);
     if (!searchClause) {
       return res.status(400).json({
