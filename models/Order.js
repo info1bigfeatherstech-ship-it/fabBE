@@ -89,7 +89,7 @@ const orderSchema = new mongoose.Schema(
         recipientName: { type: String, trim: true, maxlength: 80, default: null },
         /** Display "from" name on gift card / packing note */
         senderName: { type: String, trim: true, maxlength: 80, default: null },
-        message: { type: String, trim: true, maxlength: 300, default: null },
+        message: { type: String, trim: true, maxlength: 1000, default: null },
         /** Free text from customer/FE (no fixed enum). */
         occasion: { type: String, trim: true, maxlength: 80, default: null }
       },

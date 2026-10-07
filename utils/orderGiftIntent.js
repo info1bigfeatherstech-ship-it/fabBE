@@ -10,7 +10,7 @@
 const ORDER_INTENT_TYPES = Object.freeze(['my_order', 'gift_other']);
 
 const NAME_MAX = 80;
-const MESSAGE_MAX = 300;
+const MESSAGE_MAX = 1000;
 /** Free-text occasion label from customer / FE (not an enum). */
 const OCCASION_MAX = 80;
 
