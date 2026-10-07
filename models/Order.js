@@ -73,6 +73,29 @@ const orderSchema = new mongoose.Schema(
     
     address: { type: mongoose.Schema.Types.ObjectId, ref: 'Address', required: true },
     addressSnapshot: { type: Object, required: true },
+
+    /**
+     * Checkout intent snapshot (my order vs gift/other).
+     * Optional gift card fields — never affects pricing/shipping/payment.
+     * Legacy orders without this field are treated as my_order on read.
+     */
+    orderIntent: {
+      type: {
+        type: String,
+        enum: ['my_order', 'gift_other'],
+        default: 'my_order'
+      },
+      giftDetails: {
+        recipientName: { type: String, trim: true, maxlength: 80, default: null },
+        /** Display "from" name on gift card / packing note */
+        senderName: { type: String, trim: true, maxlength: 80, default: null },
+        message: { type: String, trim: true, maxlength: 300, default: null },
+        /** Free text from customer/FE (no fixed enum). */
+        occasion: { type: String, trim: true, maxlength: 80, default: null }
+      },
+      updatedAt: { type: Date, default: null },
+      updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
+    },
     
     userType: { type: String, enum: ['normal', 'wholesaler'], required: true },
 

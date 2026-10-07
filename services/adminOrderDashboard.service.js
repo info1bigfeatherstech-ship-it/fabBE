@@ -500,6 +500,11 @@ function mapOrderRow(order) {
     ...rowBase
   });
 
+  const orderIntentType =
+    o.orderIntent && String(o.orderIntent.type || '').toLowerCase() === 'gift_other'
+      ? 'gift_other'
+      : 'my_order';
+
   return {
     orderId: o.orderId,
     orderIdDisplay: `#${String(o.orderId).replace(/^#/, '')}`,
@@ -508,6 +513,9 @@ function mapOrderRow(order) {
     createdAt: o.createdAt,
     amountInr: roundMoney(Number(o.totalAmount) || 0),
     currency: 'INR',
+    /** Lightweight badge for admin list — full details on order detail / gift-intent GET */
+    orderIntentType,
+    isGiftOrder: orderIntentType === 'gift_other',
     orderStatus: o.orderStatus,
     shippingProvider: resolveOrderShippingProvider(o),
     fulfillmentLabel: fulfillmentLabelForAdminListRow(o.orderStatus, si.providerStatus, bucketKey, o),

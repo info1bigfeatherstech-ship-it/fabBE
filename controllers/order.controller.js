@@ -36,6 +36,13 @@ const { findCartForStorefront } = require('../services/cartStorefront.service');
 const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const {
+    parseOrderIntentInput,
+    toPublicOrderIntent,
+    orderIntentForIdempotencyHash,
+    getGiftIntentOptions,
+    DEFAULT_ORDER_INTENT
+} = require('../utils/orderGiftIntent');
 const { scheduleLoyaltyRecomputeForOrder } = require('../services/loyalty.service');
 const {
     scheduleLoyaltyPointsSideEffectsForOrder,
@@ -998,7 +1005,8 @@ function buildOrderResponsePayload(order, {
                 earned,
                 earnStatus: lp.earnStatus || 'pending',
                 estimatedEarn: estimated
-            }
+            },
+            orderIntent: toPublicOrderIntent(order.orderIntent)
         },
         appliedCoupon: appliedCouponCode ?? order.appliedCoupon?.code ?? null,
         razorpayOrder: razorpayOrder ? {
@@ -1017,13 +1025,17 @@ async function resolveIdempotencyRecord({ req, body }) {
         return { enabled: false, record: null, normalizedKey: null };
     }
 
+    const intentParse = parseOrderIntentInput(body.orderIntent);
     const requestHash = OrderIdempotencyKey.buildRequestHash({
         addressId: body.addressId || null,
         paymentMethod: body.paymentMethod || null,
         couponCode: body.couponCode || null,
         onlinePaymentMode: body.onlinePaymentMode || 'full',
         paymentAdvancePercent: body.paymentAdvancePercent || null,
-        quoteId: body.quoteId || null
+        quoteId: body.quoteId || null,
+        orderIntent: orderIntentForIdempotencyHash(
+            intentParse.ok ? intentParse.value : DEFAULT_ORDER_INTENT
+        )
     });
 
     let record = await OrderIdempotencyKey.findOne({ userId: req.userId, key: idempotencyKey });
@@ -1113,6 +1125,23 @@ async function resolveIdempotencyRecord({ req, body }) {
 // ========== MAIN ORDER CREATION API ==========
 exports.createOrder = async (req, res) => {
     logger.debug('Create order request received', buildRequestLogContext(req));
+
+    // Validate orderIntent before opening a DB transaction (backward compatible if omitted).
+    const orderIntentParse = parseOrderIntentInput(req.body?.orderIntent);
+    if (!orderIntentParse.ok) {
+        return res.status(400).json({
+            success: false,
+            code: orderIntentParse.code || 'ORDER_INTENT_VALIDATION_FAILED',
+            message: (orderIntentParse.errors || []).join(' ') || 'Invalid orderIntent',
+            errors: orderIntentParse.errors || []
+        });
+    }
+    const resolvedOrderIntent = {
+        ...orderIntentParse.value,
+        updatedAt: null,
+        updatedBy: null
+    };
+
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -1127,6 +1156,7 @@ exports.createOrder = async (req, res) => {
             balanceCollection,
             quoteId
         } = req.body || {};
+
         const idempotency = await resolveIdempotencyRecord({ req, body: req.body || {} });
         if (idempotency.existingOrder) {
             logger.info('Replaying existing order for idempotent request', buildRequestLogContext(req, {
@@ -1686,6 +1716,7 @@ exports.createOrder = async (req, res) => {
             }),
             address: addressId,
             addressSnapshot: address.toObject(),
+            orderIntent: resolvedOrderIntent,
             userType: finalUserType,
             storefront,
             shippingProvider: orderShippingProvider,
@@ -3213,6 +3244,7 @@ exports.getOrder = async (req, res) => {
         }
 
         const transformedOrder = order.toObject();
+        transformedOrder.orderIntent = toPublicOrderIntent(transformedOrder.orderIntent);
         normalizeTerminalUnpaidFinancials(transformedOrder);
 
         const isCancelledUnavailable =
@@ -3393,10 +3425,11 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount loyaltyPoints appliedCoupon paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount loyaltyPoints appliedCoupon paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes orderIntent shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();
+            plain.orderIntent = toPublicOrderIntent(plain.orderIntent);
             normalizeTerminalUnpaidFinancials(plain);
             try {
                 const {
@@ -4584,6 +4617,200 @@ exports.getReturnChat = async (req, res) => {
     } catch (error) {
         logger.error('getReturnChat failed', { message: error.message, stack: error.stack });
         return respondOrderError(res, 500, 'GET_CHAT_FAILED', 'Could not fetch chat history');
+    }
+};
+
+/**
+ * GET /api/orders/gift-intent/options
+ * Frontend catalog for My order vs Gift/Other (occasion is free text; FE owns labels).
+ */
+exports.getGiftIntentOptions = async (req, res) => {
+    try {
+        return res.json({
+            success: true,
+            data: getGiftIntentOptions()
+        });
+    } catch (error) {
+        logger.error('getGiftIntentOptions failed', { message: error.message });
+        return respondOrderError(res, 500, 'GIFT_INTENT_OPTIONS_FAILED', 'Could not load gift intent options');
+    }
+};
+
+/**
+ * GET /api/orders/items/:orderId/gift-intent
+ * User (own order) or admin staff: read gift/other snapshot.
+ */
+exports.getOrderGiftIntent = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const isOrderStaff = isOrderStaffRequest(req);
+        const order = await Order.findOne(
+            isOrderStaff ? mergeAdminOrderFilter(req, { orderId }) : { orderId, userId: req.userId }
+        ).select('orderId orderIntent userId');
+
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+        if (!canViewOrderForRequest(req, order, isOrderStaff)) {
+            return buildUnauthorizedOrderResponse(res);
+        }
+
+        return res.json({
+            success: true,
+            orderId: order.orderId,
+            orderIntent: toPublicOrderIntent(order.orderIntent)
+        });
+    } catch (error) {
+        logger.error('getOrderGiftIntent failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'GIFT_INTENT_FETCH_FAILED', 'Could not load order gift intent');
+    }
+};
+
+const GIFT_INTENT_ADMIN_EDITABLE_STATUSES = new Set([
+    'pending',
+    'confirmed',
+    'processing'
+]);
+
+/**
+ * PUT /api/orders/admin/items/:orderId/gift-intent
+ * Admin replace/set gift intent (does not touch payment/shipping).
+ */
+exports.updateAdminOrderGiftIntent = async (req, res) => {
+    try {
+        if (!isOrderStaffRequest(req)) {
+            return respondOrderError(res, 403, 'ORDER_ADMIN_ACCESS_REQUIRED', 'Admin access required');
+        }
+
+        const { orderId } = req.params;
+        const parsed = parseOrderIntentInput(req.body?.orderIntent ?? req.body, {
+            requireExplicitType: true
+        });
+        if (!parsed.ok) {
+            return res.status(400).json({
+                success: false,
+                code: parsed.code || 'ORDER_INTENT_VALIDATION_FAILED',
+                message: (parsed.errors || []).join(' ') || 'Invalid orderIntent',
+                errors: parsed.errors || []
+            });
+        }
+
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        const status = String(order.orderStatus || '').toLowerCase();
+        if (!GIFT_INTENT_ADMIN_EDITABLE_STATUSES.has(status)) {
+            return respondOrderError(
+                res,
+                400,
+                'GIFT_INTENT_NOT_EDITABLE',
+                `Gift details can only be edited while order is pending, confirmed, or processing (current: ${order.orderStatus})`
+            );
+        }
+
+        const before = toPublicOrderIntent(order.orderIntent);
+        order.orderIntent = {
+            ...parsed.value,
+            updatedAt: new Date(),
+            updatedBy: req.userId || null
+        };
+        order.markModified('orderIntent');
+
+        order.adminEditHistory = Array.isArray(order.adminEditHistory) ? order.adminEditHistory : [];
+        order.adminEditHistory.push({
+            action: 'gift_intent_updated',
+            note: `orderIntent set to ${parsed.value.type}`,
+            performedBy: req.userId || null,
+            createdAt: new Date(),
+            before,
+            after: toPublicOrderIntent(order.orderIntent),
+            metadata: null
+        });
+        order.markModified('adminEditHistory');
+
+        await order.save();
+
+        logger.info('Admin updated order gift intent', buildRequestLogContext(req, {
+            orderId: order.orderId,
+            type: parsed.value.type
+        }));
+
+        return res.json({
+            success: true,
+            message: 'Order gift intent updated',
+            orderId: order.orderId,
+            orderIntent: toPublicOrderIntent(order.orderIntent)
+        });
+    } catch (error) {
+        logger.error('updateAdminOrderGiftIntent failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'GIFT_INTENT_UPDATE_FAILED', 'Could not update order gift intent');
+    }
+};
+
+/**
+ * DELETE /api/orders/admin/items/:orderId/gift-intent
+ * Admin clears gift details → my_order (packing correction).
+ */
+exports.clearAdminOrderGiftIntent = async (req, res) => {
+    try {
+        if (!isOrderStaffRequest(req)) {
+            return respondOrderError(res, 403, 'ORDER_ADMIN_ACCESS_REQUIRED', 'Admin access required');
+        }
+
+        const { orderId } = req.params;
+        const order = await Order.findOne(mergeAdminOrderFilter(req, { orderId }));
+        if (!order) {
+            return respondOrderError(res, 404, 'ORDER_NOT_FOUND', 'Order not found');
+        }
+
+        const status = String(order.orderStatus || '').toLowerCase();
+        if (!GIFT_INTENT_ADMIN_EDITABLE_STATUSES.has(status)) {
+            return respondOrderError(
+                res,
+                400,
+                'GIFT_INTENT_NOT_EDITABLE',
+                `Gift details can only be cleared while order is pending, confirmed, or processing (current: ${order.orderStatus})`
+            );
+        }
+
+        const before = toPublicOrderIntent(order.orderIntent);
+        order.orderIntent = {
+            type: 'my_order',
+            giftDetails: null,
+            updatedAt: new Date(),
+            updatedBy: req.userId || null
+        };
+        order.markModified('orderIntent');
+
+        order.adminEditHistory = Array.isArray(order.adminEditHistory) ? order.adminEditHistory : [];
+        order.adminEditHistory.push({
+            action: 'gift_intent_cleared',
+            note: 'orderIntent reset to my_order',
+            performedBy: req.userId || null,
+            createdAt: new Date(),
+            before,
+            after: toPublicOrderIntent(order.orderIntent),
+            metadata: null
+        });
+        order.markModified('adminEditHistory');
+
+        await order.save();
+
+        logger.info('Admin cleared order gift intent', buildRequestLogContext(req, {
+            orderId: order.orderId
+        }));
+
+        return res.json({
+            success: true,
+            message: 'Order gift intent cleared (my_order)',
+            orderId: order.orderId,
+            orderIntent: toPublicOrderIntent(order.orderIntent)
+        });
+    } catch (error) {
+        logger.error('clearAdminOrderGiftIntent failed', { message: error.message, stack: error.stack });
+        return respondOrderError(res, 500, 'GIFT_INTENT_CLEAR_FAILED', 'Could not clear order gift intent');
     }
 };
 

@@ -26,13 +26,25 @@ const {
   adminDecideReturnRequest,
   adminInitiateReturnRefund,
   sendReturnChatMessage,
-  getReturnChat
+  getReturnChat,
+  getGiftIntentOptions,
+  getOrderGiftIntent,
+  updateAdminOrderGiftIntent,
+  clearAdminOrderGiftIntent
 } = require('../controllers/order.controller');
 const adminFulfillment = require('../controllers/admin-order-fulfillment.controller');
 const adminPendingOrderEdit = require('../controllers/admin-pending-order-edit.controller');
 const adminPendingOrderAddress = require('../controllers/admin-pending-order-address.controller');
 
 // Razorpay webhook is mounted in index.js (raw body) — not here
+
+/** Gift / other-order field catalog for checkout UI (auth required). */
+router.get(
+  '/gift-intent/options',
+  verifyToken,
+  requireWholesaleUserForWholesaleStorefront,
+  getGiftIntentOptions
+);
 
 router.post('/items', verifyToken, requireWholesaleUserForWholesaleStorefront, createOrder);
 router.post('/items/verify-payment', verifyToken, requireWholesaleUserForWholesaleStorefront, verifyPayment);
@@ -46,6 +58,12 @@ router.post(
 router.post('/items/:orderId/pay-balance', verifyToken, requireWholesaleUserForWholesaleStorefront, payOrderBalance);
 router.get('/items', verifyToken, requireWholesaleUserForWholesaleStorefront, getUserOrders);
 router.get('/items/:orderId', verifyToken, requireWholesaleUserForWholesaleStorefront, getOrder);
+router.get(
+  '/items/:orderId/gift-intent',
+  verifyToken,
+  requireWholesaleUserForWholesaleStorefront,
+  getOrderGiftIntent
+);
 router.get('/items/:orderId/track', verifyToken, requireWholesaleUserForWholesaleStorefront, trackOrder);
 router.post('/items/:orderId/return-request', verifyToken, requireWholesaleUserForWholesaleStorefront, uploadReturnProofs, createReturnRequest);
 router.post('/items/:orderId/return-chat', verifyToken, requireWholesaleUserForWholesaleStorefront, sendReturnChatMessage);
@@ -65,6 +83,10 @@ const adminOrderRefund = [verifyToken, authorizeRoles('admin'), requireAdminStor
 router.post('/admin/items/:orderId/refund', ...adminOrderRefund, refundOrderPayment);
 
 router.put('/admin/items/:orderId/status', ...adminOrderStaff, updateOrderStatus);
+
+router.get('/admin/items/:orderId/gift-intent', ...adminOrderStaff, getOrderGiftIntent);
+router.put('/admin/items/:orderId/gift-intent', ...adminOrderStaff, updateAdminOrderGiftIntent);
+router.delete('/admin/items/:orderId/gift-intent', ...adminOrderStaff, clearAdminOrderGiftIntent);
 
 router.get('/admin/returns/requests', ...adminOrderStaff, listAdminReturnRequests);
 
