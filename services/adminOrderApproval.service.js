@@ -60,13 +60,13 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
   const wasPaid = paymentStatus === 'paid' || paymentStatus === 'partially_paid';
   const paymentId = order.paymentInfo?.razorpayPaymentId;
   if (!wasPaid || !paymentId || !razorpay) {
-    return { refundAttempted: false, refundWarning: null };
+    return { refundAttempted: false, refundWarning: null, refundAmountInr: 0 };
   }
 
   const refundAmountInr = getCancelledOrderRefundAmount(order);
   const refundPaise = Math.round(refundAmountInr * 100);
   if (refundPaise < 1) {
-    return { refundAttempted: false, refundWarning: null };
+    return { refundAttempted: false, refundWarning: null, refundAmountInr: 0 };
   }
 
   try {
@@ -88,7 +88,7 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
       approvedAt: new Date()
     });
     await order.save();
-    return { refundAttempted: true, refundWarning: null };
+    return { refundAttempted: true, refundWarning: null, refundAmountInr };
   } catch (refundError) {
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
       refundContext: 'cancellation',
@@ -106,7 +106,8 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
     });
     return {
       refundAttempted: true,
-      refundWarning: 'Order cancelled, but refund failed. Support team action required.'
+      refundWarning: 'Order cancelled, but refund failed. Support team action required.',
+      refundAmountInr
     };
   }
 }
@@ -336,16 +337,34 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
     order.markModified('returnInfo');
 
     await order.save({ session });
-    await releaseOrderStockHold(order, session);
+    const releaseOutcome = await releaseOrderStockHold(order, session);
     await order.save({ session });
 
     await session.commitTransaction();
     session.endSession();
 
+    const stockReleased = Boolean(releaseOutcome?.ok && !releaseOutcome?.skipped);
+    const stockSkippedReason = String(releaseOutcome?.reason || '');
+
     let refundWarning = null;
+    let refundAmountDone = 0;
+    let refundAttempted = false;
     if (canInitiateRefund) {
       const refundOutcome = await attemptRefundForCancelledPaidOrder(order, { reason: 'Order cancelled by admin' });
       refundWarning = refundOutcome.refundWarning;
+      refundAttempted = Boolean(refundOutcome.refundAttempted);
+      refundAmountDone = Number(refundOutcome.refundAmountInr) || refundAmountInr || 0;
+    }
+
+    let message = 'Order cancelled.';
+    if (refundWarning) {
+      message = refundWarning;
+    } else if (refundAttempted && refundAmountDone > 0) {
+      message = `Order cancelled. Refund of ₹${refundAmountDone.toFixed(2)} initiated (reflects in 3–5 working days).`;
+    } else if (stockReleased) {
+      message = 'Order cancelled. Reserved stock released.';
+    } else if (stockSkippedReason === 'committed') {
+      message = 'Order cancelled. Stock was already deducted at payment and was not restored.';
     }
 
     return {
@@ -353,8 +372,10 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
       success: true,
       skipped: false,
       code: null,
-      message: refundWarning || 'Order cancelled and inventory restored.',
-      refundWarning: refundWarning || undefined
+      message,
+      refundWarning: refundWarning || undefined,
+      refundAmountInr: refundAttempted ? refundAmountDone : undefined,
+      stockReleased: stockReleased || undefined,
     };
   } catch (err) {
     await session.abortTransaction();
