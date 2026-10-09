@@ -10,7 +10,10 @@ const bcrypt = require('bcrypt');
 const { normalizeAllowedStorefronts } = require('../middlewares/admin-storefront-scope.middleware');
 const { getRefreshCookieOptions } = require('../utils/refreshCookieOptions');
 const refreshTokenSession = require('../services/refreshTokenSession.service');
-const { setOrUnsetUniqueString } = require('../utils/optionalUniqueContact');
+const {
+  setOrUnsetUniqueString,
+  normalizeOptionalEmail,
+} = require('../utils/optionalUniqueContact');
 const securityQuestionsService = require('../services/securityQuestions.service');
 const { parsePersonName } = require('../utils/personName');
 const { getAppName, getAppSignature } = require('../utils/appBrand');
@@ -2103,12 +2106,12 @@ const me = async (req, res) => {
 
 const updateProfile = async (req, res) => {
   try {
-    const updates = {};
     const hasEmailChange = Object.prototype.hasOwnProperty.call(req.body || {}, 'email');
     const hasPhoneChange = Object.prototype.hasOwnProperty.call(req.body || {}, 'phone');
 
-    // Identity fields require explicit OTP/verification flow; do not mutate directly here.
-    if (hasEmailChange || hasPhoneChange) {
+    // Changing an existing phone always needs OTP. Changing an existing email needs OTP too.
+    // First-time email add (phone-only / legacy accounts with no email) is allowed here.
+    if (hasPhoneChange) {
       return res.status(409).json({
         success: false,
         code: 'PROFILE_CONTACT_CHANGE_REQUIRES_VERIFICATION',
@@ -2116,18 +2119,66 @@ const updateProfile = async (req, res) => {
       });
     }
 
-    if (typeof req.body?.name === 'string' && req.body.name.trim()) {
-      updates.name = req.body.name.trim();
-    }
-
-    if (!Object.keys(updates).length) {
-      return respondAuthError(res, 400, 'PROFILE_FIELDS_MISSING', 'No updatable profile fields provided');
-    }
-
-    const user = await User.findByIdAndUpdate(req.userId, { $set: updates }, { new: true });
+    const user = await User.findById(req.userId);
     if (!user) {
       return respondAuthError(res, 404, 'USER_NOT_FOUND', 'User not found');
     }
+
+    if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+      user.name = req.body.name.trim();
+    }
+
+    if (hasEmailChange) {
+      const existingEmail = String(user.email || '').trim().toLowerCase();
+      if (existingEmail) {
+        return res.status(409).json({
+          success: false,
+          code: 'PROFILE_CONTACT_CHANGE_REQUIRES_VERIFICATION',
+          message: 'Email/phone update requires verification flow. Use dedicated contact-change endpoint.'
+        });
+      }
+
+      const normalizedEmail = normalizeOptionalEmail(req.body.email);
+      const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+      if (!emailOk) {
+        return respondAuthError(res, 400, 'INVALID_EMAIL', 'Enter a valid email address');
+      }
+
+      const customerEmailLookup = buildCustomerContactLookup(
+        { email: normalizedEmail },
+        ACCOUNT_SCOPES.ECOMM,
+      )
+      const staffEmailLookup = buildStaffContactLookup({ email: normalizedEmail })
+      const [emailTakenCustomer, emailTakenStaff] = await Promise.all([
+        customerEmailLookup
+          ? User.findOne({ ...customerEmailLookup, _id: { $ne: user._id } }).select('_id')
+          : null,
+        staffEmailLookup
+          ? User.findOne(staffEmailLookup).select('_id')
+          : null,
+      ]);
+
+      if (emailTakenCustomer || emailTakenStaff) {
+        return res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_PROFILE_FIELD',
+          message: 'This email is already in use',
+        });
+      }
+
+      setOrUnsetUniqueString(user, 'email', normalizedEmail);
+      // Added via profile/checkout — not OTP-verified yet; login still works via existing channel.
+      if (user.isEmailVerified !== true) {
+        user.isEmailVerified = false;
+      }
+    }
+
+    const dirtyPaths = user.modifiedPaths();
+    if (!dirtyPaths.length) {
+      return respondAuthError(res, 400, 'PROFILE_FIELDS_MISSING', 'No updatable profile fields provided');
+    }
+
+    await user.save();
 
     return res.status(200).json({
       success: true,
