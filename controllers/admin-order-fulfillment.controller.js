@@ -27,7 +27,8 @@ const {
 const { isUnpaidTerminalOrder } = require('../utils/orderPaymentState');
 const {
   runAdminApproveOrderSingle,
-  runAdminCancelOrderSingle
+  runAdminCancelOrderSingle,
+  runAdminRetryCancellationRefund
 } = require('../services/adminOrderApproval.service');
 const {
   buildShipmentOpsView,
@@ -2851,6 +2852,60 @@ exports.adminBulkApprovalConfirm = async (req, res) => {
   } catch (error) {
     logger.error('adminBulkApprovalConfirm', { message: error.message, stack: error.stack });
     return jsonError(res, 500, 'BULK_CONFIRM_FAILED', error.message || 'Server error');
+  }
+};
+
+/**
+ * POST /orders/admin/items/:orderId/refund/retry-cancellation
+ * Retry Razorpay refund after admin cancel left returnInfo.status = refund_failed.
+ */
+exports.adminRetryCancellationRefund = async (req, res) => {
+  try {
+    if (!assertStaffJson(req, res)) return;
+    const orderId = String(req.params?.orderId || '').trim();
+    if (!orderId) {
+      return jsonError(res, 400, 'ORDER_ID_REQUIRED', 'orderId is required');
+    }
+
+    const scopeMatch = getAdminOrderMatch(req);
+    const result = await runAdminRetryCancellationRefund(orderId, {
+      scopeMatch,
+      reason: String(req.body?.reason || '').trim() || undefined
+    });
+
+    if (!result?.success) {
+      const code = String(result?.code || 'REFUND_RETRY_FAILED');
+      const status =
+        code === 'ORDER_NOT_FOUND'
+          ? 404
+          : code === 'RAZORPAY_NOT_CONFIGURED'
+            ? 503
+            : code === 'REFUND_RETRY_IN_PROGRESS'
+              ? 409
+              : code === 'ORDER_ID_REQUIRED'
+                ? 400
+                : code === 'REFUND_RETRY_INTERNAL_ERROR'
+                  ? 500
+                  : 422;
+      return jsonError(res, status, code, result?.message || 'Refund retry failed', {
+        orderId,
+        refundFailureReason: result?.refundFailureReason || undefined,
+        refundAmountInr: result?.refundAmountInr
+      });
+    }
+
+    return res.json({
+      success: true,
+      orderId,
+      message: result.message,
+      synced: Boolean(result.synced),
+      skipped: Boolean(result.skipped),
+      refundAmountInr: result.refundAmountInr,
+      refundId: result.refundId || undefined
+    });
+  } catch (error) {
+    logger.error('adminRetryCancellationRefund', { message: error.message, stack: error.stack });
+    return jsonError(res, 500, 'REFUND_RETRY_FAILED', error.message || 'Server error');
   }
 };
 

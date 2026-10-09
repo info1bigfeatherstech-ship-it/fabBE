@@ -148,6 +148,12 @@ router.post(
 );
 
 router.post(
+  '/admin/items/:orderId/refund/retry-cancellation',
+  ...adminOrderStaff,
+  adminFulfillment.adminRetryCancellationRefund
+);
+
+router.post(
   '/admin/items/bulk-fulfillment/ship-now',
   ...adminOrderStaff,
   adminFulfillment.adminBulkFulfillmentShipNow

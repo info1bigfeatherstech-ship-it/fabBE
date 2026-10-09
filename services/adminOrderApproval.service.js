@@ -52,6 +52,79 @@ function getCancelledOrderRefundAmount(order) {
 }
 
 /**
+ * Normalize Razorpay / SDK error shapes into a single admin-readable string.
+ * @param {unknown} err
+ * @returns {string}
+ */
+function extractRazorpayErrorMessage(err) {
+  try {
+    const nested =
+      err?.error?.description ||
+      err?.error?.reason ||
+      err?.error?.message ||
+      err?.description ||
+      err?.reason ||
+      err?.message;
+    const text = String(nested || '').trim();
+    if (text) return text.slice(0, 500);
+  } catch {
+    /* ignore */
+  }
+  return 'Refund API failed';
+}
+
+/**
+ * @param {string} message
+ * @returns {boolean}
+ */
+function looksLikeAlreadyRefundedError(message) {
+  const m = String(message || '').toLowerCase();
+  return (
+    m.includes('already been refunded') ||
+    m.includes('already refunded') ||
+    m.includes('fully refunded') ||
+    m.includes('refund has already been') ||
+    (m.includes('amount') && m.includes('exceed') && m.includes('refund'))
+  );
+}
+
+/**
+ * Apply successful cancellation refund fields on the order document (caller saves).
+ * @param {import('mongoose').Document} order
+ * @param {{ refundId: string, refundAmountInr: number, totalRefundedPaise?: number }} args
+ */
+function applySuccessfulCancellationRefund(order, { refundId, refundAmountInr, totalRefundedPaise }) {
+  const totalPaise = Math.round((Number(order.totalAmount) || 0) * 100);
+  const refundedPaise =
+    totalRefundedPaise != null
+      ? Number(totalRefundedPaise) || 0
+      : Math.round((Number(refundAmountInr) || 0) * 100);
+
+  order.paymentStatus =
+    totalPaise > 0 && refundedPaise >= totalPaise ? 'refunded' : 'partially_refunded';
+
+  order.returnInfo = mergeReturnInfo(order.returnInfo, {
+    refundContext: 'cancellation',
+    refundAmount: Number(refundAmountInr) || 0,
+    refundId: refundId || order.returnInfo?.refundId || null,
+    status: 'refunded',
+    approvedAt: new Date()
+  });
+
+  order.paymentInfo = {
+    ...(order.paymentInfo || {}),
+  };
+  if (order.paymentInfo.refundFailureReason) {
+    delete order.paymentInfo.refundFailureReason;
+  }
+  if (order.paymentInfo.refundRetryStartedAt) {
+    delete order.paymentInfo.refundRetryStartedAt;
+  }
+  order.markModified('paymentInfo');
+  order.markModified('returnInfo');
+}
+
+/**
  * @param {import('mongoose').Document} order
  * @param {{ reason?: string }} [opts]
  */
@@ -78,23 +151,15 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
       }
     });
 
-    order.paymentStatus =
-      refundPaise >= Math.round((Number(order.totalAmount) || 0) * 100) ? 'refunded' : 'partially_refunded';
-    order.returnInfo = mergeReturnInfo(order.returnInfo, {
-      refundContext: 'cancellation',
-      refundAmount: refundAmountInr,
-      refundId: refund.id,
-      status: 'refunded',
-      approvedAt: new Date()
+    applySuccessfulCancellationRefund(order, {
+      refundId: refund?.id,
+      refundAmountInr,
+      totalRefundedPaise: refundPaise
     });
     await order.save();
     return { refundAttempted: true, refundWarning: null, refundAmountInr };
   } catch (refundError) {
-    const failureReason =
-      refundError?.error?.description ||
-      refundError?.description ||
-      refundError?.message ||
-      'Refund API failed';
+    const failureReason = extractRazorpayErrorMessage(refundError);
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
       refundContext: 'cancellation',
       status: 'refund_failed',
@@ -115,6 +180,306 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
       refundWarning: 'Order cancelled, but refund failed. Support team action required.',
       refundFailureReason: failureReason,
       refundAmountInr,
+    };
+  }
+}
+
+/**
+ * Admin retry for a cancellation refund that previously failed at Razorpay.
+ * Idempotent: syncs DB if gateway already refunded; claims refund_failed → refund_pending
+ * to reduce double-click races.
+ *
+ * @param {string} orderId
+ * @param {{ scopeMatch?: object|null, reason?: string }} [opts]
+ */
+async function runAdminRetryCancellationRefund(orderId, opts = {}) {
+  const id = String(orderId || '').trim();
+  if (!id) {
+    return {
+      orderId: orderId || '',
+      success: false,
+      code: 'ORDER_ID_REQUIRED',
+      message: 'orderId is required'
+    };
+  }
+
+  if (!razorpay) {
+    return {
+      orderId: id,
+      success: false,
+      code: 'RAZORPAY_NOT_CONFIGURED',
+      message: 'Razorpay is not configured on this server.'
+    };
+  }
+
+  try {
+    const filter = mergeOrderScopeFilter({ orderId: id }, opts.scopeMatch || null);
+    const order = await Order.findOne(filter);
+    if (!order) {
+      return { orderId: id, success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found' };
+    }
+
+    const orderStatus = String(order.orderStatus || '').toLowerCase();
+    if (orderStatus !== 'cancelled') {
+      return {
+        orderId: id,
+        success: false,
+        code: 'ORDER_NOT_CANCELLED',
+        message: 'Retry refund is only allowed for cancelled orders.'
+      };
+    }
+
+    const payStatus = String(order.paymentStatus || '').toLowerCase();
+    if (payStatus === 'refunded') {
+      return {
+        orderId: id,
+        success: true,
+        skipped: true,
+        code: 'ALREADY_REFUNDED',
+        message: 'Order is already marked refunded.'
+      };
+    }
+
+    const riStatus = String(order.returnInfo?.status || '').toLowerCase();
+    const refundContext = String(order.returnInfo?.refundContext || '').toLowerCase();
+    const hasFailureReason = Boolean(String(order.paymentInfo?.refundFailureReason || '').trim());
+    const eligibleStatus =
+      riStatus === 'refund_failed' ||
+      (riStatus === 'refund_pending' && hasFailureReason) ||
+      (hasFailureReason && ['paid', 'partially_paid', 'partially_refunded'].includes(payStatus));
+
+    if (!eligibleStatus) {
+      return {
+        orderId: id,
+        success: false,
+        code: 'REFUND_RETRY_NOT_ELIGIBLE',
+        message: 'No failed cancellation refund to retry on this order.'
+      };
+    }
+
+    if (refundContext && refundContext !== 'cancellation') {
+      return {
+        orderId: id,
+        success: false,
+        code: 'REFUND_CONTEXT_NOT_CANCELLATION',
+        message: 'This refund belongs to another flow (not cancellation). Use the matching refund tool.'
+      };
+    }
+
+    const paymentId = String(order.paymentInfo?.razorpayPaymentId || '').trim();
+    if (!paymentId) {
+      return {
+        orderId: id,
+        success: false,
+        code: 'RAZORPAY_PAYMENT_MISSING',
+        message: 'Missing Razorpay payment id — cannot retry refund.'
+      };
+    }
+
+    // Claim the retry slot to reduce concurrent admin double-clicks.
+    if (riStatus === 'refund_failed') {
+      const startedAt = order.paymentInfo?.refundRetryStartedAt
+        ? new Date(order.paymentInfo.refundRetryStartedAt).getTime()
+        : 0;
+      if (startedAt && Date.now() - startedAt < 45_000) {
+        return {
+          orderId: id,
+          success: false,
+          code: 'REFUND_RETRY_IN_PROGRESS',
+          message: 'A refund retry is already in progress. Wait a moment and refresh.'
+        };
+      }
+      order.returnInfo = mergeReturnInfo(order.returnInfo, {
+        refundContext: 'cancellation',
+        status: 'refund_pending'
+      });
+      order.paymentInfo = {
+        ...(order.paymentInfo || {}),
+        refundRetryStartedAt: new Date()
+      };
+      order.markModified('paymentInfo');
+      order.markModified('returnInfo');
+      await order.save();
+    }
+
+    let gatewayPayment = null;
+    try {
+      gatewayPayment = await razorpay.payments.fetch(paymentId);
+    } catch (fetchErr) {
+      const failureReason = extractRazorpayErrorMessage(fetchErr);
+      order.returnInfo = mergeReturnInfo(order.returnInfo, {
+        refundContext: 'cancellation',
+        status: 'refund_failed'
+      });
+      order.paymentInfo = {
+        ...(order.paymentInfo || {}),
+        refundFailureReason: failureReason
+      };
+      if (order.paymentInfo.refundRetryStartedAt) {
+        delete order.paymentInfo.refundRetryStartedAt;
+      }
+      order.markModified('paymentInfo');
+      await order.save();
+      logger.error('[adminOrderApproval] refund retry: payment fetch failed', {
+        orderId: id,
+        message: failureReason
+      });
+      return {
+        orderId: id,
+        success: false,
+        code: 'RAZORPAY_PAYMENT_FETCH_FAILED',
+        message: failureReason,
+        refundFailureReason: failureReason
+      };
+    }
+
+    const paymentAmountPaise = Math.max(0, Number(gatewayPayment?.amount) || 0);
+    const alreadyRefundedPaise = Math.max(0, Number(gatewayPayment?.amount_refunded) || 0);
+    // Prefer amount stored at cancel time; else derive from paid / bill total.
+    const storedRefundInr = Number(order.returnInfo?.refundAmount) || 0;
+    const targetRefundInr =
+      storedRefundInr > 0
+        ? storedRefundInr
+        : payStatus === 'partially_paid'
+          ? Math.max(0, Number(order.amountPaidInr) || 0)
+          : Math.max(0, Number(order.totalAmount) || 0);
+    const targetPaise = Math.round(targetRefundInr * 100);
+    const remainingPaise = Math.max(0, paymentAmountPaise - alreadyRefundedPaise);
+
+    // Gateway already covered the target — sync local state (idempotent success).
+    if (targetPaise > 0 && alreadyRefundedPaise >= targetPaise) {
+      const latestRefundId = order.returnInfo?.refundId || null;
+      applySuccessfulCancellationRefund(order, {
+        refundId: latestRefundId,
+        refundAmountInr: targetRefundInr,
+        totalRefundedPaise: alreadyRefundedPaise
+      });
+      await order.save();
+      return {
+        orderId: id,
+        success: true,
+        synced: true,
+        code: null,
+        message: `Refund already completed at Razorpay. Order synced — ₹${targetRefundInr.toFixed(2)}.`,
+        refundAmountInr: targetRefundInr,
+        refundId: latestRefundId
+      };
+    }
+
+    const refundPaise = Math.min(
+      targetPaise > alreadyRefundedPaise ? targetPaise - alreadyRefundedPaise : remainingPaise,
+      remainingPaise
+    );
+    if (refundPaise < 1) {
+      applySuccessfulCancellationRefund(order, {
+        refundId: order.returnInfo?.refundId,
+        refundAmountInr: targetRefundInr || alreadyRefundedPaise / 100,
+        totalRefundedPaise: alreadyRefundedPaise
+      });
+      await order.save();
+      return {
+        orderId: id,
+        success: true,
+        synced: true,
+        code: null,
+        message: 'No remaining refundable amount at Razorpay. Order marked refunded.',
+        refundAmountInr: alreadyRefundedPaise / 100
+      };
+    }
+
+    const refundAmountInr = refundPaise / 100;
+
+    try {
+      const refund = await razorpay.payments.refund(paymentId, {
+        amount: refundPaise,
+        notes: {
+          orderId: id,
+          reason: opts.reason || 'Admin retry — cancellation refund',
+          retry: '1'
+        }
+      });
+
+      applySuccessfulCancellationRefund(order, {
+        refundId: refund?.id,
+        refundAmountInr: (alreadyRefundedPaise + refundPaise) / 100,
+        totalRefundedPaise: alreadyRefundedPaise + refundPaise
+      });
+      await order.save();
+
+      return {
+        orderId: id,
+        success: true,
+        code: null,
+        message: `Refund of ₹${refundAmountInr.toFixed(2)} initiated (5–7 working days to reflect).`,
+        refundAmountInr,
+        refundId: refund?.id || null
+      };
+    } catch (refundError) {
+      const failureReason = extractRazorpayErrorMessage(refundError);
+
+      if (looksLikeAlreadyRefundedError(failureReason)) {
+        try {
+          const again = await razorpay.payments.fetch(paymentId);
+          const refundedPaise = Math.max(0, Number(again?.amount_refunded) || 0);
+          applySuccessfulCancellationRefund(order, {
+            refundId: order.returnInfo?.refundId,
+            refundAmountInr: refundedPaise / 100,
+            totalRefundedPaise: refundedPaise
+          });
+          await order.save();
+          return {
+            orderId: id,
+            success: true,
+            synced: true,
+            code: null,
+            message: 'Razorpay reports payment already refunded. Order synced.',
+            refundAmountInr: refundedPaise / 100
+          };
+        } catch {
+          /* fall through to failure path */
+        }
+      }
+
+      order.returnInfo = mergeReturnInfo(order.returnInfo, {
+        refundContext: 'cancellation',
+        status: 'refund_failed',
+        refundAmount: targetRefundInr || refundAmountInr
+      });
+      order.paymentInfo = {
+        ...(order.paymentInfo || {}),
+        refundFailureReason: failureReason
+      };
+      if (order.paymentInfo.refundRetryStartedAt) {
+        delete order.paymentInfo.refundRetryStartedAt;
+      }
+      order.markModified('paymentInfo');
+      await order.save();
+
+      logger.error('[adminOrderApproval] refund retry failed', {
+        orderId: id,
+        message: failureReason
+      });
+
+      return {
+        orderId: id,
+        success: false,
+        code: 'REFUND_RETRY_FAILED',
+        message: failureReason,
+        refundFailureReason: failureReason,
+        refundAmountInr: targetRefundInr || refundAmountInr
+      };
+    }
+  } catch (err) {
+    logger.error('[adminOrderApproval] runAdminRetryCancellationRefund', {
+      orderId: id,
+      message: err?.message,
+      stack: err?.stack
+    });
+    return {
+      orderId: id,
+      success: false,
+      code: 'REFUND_RETRY_INTERNAL_ERROR',
+      message: err?.message || 'Refund retry failed'
     };
   }
 }
@@ -411,5 +776,8 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
 
 module.exports = {
   runAdminApproveOrderSingle,
-  runAdminCancelOrderSingle
+  runAdminCancelOrderSingle,
+  runAdminRetryCancellationRefund,
+  getCancelledOrderRefundAmount,
+  extractRazorpayErrorMessage
 };
