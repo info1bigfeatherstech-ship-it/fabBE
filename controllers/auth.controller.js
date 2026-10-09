@@ -27,6 +27,7 @@ const {
   buildStaffContactLookup,
   customerScopeFromStorefront
 } = require('../utils/accountScope');
+const { findEcommCustomerByGoogleOrEmail } = require('../utils/ecommCustomerIdentity');
 const { publicLoyaltyView } = require('../services/loyalty.service');
 
 // Import from OTP service
@@ -541,13 +542,24 @@ const listRefreshCookieCandidates = (req, preferredPortal) => {
   const portal = normalizeRefreshPortal(preferredPortal) || 'ecomm';
   const cookieNames = REFRESH_COOKIES_BY_PORTAL[portal] || REFRESH_COOKIES_BY_PORTAL.ecomm;
   const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (refreshToken, cookieName) => {
+    const token = String(refreshToken || '').trim();
+    if (!token || seen.has(token)) return;
+    seen.add(token);
+    candidates.push({ refreshToken: token, cookieName });
+  };
 
   for (const cookieName of cookieNames) {
-    const value = req.cookies?.[cookieName];
-    if (value) {
-      candidates.push({ refreshToken: value, cookieName });
-    }
+    pushCandidate(req.cookies?.[cookieName], cookieName);
   }
+
+  // Fallback when HttpOnly cookie is missing (e.g. strict browser / first paint).
+  // Prefer cookie; body/header only used if not already present.
+  const primaryCookieName = cookieNames[0] || resolveRefreshCookieName(portal);
+  pushCandidate(req.body?.refreshToken, primaryCookieName);
+  pushCandidate(req.headers?.['x-refresh-token'], primaryCookieName);
 
   return candidates;
 };
@@ -837,7 +849,15 @@ const register = async (req, res) => {
     }
 
     if (existingEmailUser && isVerifiedUserRecord(existingEmailUser)) {
-      return respondAuthError(res, 409, 'EMAIL_ALREADY_REGISTERED', 'User with this email already exists. Please login.');
+      const viaGoogle = Boolean(existingEmailUser.googleId);
+      return respondAuthError(
+        res,
+        409,
+        'EMAIL_ALREADY_REGISTERED',
+        viaGoogle
+          ? 'An account with this email already exists. Please continue with Google login.'
+          : 'User with this email already exists. Please login.'
+      );
     }
 
     const phoneOrphan = existingPhoneUser && !isVerifiedUserRecord(existingPhoneUser) ? existingPhoneUser : null;
@@ -1042,6 +1062,7 @@ const verifyOTPAndLogin = async (req, res) => {
       success: true,
       message: 'Email verified successfully. You are now logged in.',
       accessToken,
+      refreshToken,
       user: {
         id: user._id,
         name: user.name,
@@ -1130,6 +1151,7 @@ await refreshTokenSession.appendSession(user._id, {
       success: true,
       message: "Login successful",
       accessToken,
+      refreshToken,
       user: {
         id: user._id,
         email: user.email,
@@ -2050,7 +2072,8 @@ const refreshAccessToken = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      accessToken: newAccessToken
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken
     });
 
   } catch (error) {
@@ -2285,6 +2308,7 @@ const googleAuth = async (req, res) => {
 
     const { sub: googleId, email, name = "" } = payload;
     const normalizedEmail = String(email || '').trim().toLowerCase();
+    const displayName = String(name || '').trim();
 
     const reserved = await User.findOne(buildStaffContactLookup({ email: normalizedEmail })).select('_id');
     if (reserved) {
@@ -2296,9 +2320,11 @@ const googleAuth = async (req, res) => {
       );
     }
 
-    let user = await User.findOne(
-      buildCustomerContactLookup({ email: normalizedEmail }, ACCOUNT_SCOPES.ECOMM)
-    );
+    // Prefer existing ecomm customer by googleId OR email (canonical if duplicates).
+    let user = await findEcommCustomerByGoogleOrEmail({
+      googleId,
+      email: normalizedEmail
+    });
 
     if (user) {
       if (isWholesalerAccount(user) || isPrivilegedAccount(user)) {
@@ -2309,61 +2335,108 @@ const googleAuth = async (req, res) => {
           'This account is not allowed to login from the ecomm user portal.'
         );
       }
-      if (!user.googleId) user.googleId = googleId;
+      // Never create a second account for the same Google email.
+      if (!user.googleId) {
+        user.googleId = googleId;
+      } else if (String(user.googleId) !== String(googleId)) {
+        // Same email, different Google subject — keep existing email owner (support).
+        return respondAuthError(
+          res,
+          409,
+          'GOOGLE_EMAIL_LINKED_TO_OTHER',
+          'This email is already linked to another Google account. Please login with email/password or contact support.'
+        );
+      }
+      setOrUnsetUniqueString(user, 'email', normalizedEmail);
+      if (displayName && !String(user.name || '').trim()) {
+        user.name = displayName;
+      }
       user.isEmailVerified = true;
-      user.status = "active";
+      user.status = 'active';
       user.accountScope = ACCOUNT_SCOPES.ECOMM;
+      user.lastLoginMethod = 'google';
+      if (!user.registrationMethod) user.registrationMethod = 'google';
     } else {
       user = new User({
         googleId,
         email: normalizedEmail,
-        name,
+        name: displayName || undefined,
         isEmailVerified: true,
-        status: "active",
-        userType: "user",
-        role: "user",
+        status: 'active',
+        userType: 'user',
+        role: 'user',
         accountScope: ACCOUNT_SCOPES.ECOMM,
-        registrationMethod: "google"
+        registrationMethod: 'google',
+        lastLoginMethod: 'google'
       });
     }
 
-  const accessToken = generateAccessToken(user._id, user.userType, user.role, 'ecomm');
-  const refreshToken = generateRefreshToken(user._id);
-  const hashedRefreshToken = hashToken(refreshToken);
+    const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Google-Login';
 
-  const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Google-Login';
-
-  try {
-    await user.save();
-  } catch (saveErr) {
-    if (handleDuplicateContactError(res, saveErr, 'This Google email is already registered on e-commerce.')) {
-      return;
+    try {
+      await user.save();
+    } catch (saveErr) {
+      // Race: another request created/linked the same email — login that account.
+      if (saveErr?.code === 11000) {
+        const existing = await findEcommCustomerByGoogleOrEmail({
+          googleId,
+          email: normalizedEmail
+        });
+        if (existing && !isWholesalerAccount(existing) && !isPrivilegedAccount(existing)) {
+          user = existing;
+          if (!user.googleId) user.googleId = googleId;
+          setOrUnsetUniqueString(user, 'email', normalizedEmail);
+          user.isEmailVerified = true;
+          user.status = 'active';
+          user.accountScope = ACCOUNT_SCOPES.ECOMM;
+          user.lastLoginMethod = 'google';
+          await user.save();
+        } else if (
+          handleDuplicateContactError(
+            res,
+            saveErr,
+            'This Google email is already registered on e-commerce.'
+          )
+        ) {
+          return;
+        } else {
+          throw saveErr;
+        }
+      } else {
+        throw saveErr;
+      }
     }
-    throw saveErr;
-  }
 
-await refreshTokenSession.appendSession(user._id, {
-  hashedToken: hashedRefreshToken,
-  deviceInfo
-});
+    const accessToken = generateAccessToken(user._id, user.userType, user.role, 'ecomm');
+    const refreshToken = generateRefreshToken(user._id);
+    const hashedRefreshToken = hashToken(refreshToken);
 
-setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
+    await refreshTokenSession.appendSession(user._id, {
+      hashedToken: hashedRefreshToken,
+      deviceInfo
+    });
 
+    setRefreshTokenCookie(req, res, 'ecomm', refreshToken);
 
     return res.status(200).json({
       success: true,
-      message: "Google login successful",
+      message: 'Google login successful',
       accessToken,
+      refreshToken,
       user: {
         id: user._id,
         email: user.email,
         name: user.name,
-        userType: user.userType
+        phone: user.phone,
+        userType: user.userType,
+        role: user.role,
+        status: user.status,
+        isEmailVerified: user.isEmailVerified,
+        isPhoneVerified: user.isPhoneVerified
       }
     });
-
   } catch (error) {
-    console.error("[Google Auth Error]", error);
+    console.error('[Google Auth Error]', error);
     return respondAuthError(res, 500, 'GOOGLE_AUTH_FAILED', 'Google authentication failed');
   }
 };

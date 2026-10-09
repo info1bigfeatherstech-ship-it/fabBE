@@ -337,17 +337,20 @@ async function releaseInventoryHoldByOrderId(orderId, meta = {}) {
 
 /**
  * Release hold for a persisted order (cancel / fail / expiry).
- * Idempotent for already released/committed (committed → no stock return here).
+ * Idempotent for already released.
+ * @param {object} [opts]
+ * @param {boolean} [opts.restoreCommittedOnCancel] — admin cancel: restock even after payment commit
  */
-async function releaseOrderStockHold(order, session = null) {
+async function releaseOrderStockHold(order, session = null, opts = {}) {
   if (!order) return { ok: true, skipped: true };
   const hold = readHold(order);
+  const restoreCommittedOnCancel = Boolean(opts.restoreCommittedOnCancel);
 
   if (hold.status === 'released' || hold.status === 'none') {
     return { ok: true, skipped: true, reason: hold.status };
   }
-  if (hold.status === 'committed') {
-    // Sold stock is not returned on cancel-after-commit in Phase 2 (returns/RTO separate).
+  if (hold.status === 'committed' && !restoreCommittedOnCancel) {
+    // Default: sold stock is not returned (returns/RTO separate).
     logger.info('[orderStockBridge] release skipped — already committed', {
       orderId: order.orderId
     });
@@ -356,6 +359,52 @@ async function releaseOrderStockHold(order, session = null) {
 
   // Legacy orders without inventoryHold: treat as mongo
   const treatAsMongo = !hold.inventoryReserved && (hold.mongoReserved || !hold.source || hold.source === 'mongo');
+
+  if (hold.status === 'committed' && restoreCommittedOnCancel) {
+    let inventoryReleased = false;
+    if (hold.inventoryReserved || hold.source === 'inventory' || hold.source === 'hybrid') {
+      const rel = await releaseInventoryHoldByOrderId(order.orderId, {
+        trigger: 'admin_cancel_restock_committed',
+      });
+      inventoryReleased = Boolean(rel.ok);
+      if (!rel.ok && rel.code === 'ORDER_ALREADY_COMMITTED') {
+        logger.warn('[orderStockBridge] inventory already committed — restocking mongo ecom qty on admin cancel', {
+          orderId: order.orderId,
+        });
+      } else if (!rel.ok && rel.code && rel.code !== 'RESERVATION_NOT_FOUND') {
+        logger.error('[orderStockBridge] inventory release incomplete on committed cancel', {
+          orderId: order.orderId,
+          code: rel.code,
+        });
+      }
+    }
+
+    // Mongo was cut at reserve for mongo/hybrid-mongo lines. Restock those.
+    // If inventory release failed after commit, also restore all lines in mongo so Ecom stock recovers.
+    if (hold.source === 'hybrid' && inventoryReleased) {
+      const mongoItems = (order.items || []).filter((it) => !normalizeProductCode(it.productCode));
+      if (mongoItems.length) {
+        await releaseReservedInventoryForLines(mongoItems, session);
+      }
+    } else if (
+      hold.mongoReserved ||
+      treatAsMongo ||
+      hold.source === 'mongo' ||
+      !hold.source ||
+      (hold.inventoryReserved && !inventoryReleased) ||
+      (hold.source === 'hybrid' && !inventoryReleased) ||
+      hold.source === 'inventory'
+    ) {
+      await releaseReservedInventoryForOrder(order, session);
+    }
+
+    writeHold(order, {
+      ...hold,
+      status: 'released',
+      reason: 'admin_cancel_restock_committed',
+    });
+    return { ok: true, skipped: false, reason: 'restored_after_commit' };
+  }
 
   if (hold.inventoryReserved || hold.source === 'inventory' || hold.source === 'hybrid') {
     const rel = await releaseInventoryHoldByOrderId(order.orderId, { trigger: 'order_release' });

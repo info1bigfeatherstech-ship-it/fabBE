@@ -1,7 +1,12 @@
 
 const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
-const { deriveAccountScope, ACCOUNT_SCOPES } = require("../utils/accountScope");
+const {
+  deriveAccountScope,
+  ACCOUNT_SCOPES,
+  isPrivilegedRole,
+  normalizeAccountScope
+} = require("../utils/accountScope");
 
 const userSchema = new mongoose.Schema(
   {
@@ -293,6 +298,34 @@ userSchema.index({ accountScope: 1, userType: 1 });
 userSchema.index({ 'loyalty.badgeSlug': 1 });
 userSchema.index({ 'loyalty.lifetimeSpendInr': -1 });
 userSchema.index({ 'loyalty.pointsBalance': -1 });
+
+/**
+ * Block nameless shell customers (no email/phone/googleId). Those docs steal
+ * sessions in the UI while leaving orders/addresses on the real account.
+ * Mongoose 9 / Kareem: sync pre hooks — no `next` callback (calling next throws).
+ */
+userSchema.pre('validate', function requireEcommCustomerContact() {
+  const userType = String(this.userType || 'user').trim().toLowerCase();
+  const role = String(this.role || 'user').trim().toLowerCase();
+  const scope = normalizeAccountScope(this.accountScope);
+
+  if (userType === 'admin' || userType === 'wholesaler' || role === 'wholesaler') {
+    return;
+  }
+  if (scope === ACCOUNT_SCOPES.STAFF || isPrivilegedRole(role)) {
+    return;
+  }
+  if (scope === ACCOUNT_SCOPES.WHOLESALE) {
+    return;
+  }
+
+  const email = String(this.email || '').trim();
+  const phone = String(this.phone || '').trim();
+  const googleId = String(this.googleId || '').trim();
+  if (!email && !phone && !googleId) {
+    throw new Error('Ecomm customer requires email, phone, or Google identity');
+  }
+});
 
 /**
  * Never persist empty/null on unique contact fields — otherwise a legacy

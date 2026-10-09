@@ -99,7 +99,9 @@ function customerScopeFilter(scope) {
         $or: [
           { accountScope: ACCOUNT_SCOPES.ECOMM },
           { accountScope: { $exists: false } },
-          { accountScope: null }
+          { accountScope: null },
+          // Legacy docs sometimes stored empty string (missed by null/missing checks).
+          { accountScope: '' }
         ]
       },
       { userType: { $nin: ['wholesaler', 'admin'] } },

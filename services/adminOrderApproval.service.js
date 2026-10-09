@@ -90,24 +90,31 @@ async function attemptRefundForCancelledPaidOrder(order, opts = {}) {
     await order.save();
     return { refundAttempted: true, refundWarning: null, refundAmountInr };
   } catch (refundError) {
+    const failureReason =
+      refundError?.error?.description ||
+      refundError?.description ||
+      refundError?.message ||
+      'Refund API failed';
     order.returnInfo = mergeReturnInfo(order.returnInfo, {
       refundContext: 'cancellation',
-      status: 'refund_failed'
+      status: 'refund_failed',
+      refundAmount: refundAmountInr,
     });
     order.paymentInfo = {
       ...(order.paymentInfo || {}),
-      refundFailureReason: refundError?.message || 'Refund API failed'
+      refundFailureReason: failureReason,
     };
     order.markModified('paymentInfo');
     await order.save();
     logger.error('[adminOrderApproval] refund failed after admin cancel', {
       orderId: order.orderId,
-      message: refundError?.message
+      message: failureReason,
     });
     return {
       refundAttempted: true,
       refundWarning: 'Order cancelled, but refund failed. Support team action required.',
-      refundAmountInr
+      refundFailureReason: failureReason,
+      refundAmountInr,
     };
   }
 }
@@ -337,7 +344,10 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
     order.markModified('returnInfo');
 
     await order.save({ session });
-    const releaseOutcome = await releaseOrderStockHold(order, session);
+    // Paid/partial cancel must restock even if payment was already committed; refund is separate.
+    const releaseOutcome = await releaseOrderStockHold(order, session, {
+      restoreCommittedOnCancel: true,
+    });
     await order.save({ session });
 
     await session.commitTransaction();
@@ -347,24 +357,31 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
     const stockSkippedReason = String(releaseOutcome?.reason || '');
 
     let refundWarning = null;
+    let refundFailureReason = null;
     let refundAmountDone = 0;
     let refundAttempted = false;
     if (canInitiateRefund) {
       const refundOutcome = await attemptRefundForCancelledPaidOrder(order, { reason: 'Order cancelled by admin' });
       refundWarning = refundOutcome.refundWarning;
+      refundFailureReason = refundOutcome.refundFailureReason || null;
       refundAttempted = Boolean(refundOutcome.refundAttempted);
       refundAmountDone = Number(refundOutcome.refundAmountInr) || refundAmountInr || 0;
     }
 
-    let message = 'Order cancelled.';
+    const stockBit = stockReleased
+      ? 'Stock restocked.'
+      : stockSkippedReason
+        ? `Stock note: ${stockSkippedReason}.`
+        : '';
+    let message = `Order cancelled. ${stockBit}`.trim();
     if (refundWarning) {
-      message = refundWarning;
+      message = `Order cancelled. ${stockBit} Refund failed — see reason below.`
+        .replace(/\s+/g, ' ')
+        .trim();
     } else if (refundAttempted && refundAmountDone > 0) {
-      message = `Order cancelled. Refund of ₹${refundAmountDone.toFixed(2)} initiated (reflects in 3–5 working days).`;
-    } else if (stockReleased) {
-      message = 'Order cancelled. Reserved stock released.';
-    } else if (stockSkippedReason === 'committed') {
-      message = 'Order cancelled. Stock was already deducted at payment and was not restored.';
+      message = `Order cancelled. ${stockBit} Refund of ₹${refundAmountDone.toFixed(2)} initiated (5–7 working days to reflect).`
+        .replace(/\s+/g, ' ')
+        .trim();
     }
 
     return {
@@ -374,6 +391,7 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
       code: null,
       message,
       refundWarning: refundWarning || undefined,
+      refundFailureReason: refundFailureReason || undefined,
       refundAmountInr: refundAttempted ? refundAmountDone : undefined,
       stockReleased: stockReleased || undefined,
     };
