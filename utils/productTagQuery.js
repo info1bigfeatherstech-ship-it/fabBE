@@ -9,6 +9,7 @@ const MARKETING_TAG_SLUGS = Object.freeze([
   'today-arrival',
   'jewellery-spotted',
   'bestselling-jewelry',
+  'festive-offer',
 ]);
 
 /**

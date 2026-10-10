@@ -10,7 +10,13 @@ const productTagSchema = new mongoose.Schema(
 
     tags: {
       type: [String],
-      enum: ["on-sale", "today-arrival", "jewellery-spotted", "bestselling-jewelry"],
+      enum: [
+        "on-sale",
+        "today-arrival",
+        "jewellery-spotted",
+        "bestselling-jewelry",
+        "festive-offer",
+      ],
       default: []
     }
   },
