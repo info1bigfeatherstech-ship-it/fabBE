@@ -27,7 +27,11 @@ const {
   buildStaffContactLookup,
   customerScopeFromStorefront
 } = require('../utils/accountScope');
-const { findEcommCustomerByGoogleOrEmail } = require('../utils/ecommCustomerIdentity');
+const {
+  findEcommCustomerByGoogleOrEmail,
+  resolveEcommCustomerForGoogleLogin,
+  claimGoogleIdForEcommCustomer
+} = require('../utils/ecommCustomerIdentity');
 const { publicLoyaltyView } = require('../services/loyalty.service');
 
 // Import from OTP service
@@ -2382,14 +2386,16 @@ const googleAuth = async (req, res) => {
       );
     }
 
-    // Prefer existing ecomm customer by googleId OR email (canonical if duplicates).
-    let user = await findEcommCustomerByGoogleOrEmail({
-      googleId,
-      email: normalizedEmail
-    });
-
-    if (user) {
-      if (isWholesalerAccount(user) || isPrivilegedAccount(user)) {
+    /**
+     * Production-safe identity:
+     * 1) Resolve existing ecomm customer by googleId OR email (canonical if dupes).
+     * 2) Never create a second account for the same Google email/subject.
+     * 3) Re-check immediately before insert to close TOCTOU races.
+     * 4) On unique-index conflict, recover to the existing customer — never 500.
+     */
+    const respondGoogleIdentityError = (err) => {
+      const code = err?.code;
+      if (code === 'PORTAL_ACCESS_DENIED') {
         return respondAuthError(
           res,
           403,
@@ -2397,11 +2403,7 @@ const googleAuth = async (req, res) => {
           'This account is not allowed to login from the ecomm user portal.'
         );
       }
-      // Never create a second account for the same Google email.
-      if (!user.googleId) {
-        user.googleId = googleId;
-      } else if (String(user.googleId) !== String(googleId)) {
-        // Same email, different Google subject — keep existing email owner (support).
+      if (code === 'GOOGLE_EMAIL_LINKED_TO_OTHER') {
         return respondAuthError(
           res,
           409,
@@ -2409,28 +2411,91 @@ const googleAuth = async (req, res) => {
           'This email is already linked to another Google account. Please login with email/password or contact support.'
         );
       }
-      setOrUnsetUniqueString(user, 'email', normalizedEmail);
-      if (displayName && !String(user.name || '').trim()) {
-        user.name = displayName;
+      if (code === 'GOOGLE_ID_EMAIL_MISMATCH') {
+        return respondAuthError(
+          res,
+          409,
+          'GOOGLE_ID_EMAIL_MISMATCH',
+          'This Google account is already linked to a different email. Please contact support.'
+        );
       }
-      user.isEmailVerified = true;
-      user.status = 'active';
-      user.accountScope = ACCOUNT_SCOPES.ECOMM;
-      user.lastLoginMethod = 'google';
-      if (!user.registrationMethod) user.registrationMethod = 'google';
+      return null;
+    };
+
+    const resolved = await resolveEcommCustomerForGoogleLogin({
+      googleId,
+      email: normalizedEmail
+    });
+
+    if (resolved.code === 'GOOGLE_ID_EMAIL_MISMATCH') {
+      return respondAuthError(
+        res,
+        409,
+        'GOOGLE_ID_EMAIL_MISMATCH',
+        resolved.message ||
+          'This Google account is already linked to a different email. Please contact support.'
+      );
+    }
+
+    let user = resolved.user;
+
+    const applyGoogleSessionFields = async (target) => {
+      if (isWholesalerAccount(target) || isPrivilegedAccount(target)) {
+        const err = new Error('PORTAL_ACCESS_DENIED');
+        err.code = 'PORTAL_ACCESS_DENIED';
+        throw err;
+      }
+      await claimGoogleIdForEcommCustomer(target, googleId, normalizedEmail);
+      setOrUnsetUniqueString(target, 'email', normalizedEmail);
+      if (displayName && !String(target.name || '').trim()) {
+        target.name = displayName;
+      }
+      target.isEmailVerified = true;
+      target.status = 'active';
+      target.accountScope = ACCOUNT_SCOPES.ECOMM;
+      target.userType = target.userType || 'user';
+      target.role = target.role || 'user';
+      target.lastLoginMethod = 'google';
+      if (!target.registrationMethod) target.registrationMethod = 'google';
+      return target;
+    };
+
+    const bindExistingGoogleUser = async (existing) => {
+      try {
+        return await applyGoogleSessionFields(existing);
+      } catch (linkErr) {
+        const handled = respondGoogleIdentityError(linkErr);
+        if (handled) return null;
+        throw linkErr;
+      }
+    };
+
+    if (user) {
+      user = await bindExistingGoogleUser(user);
+      if (!user) return;
     } else {
-      user = new User({
+      // TOCTOU: another request may have created/linked the identity since resolve.
+      const raced = await findEcommCustomerByGoogleOrEmail({
         googleId,
-        email: normalizedEmail,
-        name: displayName || undefined,
-        isEmailVerified: true,
-        status: 'active',
-        userType: 'user',
-        role: 'user',
-        accountScope: ACCOUNT_SCOPES.ECOMM,
-        registrationMethod: 'google',
-        lastLoginMethod: 'google'
+        email: normalizedEmail
       });
+      if (raced) {
+        user = await bindExistingGoogleUser(raced);
+        if (!user) return;
+      } else {
+        user = new User({
+          googleId,
+          email: normalizedEmail,
+          name: displayName || undefined,
+          isEmailVerified: true,
+          status: 'active',
+          userType: 'user',
+          role: 'user',
+          accountScope: ACCOUNT_SCOPES.ECOMM,
+          registrationMethod: 'google',
+          lastLoginMethod: 'google'
+        });
+      }
     }
 
     const deviceInfo = req.headers['user-agent'] || req.body.deviceInfo || 'Google-Login';
@@ -2438,22 +2503,52 @@ const googleAuth = async (req, res) => {
     try {
       await user.save();
     } catch (saveErr) {
-      // Race: another request created/linked the same email — login that account.
-      if (saveErr?.code === 11000) {
+      if (saveErr?.code !== 11000) throw saveErr;
+
+      // Race / legacy duplicate index: always prefer logging into the existing identity.
+      let recovered = null;
+      try {
         const existing = await findEcommCustomerByGoogleOrEmail({
           googleId,
           email: normalizedEmail
         });
         if (existing && !isWholesalerAccount(existing) && !isPrivilegedAccount(existing)) {
-          user = existing;
-          if (!user.googleId) user.googleId = googleId;
-          setOrUnsetUniqueString(user, 'email', normalizedEmail);
-          user.isEmailVerified = true;
-          user.status = 'active';
-          user.accountScope = ACCOUNT_SCOPES.ECOMM;
-          user.lastLoginMethod = 'google';
-          await user.save();
-        } else if (
+          recovered = await applyGoogleSessionFields(existing);
+          await recovered.save();
+          user = recovered;
+        }
+      } catch (recoverErr) {
+        const handled = respondGoogleIdentityError(recoverErr);
+        if (handled) return;
+
+        if (recoverErr?.code === 11000) {
+          // Identity already matches an existing doc — login without further unique mutations.
+          const again = await findEcommCustomerByGoogleOrEmail({
+            googleId,
+            email: normalizedEmail
+          });
+          if (again && !isWholesalerAccount(again) && !isPrivilegedAccount(again)) {
+            user = again;
+            user.lastLoginMethod = 'google';
+            user.status = 'active';
+            user.accountScope = ACCOUNT_SCOPES.ECOMM;
+            try {
+              await user.save();
+            } catch (finalSaveErr) {
+              if (finalSaveErr?.code !== 11000) throw finalSaveErr;
+              // Doc is already the indexed owner; continue with tokens on this _id.
+            }
+            recovered = user;
+          } else {
+            throw recoverErr;
+          }
+        } else {
+          throw recoverErr;
+        }
+      }
+
+      if (!recovered) {
+        if (
           handleDuplicateContactError(
             res,
             saveErr,
@@ -2461,10 +2556,7 @@ const googleAuth = async (req, res) => {
           )
         ) {
           return;
-        } else {
-          throw saveErr;
         }
-      } else {
         throw saveErr;
       }
     }
