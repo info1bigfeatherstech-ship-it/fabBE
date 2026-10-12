@@ -1,12 +1,32 @@
 /**
  * Cart / wishlist auto-push calendar (Asia/Kolkata).
- * Not daily — only these weekdays at the configured hour:
- *   Cart:     Tuesday, Friday, Saturday
- *   Wishlist: Thursday, Sunday
+ * Single source of truth for schedulers + admin Leads UI labels.
+ *
+ * Defaults (override via env CSV of weekday numbers, Sun=0 … Sat=6):
+ *   CART_REMINDER_PUSH_WEEKDAYS_IST=2,5,6        → Tue, Fri, Sat
+ *   WISHLIST_REMINDER_PUSH_WEEKDAYS_IST=0,4      → Sun, Thu
  */
 
-const CART_WEEKDAYS_IST = new Set([2, 5, 6]); // Tue, Fri, Sat (Sun=0)
-const WISHLIST_WEEKDAYS_IST = new Set([0, 4]); // Sun, Thu
+const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function parseWeekdaySet(envValue, fallbackList) {
+  const raw = String(envValue || '').trim();
+  if (!raw) return new Set(fallbackList);
+  const parts = raw
+    .split(/[,|\s]+/)
+    .map((p) => Number(String(p).trim()))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 6);
+  return parts.length ? new Set(parts) : new Set(fallbackList);
+}
+
+const CART_WEEKDAYS_IST = parseWeekdaySet(
+  process.env.CART_REMINDER_PUSH_WEEKDAYS_IST,
+  [2, 5, 6]
+);
+const WISHLIST_WEEKDAYS_IST = parseWeekdaySet(
+  process.env.WISHLIST_REMINDER_PUSH_WEEKDAYS_IST,
+  [0, 4]
+);
 
 function getIstCalendarParts(now = new Date()) {
   const formatter = new Intl.DateTimeFormat('en-GB', {
@@ -45,12 +65,36 @@ function isWishlistReminderDayIst(now = new Date()) {
   return WISHLIST_WEEKDAYS_IST.has(weekday);
 }
 
+/** Sorted short labels matching the Sets used by schedulers (e.g. "Tue · Fri · Sat"). */
+function formatWeekdaySetLabel(daySet) {
+  const ordered = [...daySet].filter((n) => n >= 0 && n <= 6).sort((a, b) => a - b);
+  if (!ordered.length) return '—';
+  return ordered.map((d) => WEEKDAY_SHORT[d]).join(' · ');
+}
+
 function cartReminderDaysLabel() {
-  return 'Tue · Fri · Sat';
+  return formatWeekdaySetLabel(CART_WEEKDAYS_IST);
 }
 
 function wishlistReminderDaysLabel() {
-  return 'Thu · Sun';
+  return formatWeekdaySetLabel(WISHLIST_WEEKDAYS_IST);
+}
+
+function formatIstHourLabel(hour) {
+  const h = Math.floor(Number(hour));
+  if (!Number.isFinite(h) || h < 0 || h > 23) return '—';
+  if (h === 0) return '12:00 AM IST';
+  if (h === 12) return '12:00 PM IST';
+  if (h < 12) return `${h}:00 AM IST`;
+  return `${h - 12}:00 PM IST`;
+}
+
+/** Human line for admin UI: "Tue · Fri · Sat · 5:00 PM IST" */
+function formatScheduleSummary(daysLabel, hourIst) {
+  const days = String(daysLabel || '').trim() || '—';
+  const time = formatIstHourLabel(hourIst);
+  if (days === '—' && time === '—') return '—';
+  return `${days} · ${time}`;
 }
 
 module.exports = {
@@ -61,4 +105,6 @@ module.exports = {
   isWishlistReminderDayIst,
   cartReminderDaysLabel,
   wishlistReminderDaysLabel,
+  formatIstHourLabel,
+  formatScheduleSummary,
 };

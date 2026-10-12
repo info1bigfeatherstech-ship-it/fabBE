@@ -4,6 +4,7 @@ const logger = require('../utils/logger');
 const {
   cartReminderDaysLabel,
   wishlistReminderDaysLabel,
+  formatScheduleSummary,
 } = require('../utils/reminderPushSchedule');
 
 const VALID_STOREFRONTS = new Set(['ecomm', 'wholesale']);
@@ -47,14 +48,23 @@ async function getOrCreateSettings(storefront) {
 }
 
 function toAdminPayload(doc) {
+  const autoPushHourIst = getAutoPushHourIst();
+  const autoWishlistPushHourIst = getWishlistAutoPushHourIst();
+  const cartDays = cartReminderDaysLabel();
+  const wishlistDays = wishlistReminderDaysLabel();
   return {
     storefront: doc?.storefront || 'ecomm',
     autoPushEnabled: Boolean(doc?.autoPushEnabled),
     autoWishlistPushEnabled: Boolean(doc?.autoWishlistPushEnabled),
-    autoPushHourIst: getAutoPushHourIst(),
-    autoWishlistPushHourIst: getWishlistAutoPushHourIst(),
-    cartReminderDaysLabel: cartReminderDaysLabel(),
-    wishlistReminderDaysLabel: wishlistReminderDaysLabel(),
+    autoPushHourIst,
+    autoWishlistPushHourIst,
+    /** Exact weekday set used by cartReminderPushScheduler (IST). */
+    cartReminderDaysLabel: cartDays,
+    /** Exact weekday set used by wishlistReminderPushScheduler (IST). */
+    wishlistReminderDaysLabel: wishlistDays,
+    /** Ready-to-show lines for Leads toggles — days + hour from the same source as cron. */
+    cartScheduleSummary: formatScheduleSummary(cartDays, autoPushHourIst),
+    wishlistScheduleSummary: formatScheduleSummary(wishlistDays, autoWishlistPushHourIst),
     pushConfigured: isPushConfigured(),
     updatedAt: doc?.updatedAt || null,
   };

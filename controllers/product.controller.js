@@ -1544,7 +1544,10 @@ const createProduct = async (req, res) => {
       const inventoryObj = {
         quantity: Number(v.inventory?.quantity) || 0,
         trackInventory: v.inventory?.trackInventory !== false,
-        lowStockThreshold: v.inventory?.lowStockThreshold || 5
+        lowStockThreshold: (() => {
+          const n = Number(v.inventory?.lowStockThreshold);
+          return Number.isFinite(n) && n >= 0 ? n : 0;
+        })()
       };
 
       const variantImages = [];
@@ -2789,7 +2792,7 @@ async function buildVariantWithValidation(row, productName, options = {}) {
     inventory: {
       quantity: Number(row.quantity) || 0,
       trackInventory: true,
-      lowStockThreshold: 5,
+      lowStockThreshold: 0,
     },
     images: imagesArr,
     isActive: normalizeLifecycleFromRowStatus(row?.status, 'active') === 'active',
@@ -3560,7 +3563,7 @@ async function buildCompleteVariant(row, productName, images, options = {}) {
     inventory: {
       quantity: Number(row.quantity) || 0,
       trackInventory: true,
-      lowStockThreshold: 5,
+      lowStockThreshold: 0,
     },
     images: images,
     isActive: normalizeLifecycleFromRowStatus(row?.status, 'active') === 'active',
@@ -6833,7 +6836,10 @@ const newVariant = {
 
   inventory: {
     quantity: Number(variant.inventory?.quantity || 0),
-    lowStockThreshold: Number(variant.inventory?.lowStockThreshold || 5),
+    lowStockThreshold: (() => {
+      const n = Number(variant.inventory?.lowStockThreshold);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    })(),
     trackInventory: variant.inventory?.trackInventory !== false
   },
 
@@ -7217,7 +7223,7 @@ const getVariantByproductCode = async (req, res) => {
 
 //     if (req.body.lowStockThreshold !== undefined) {
 //       variant.inventory.lowStockThreshold =
-//         parseNumber(req.body.lowStockThreshold) || 5;
+//         parseNumber(req.body.lowStockThreshold) ?? 0;
 //     }
 
 //     if (req.body.trackInventory !== undefined) {

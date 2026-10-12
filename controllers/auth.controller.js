@@ -2109,13 +2109,14 @@ const me = async (req, res) => {
         id: user._id,
         email: user.email,
         name: user.name,
-        phone: user.phone,
+        phone: user.phone || '',
         userType: user.userType,
-         role: user.role || user.userType,  // ✅ ADD THIS
+        role: user.role || user.userType,
         status: user.status,
-        isPhoneVerified: user.isPhoneVerified,
-         isEmailVerified: user.isEmailVerified,  // ✅ Add this too
-        isProfileComplete: user.isProfileComplete,  // ✅ Add this too
+        isPhoneVerified: Boolean(user.isPhoneVerified),
+        isEmailVerified: Boolean(user.isEmailVerified),
+        isProfileComplete: Boolean(user.isProfileComplete),
+        needsContactPhone: !String(user.phone || '').trim(),
         loyalty: publicLoyaltyView(user)
       }
     });
@@ -2127,20 +2128,19 @@ const me = async (req, res) => {
 
 // ========== 10 UPDATE PROFILE ==========
 
+const normalizeProfilePhone = (raw) => {
+  const digits = String(raw || '').replace(/\D/g, '');
+  const phone = digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
+  if (!/^[0-9]{10}$/.test(phone)) {
+    return { ok: false, phone: '' };
+  }
+  return { ok: true, phone };
+};
+
 const updateProfile = async (req, res) => {
   try {
     const hasEmailChange = Object.prototype.hasOwnProperty.call(req.body || {}, 'email');
     const hasPhoneChange = Object.prototype.hasOwnProperty.call(req.body || {}, 'phone');
-
-    // Changing an existing phone always needs OTP. Changing an existing email needs OTP too.
-    // First-time email add (phone-only / legacy accounts with no email) is allowed here.
-    if (hasPhoneChange) {
-      return res.status(409).json({
-        success: false,
-        code: 'PROFILE_CONTACT_CHANGE_REQUIRES_VERIFICATION',
-        message: 'Email/phone update requires verification flow. Use dedicated contact-change endpoint.'
-      });
-    }
 
     const user = await User.findById(req.userId);
     if (!user) {
@@ -2149,6 +2149,58 @@ const updateProfile = async (req, res) => {
 
     if (typeof req.body?.name === 'string' && req.body.name.trim()) {
       user.name = req.body.name.trim();
+    }
+
+    /**
+     * First-time phone add (e.g. Google login users) — allowed without OTP.
+     * Changing an existing phone still requires the dedicated verification flow.
+     */
+    if (hasPhoneChange) {
+      const existingPhone = String(user.phone || '').trim();
+      if (existingPhone) {
+        return res.status(409).json({
+          success: false,
+          code: 'PROFILE_CONTACT_CHANGE_REQUIRES_VERIFICATION',
+          message: 'Phone update requires verification flow. Use dedicated contact-change endpoint.'
+        });
+      }
+
+      const parsedPhone = normalizeProfilePhone(req.body.phone);
+      if (!parsedPhone.ok) {
+        return respondAuthError(
+          res,
+          400,
+          'INVALID_PHONE',
+          'Enter a valid 10-digit phone number'
+        );
+      }
+
+      const customerPhoneLookup = buildCustomerContactLookup(
+        { phone: parsedPhone.phone },
+        ACCOUNT_SCOPES.ECOMM
+      );
+      const staffPhoneLookup = buildStaffContactLookup({ phone: parsedPhone.phone });
+      const [phoneTakenCustomer, phoneTakenStaff] = await Promise.all([
+        customerPhoneLookup
+          ? User.findOne({ ...customerPhoneLookup, _id: { $ne: user._id } }).select('_id')
+          : null,
+        staffPhoneLookup ? User.findOne(staffPhoneLookup).select('_id') : null
+      ]);
+
+      if (phoneTakenCustomer || phoneTakenStaff) {
+        return res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_PROFILE_FIELD',
+          message: 'This phone number is already in use'
+        });
+      }
+
+      setOrUnsetUniqueString(user, 'phone', parsedPhone.phone);
+      // Collected for leads / contact — not SMS-verified until OTP service is wired.
+      user.isPhoneVerified = false;
+      if (String(user.email || '').trim() && String(user.phone || '').trim()) {
+        user.isProfileComplete = true;
+      }
     }
 
     if (hasEmailChange) {
@@ -2194,6 +2246,9 @@ const updateProfile = async (req, res) => {
       if (user.isEmailVerified !== true) {
         user.isEmailVerified = false;
       }
+      if (String(user.email || '').trim() && String(user.phone || '').trim()) {
+        user.isProfileComplete = true;
+      }
     }
 
     const dirtyPaths = user.modifiedPaths();
@@ -2210,7 +2265,10 @@ const updateProfile = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        phone: user.phone
+        phone: user.phone,
+        isPhoneVerified: user.isPhoneVerified,
+        isEmailVerified: user.isEmailVerified,
+        isProfileComplete: user.isProfileComplete
       }
     });
   } catch (error) {
@@ -2219,7 +2277,11 @@ const updateProfile = async (req, res) => {
       return res.status(409).json({
         success: false,
         code: 'DUPLICATE_PROFILE_FIELD',
-        message: `${key} is already in use`
+        message: key === 'phone'
+          ? 'This phone number is already in use'
+          : key === 'email'
+            ? 'This email is already in use'
+            : `${key} is already in use`
       });
     }
     console.error('Update profile error:', error);
@@ -2427,12 +2489,15 @@ const googleAuth = async (req, res) => {
         id: user._id,
         email: user.email,
         name: user.name,
-        phone: user.phone,
+        phone: user.phone || '',
         userType: user.userType,
         role: user.role,
         status: user.status,
         isEmailVerified: user.isEmailVerified,
-        isPhoneVerified: user.isPhoneVerified
+        isPhoneVerified: Boolean(user.isPhoneVerified),
+        isProfileComplete: Boolean(user.isProfileComplete),
+        /** FE gate: collect contact number after Google login when missing. */
+        needsContactPhone: !String(user.phone || '').trim()
       }
     });
   } catch (error) {

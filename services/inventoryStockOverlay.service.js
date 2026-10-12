@@ -38,7 +38,7 @@ function ensureInventoryObject(variant) {
   if (!variant.inventory || typeof variant.inventory !== 'object') {
     variant.inventory = {
       quantity: 0,
-      lowStockThreshold: 5,
+      lowStockThreshold: 0,
       trackInventory: true
     };
   }

@@ -90,7 +90,7 @@ const variantSchema = new mongoose.Schema(
 
     inventory: {
       quantity: { type: Number, default: 0 },
-      lowStockThreshold: { type: Number, default: 5 },
+      lowStockThreshold: { type: Number, default: 0 },
       trackInventory: { type: Boolean, default: true }
     },
 
