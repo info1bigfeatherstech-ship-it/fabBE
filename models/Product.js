@@ -51,7 +51,9 @@ const variantSchema = new mongoose.Schema(
     attributes: [
       {
         key: { type: String, trim: true },
-        value: { type: String, trim: true }
+        value: { type: String, trim: true },
+        /** Optional #RRGGBB for storefront color swatches (color/shade attrs). */
+        hex: { type: String, trim: true, required: false }
       }
     ],
     images: {
@@ -233,7 +235,13 @@ const productSchema = new mongoose.Schema(
       }
     },
 
-    attributes: [{ key: String, value: String }],
+    attributes: [
+      {
+        key: String,
+        value: String,
+        hex: { type: String, trim: true, required: false }
+      }
+    ],
     isFeatured: { type: Boolean, default: false },
 
     status: {

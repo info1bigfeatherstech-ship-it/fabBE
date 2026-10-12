@@ -20,6 +20,10 @@ const { generateSEOData } = require("../utils/seoUtils");
 const { buildNameAndProductCodeSearch, applyConfiguredProductCodePrefix } = require('../utils/productCode');
 const productCodePrefixSettingsService = require('../services/productCodePrefixSettings.service');
 const { enqueueNewProductForDigest } = require('../services/newProductsDigest.service');
+const {
+  sanitizeVariantAttributes,
+  parseAttributePipeList
+} = require('../utils/variantAttributes');
 
 function queueNewProductDigestSafe(product) {
   Promise.resolve()
@@ -1584,9 +1588,7 @@ const createProduct = async (req, res) => {
         sku: skuVal,
         productCode,
         wholesale,
-        attributes: Array.isArray(v.attributes)
-          ? v.attributes.map(a => ({ key: a.key, value: a.value }))
-          : [],
+        attributes: sanitizeVariantAttributes(v.attributes),
         price: priceObj,
         minimumOrderQuantity: moq,
         inventory: inventoryObj,
@@ -1735,7 +1737,7 @@ const createProduct = async (req, res) => {
       soldInfo: parsedSoldInfo || { enabled: false, count: 0 },
       fomo: parsedFomo || { enabled: false, type: "viewing_now", viewingNow: 0 },
       shipping: normalizedShipping,
-      attributes: parsedAttributes || [],
+      attributes: sanitizeVariantAttributes(parsedAttributes),
       variants,
       price: {
         base: Number(req.body.price?.base) || 0,
@@ -2762,13 +2764,10 @@ async function buildVariantWithValidation(row, productName, options = {}) {
     throw new Error(`Sale price (${cleanSalePrice}) must be less than base price (${cleanBasePrice}) (Row ${row.rowNumber})`);
   }
   
-  // Attributes
-  const variantAttributes = row.variantAttributes
-    ? row.variantAttributes.split("|").map((pair) => {
-        const [key, value] = pair.split(":");
-        return { key: key?.trim(), value: value?.trim() };
-      }).filter(attr => attr.key && attr.value)
-    : [];
+  // Attributes (optional Color:Name:#HEX)
+  const variantAttributes = sanitizeVariantAttributes(
+    parseAttributePipeList(row.variantAttributes)
+  );
   
   // Images: parallel download/optimize/upload (ZIP-style concurrency; stable order)
   const imagesArr = await buildImagesFromCsvUrls(row.images, productName, row.rowNumber);
@@ -3535,16 +3534,9 @@ async function buildCompleteVariant(row, productName, images, options = {}) {
   const wholesaleSale = wholesaleCfg.wholesaleSale;
   const minimumOrderQuantity = wholesaleCfg.minimumOrderQuantity;
   
-  // Parse attributes
-  const parseAttributes = (attrString) => {
-    if (!attrString) return [];
-    return attrString.split("|").map(item => {
-      const [key, value] = item.split(":");
-      return { key: key?.trim(), value: value?.trim() };
-    }).filter(attr => attr.key && attr.value);
-  };
-  
-  const variantAttributes = parseAttributes(row.variantAttributes);
+  const variantAttributes = sanitizeVariantAttributes(
+    parseAttributePipeList(row.variantAttributes)
+  );
   const sku = resolveVariantSku({ productCode, explicitSku: row.sku });
   const wholesaleEligible = wholesaleCfg.wholesaleEligible;
 
@@ -3871,14 +3863,9 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
       const finalHsnCode = row.hsnCode?.trim().toUpperCase() || null;
       const finalgstRate = row.gstRate ? parseFloat(row.gstRate) : null;
       const finalIsFragile = parseBoolean(row.isFragile);
-      const parseAttributes = (attrString) => {
-        if (!attrString) return [];
-        return attrString.split("|").map(item => {
-          const [key, value] = item.split(":");
-          return { key: key?.trim(), value: value?.trim() };
-        }).filter(attr => attr.key && attr.value);
-      };
-      const productAttributes = parseAttributes(row.productAttributes);
+      const productAttributes = sanitizeVariantAttributes(
+        parseAttributePipeList(row.productAttributes)
+      );
 
       if (product) {
         // If product already has variants, incoming productCode base must match existing base.
@@ -5115,9 +5102,7 @@ const updateProduct = async (req, res) => {
     // Product-level attributes (skip when this request targets a variant and sends variant attrs in `attributes`)
     if (updates.attributes !== undefined && !targetProductCode) {
       const parsed = parseIfString(updates.attributes, []);
-      doc.attributes = Array.isArray(parsed)
-        ? parsed.filter((a) => a && a.key && a.value).map((a) => ({ key: a.key, value: a.value }))
-        : [];
+      doc.attributes = sanitizeVariantAttributes(parsed);
     }
 
     // -------- Variant-scoped fields (when productCode sent) --------
@@ -5240,16 +5225,12 @@ const updateProduct = async (req, res) => {
 
       if (updates.attributes !== undefined) {
         const parsed = parseIfString(updates.attributes, []);
-        variant.attributes = Array.isArray(parsed)
-          ? parsed.filter((a) => a && a.key && a.value).map((a) => ({ key: a.key, value: a.value }))
-          : [];
+        variant.attributes = sanitizeVariantAttributes(parsed);
       }
 
       if (updates.variantAttributes !== undefined) {
         const parsed = parseIfString(updates.variantAttributes, []);
-        variant.attributes = Array.isArray(parsed)
-          ? parsed.filter((a) => a && a.key && a.value).map((a) => ({ key: a.key, value: a.value }))
-          : [];
+        variant.attributes = sanitizeVariantAttributes(parsed);
       }
 
       if (updates.inventory !== undefined) {
@@ -6816,14 +6797,7 @@ const newVariant = {
 
   wholesale: variant.wholesale === "true" || variant.wholesale === true,
 
-  attributes: Array.isArray(variant.attributes)
-    ? variant.attributes
-        .filter(a => a.key && a.value)
-        .map(a => ({
-          key: a.key,
-          value: a.value
-        }))
-    : [],
+  attributes: sanitizeVariantAttributes(variant.attributes),
 
   price: {
     base: basePrice,
@@ -7382,11 +7356,16 @@ const exportProductsCSV = async (req, res) => {
       for (const variant of variants) {
         const categoryName = product.category ? (product.category.name || '') : '';
 
-        // Variant attributes: e.g. Color:Red|Size:M
+        // Variant attributes: e.g. Color:Red|Size:M or Color:Ochre:#CC7722
         let variantAttributes = '';
         if (variant && Array.isArray(variant.attributes) && variant.attributes.length > 0) {
           variantAttributes = variant.attributes
-            .map(a => `${a.key || ''}:${a.value || ''}`)
+            .map((a) => {
+              const key = a.key || '';
+              const value = a.value || '';
+              const hex = String(a.hex || '').trim();
+              return hex ? `${key}:${value}:${hex}` : `${key}:${value}`;
+            })
             .join('|');
         }
 
@@ -7394,7 +7373,12 @@ const exportProductsCSV = async (req, res) => {
         let productAttributes = '';
         if (Array.isArray(product.attributes) && product.attributes.length > 0) {
           productAttributes = product.attributes
-            .map(a => `${a.key || ''}:${a.value || ''}`)
+            .map((a) => {
+              const key = a.key || '';
+              const value = a.value || '';
+              const hex = String(a.hex || '').trim();
+              return hex ? `${key}:${value}:${hex}` : `${key}:${value}`;
+            })
             .join('|');
         }
 
