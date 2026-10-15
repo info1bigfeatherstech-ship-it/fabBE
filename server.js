@@ -440,7 +440,15 @@ app.use((req, res, next) => {
     },
     credentials: !isOwnerReviewPath, // no cookies needed for token-based owner review
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', ...CORS_STOREFRONT_ALLOWED_HEADERS]
+    allowedHeaders: ['Content-Type', 'Authorization', ...CORS_STOREFRONT_ALLOWED_HEADERS],
+    // Bulk label PDF download summary (safe additive; unused headers are ignored by clients)
+    exposedHeaders: [
+      'Content-Disposition',
+      'X-Bulk-Labels-Total',
+      'X-Bulk-Labels-Succeeded',
+      'X-Bulk-Labels-Failed',
+      'X-Bulk-Labels-Pages'
+    ]
   };
 
   return cors(corsOptions)(req, res, next);

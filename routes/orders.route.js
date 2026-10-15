@@ -189,6 +189,13 @@ router.post(
   adminFulfillment.adminBulkShippingLabelsZip
 );
 
+/** Alias — same multi-page PDF handler (preferred name). */
+router.post(
+  '/admin/items/bulk-documents/shipping-labels-pdf',
+  ...adminOrderStaff,
+  adminFulfillment.adminBulkShippingLabelsZip
+);
+
 router.post(
   '/admin/items/bulk-documents/manifests-zip',
   ...adminOrderStaff,

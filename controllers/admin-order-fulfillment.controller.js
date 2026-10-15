@@ -61,6 +61,7 @@ const {
 const shipmozoLabelSettingsService = require('../services/shipmozoLabelSettings.service');
 const { buildLabelViewModel } = require('../services/shipmozoLabelViewModel.service');
 const { renderLabelPdf } = require('../services/shipmozoLabelPdf.service');
+const { mergeShippingLabelPartsToPdf } = require('../utils/mergeShippingLabelsPdf');
 
 function manifestAlreadyGeneratedMessage(message) {
   return /manifest already generated|already been generated/i.test(String(message || ''));
@@ -2537,7 +2538,11 @@ exports.adminBulkManifestsZip = async (req, res) => {
   }
 };
 
-/** POST /orders/admin/items/bulk-documents/shipping-labels-zip — ZIP of label PDFs + manifest.json */
+/**
+ * POST /orders/admin/items/bulk-documents/shipping-labels-zip
+ * (legacy path name kept) — single multi-page PDF (one label per page / PDF pages copied).
+ * Does not change tax-invoice or manifest ZIP endpoints.
+ */
 exports.adminBulkShippingLabelsZip = async (req, res) => {
   try {
     if (!assertStaffJson(req, res)) return;
@@ -2579,8 +2584,7 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
           allowOrderStatusUpdate: false
         });
         await evaluateAndPersistShipmentOps(order, { source: 'admin_bulk_label_downloaded' });
-        const entryName = safeZipEntryBase(oid, `-shipping-label.${ext}`);
-        return { orderId: oid, success: true, entryName, pdfBuf: fileBuf };
+        return { orderId: oid, success: true, extension: ext, pdfBuf: fileBuf };
       } catch (err) {
         const code = err.code || 'LABEL_FAILED';
         logger.error('adminBulkShippingLabelsZip row', {
@@ -2596,34 +2600,62 @@ exports.adminBulkShippingLabelsZip = async (req, res) => {
     const succeeded = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
     if (succeeded.length === 0) {
-      return jsonError(res, 400, 'BULK_LABELS_NONE', 'No shipping labels could be added to the ZIP.', {
+      return jsonError(res, 400, 'BULK_LABELS_NONE', 'No shipping labels could be added to the PDF.', {
         failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
       });
     }
 
-    const zip = new AdmZip();
-    const manifest = {
-      type: 'shipping_labels',
-      generatedAt: new Date().toISOString(),
-      summary: {
-        total: results.length,
-        succeeded: succeeded.length,
-        failed: failed.length
-      },
-      succeeded: succeeded.map((r) => ({ orderId: r.orderId, file: r.entryName })),
-      failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message }))
-    };
-    zip.addFile('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-    for (const row of succeeded) {
-      zip.addFile(row.entryName, row.pdfBuf);
+    let merged;
+    try {
+      merged = await mergeShippingLabelPartsToPdf(
+        succeeded.map((r) => ({
+          orderId: r.orderId,
+          buffer: r.pdfBuf,
+          extension: r.extension
+        }))
+      );
+    } catch (mergeErr) {
+      logger.error('adminBulkShippingLabelsZip merge', {
+        message: mergeErr?.message,
+        skipped: mergeErr?.skipped
+      });
+      return jsonError(
+        res,
+        400,
+        mergeErr?.code || 'BULK_LABELS_PDF_EMPTY',
+        mergeErr?.message || 'Could not build shipping labels PDF.',
+        {
+          failed: failed.map((r) => ({ orderId: r.orderId, code: r.code, message: r.message })),
+          mergeSkipped: mergeErr?.skipped || []
+        }
+      );
     }
-    const buf = zip.toBuffer();
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="shipping-labels-bulk-${Date.now()}.zip"`);
-    return res.status(200).send(buf);
+
+    const mergeSkippedAsFailed = (merged.skipped || []).map((s) => ({
+      orderId: s.orderId,
+      code: 'LABEL_MERGE_SKIPPED',
+      message: s.reason
+    }));
+    const allFailed = [...failed, ...mergeSkippedAsFailed];
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="shipping-labels-bulk-${Date.now()}.pdf"`
+    );
+    res.setHeader('X-Bulk-Labels-Total', String(results.length));
+    res.setHeader('X-Bulk-Labels-Succeeded', String(merged.appended.length));
+    res.setHeader('X-Bulk-Labels-Failed', String(allFailed.length));
+    res.setHeader('X-Bulk-Labels-Pages', String(merged.pageCount));
+    // Expose summary headers to browser JS (admin SPA).
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'Content-Disposition, X-Bulk-Labels-Total, X-Bulk-Labels-Succeeded, X-Bulk-Labels-Failed, X-Bulk-Labels-Pages'
+    );
+    return res.status(200).send(merged.pdfBuffer);
   } catch (error) {
     logger.error('adminBulkShippingLabelsZip', { message: error.message, stack: error.stack });
-    return jsonError(res, 500, 'BULK_LABELS_ZIP_FAILED', error.message || 'Server error');
+    return jsonError(res, 500, 'BULK_LABELS_PDF_FAILED', error.message || 'Server error');
   }
 };
 
