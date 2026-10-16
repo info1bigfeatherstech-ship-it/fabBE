@@ -70,6 +70,8 @@ function defaultSettings() {
       showPrice: true,
       showTotal: true,
       showHsn: false,
+      /** Per-item GST column on custom 4×6 labels (Shipmozo + Shiprocket custom). */
+      showGst: false,
       showTaxableAmount: false,
       showDiscount: false,
       showPlatformFee: false,
@@ -78,7 +80,7 @@ function defaultSettings() {
       showTotalQuantity: true,
       showAllItems: false,
       trimSkuUpto: 10,
-      trimProductNameUpto: 10,
+      trimProductNameUpto: 18,
       maxLineItems: 10
     },
     misc: {
@@ -192,6 +194,7 @@ function sanitizeSettings(incoming) {
         showPrice: 'bool',
         showTotal: 'bool',
         showHsn: 'bool',
+        showGst: 'bool',
         showTaxableAmount: 'bool',
         showDiscount: 'bool',
         showPlatformFee: 'bool',

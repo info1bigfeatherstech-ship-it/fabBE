@@ -3,7 +3,8 @@ const mongoose = require('mongoose');
 /**
  * Per-storefront Shipmozo shipping-label layout.
  * Ecomm admin writes storefront=ecomm; wholesale admin writes storefront=wholesale.
- * Applied only when generating custom labels for Shipmozo orders (never Shiprocket).
+ * Applied when generating custom 4×6 shipping labels (Shipmozo default + Shiprocket when
+ * admin chooses "Custom" on download). Provider (Shiprocket/Shipmozo) labels are separate.
  */
 const shipmozoLabelSettingsSchema = new mongoose.Schema(
   {

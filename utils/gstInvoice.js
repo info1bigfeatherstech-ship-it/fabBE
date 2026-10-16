@@ -40,20 +40,77 @@ function resolveLineSku(item) {
   return null;
 }
 
-function lineFromItem(item, productName) {
-  const qty = Number(item.quantity) || 0;
-  /** Pre-tax line amount — matches checkout `priceSnapshot.total` and order.subtotal. */
-  const lineSubtotal = roundMoney2(Number(item.priceSnapshot?.total) || 0);
-  const rate = item.gstRate != null ? Number(item.gstRate) : null;
-  const taxable = lineSubtotal;
-  let taxAmt = 0;
-  if (rate != null && rate > 0 && rate < 100) {
-    taxAmt = roundMoney2((lineSubtotal * rate) / 100);
+function resolveLineGstRate(item) {
+  const fromItem = Number(item?.gstRate);
+  if (Number.isFinite(fromItem) && fromItem >= 0) return fromItem;
+  const prod = item?.productId;
+  if (prod && typeof prod === 'object') {
+    const fromProd = Number(prod.gstRate);
+    if (Number.isFinite(fromProd) && fromProd >= 0) return fromProd;
   }
-  const lineTotal = roundMoney2(taxable + taxAmt);
-  const sku = resolveLineSku(item);
-  const attrs = Array.isArray(item.variantAttributesSnapshot)
-    ? item.variantAttributesSnapshot
+  return null;
+}
+
+function resolveLineHsn(item) {
+  const fromItem = String(item?.hsnCode || '').trim();
+  if (fromItem) return fromItem;
+  const prod = item?.productId;
+  if (prod && typeof prod === 'object') {
+    const fromProd = String(prod.hsnCode || '').trim();
+    if (fromProd) return fromProd;
+  }
+  return '—';
+}
+
+function plainOrderItem(item) {
+  if (item && typeof item.toObject === 'function') {
+    try {
+      return item.toObject({ depopulate: false });
+    } catch (_) {
+      /* fall through */
+    }
+  }
+  return item && typeof item === 'object' ? item : {};
+}
+
+/**
+ * Qty | unit sale price | line sale | GST on line sale | total (sale + GST).
+ */
+function lineFromItem(item, productName) {
+  const row = plainOrderItem(item);
+  const snap = row.priceSnapshot && typeof row.priceSnapshot === 'object' ? row.priceSnapshot : {};
+  let qty = Number(row.quantity);
+  if (!Number.isFinite(qty) || qty < 0) qty = 0;
+
+  const saleRaw = Number(snap.sale);
+  const baseRaw = Number(snap.base);
+  const unitSale = roundMoney2(
+    Number.isFinite(saleRaw) && saleRaw >= 0
+      ? saleRaw
+      : Number.isFinite(baseRaw) && baseRaw >= 0
+        ? baseRaw
+        : 0
+  );
+
+  let saleAmount = roundMoney2(Number(snap.total));
+  if (!Number.isFinite(saleAmount) || saleAmount < 0) saleAmount = 0;
+  // Recover line sale when total missing but unit × qty is available.
+  if (saleAmount < 0.001 && unitSale > 0 && qty > 0) {
+    saleAmount = roundMoney2(unitSale * qty);
+  }
+  // Unit price missing but line total present (qty >= 1).
+  const displayUnit =
+    unitSale > 0.001 ? unitSale : qty > 0 ? roundMoney2(saleAmount / qty) : saleAmount;
+
+  const rate = resolveLineGstRate(row);
+  let taxAmt = 0;
+  if (rate != null && rate > 0 && rate < 100 && saleAmount > 0) {
+    taxAmt = roundMoney2((saleAmount * rate) / 100);
+  }
+  const lineTotal = roundMoney2(saleAmount + taxAmt);
+  const sku = resolveLineSku(row);
+  const attrs = Array.isArray(row.variantAttributesSnapshot)
+    ? row.variantAttributesSnapshot
         .map((a) => (a?.key && a?.value ? `${a.key}: ${a.value}` : null))
         .filter(Boolean)
         .join(', ')
@@ -62,10 +119,13 @@ function lineFromItem(item, productName) {
     description: productName || 'Goods',
     sku,
     attrs,
-    hsn: item.hsnCode || '—',
+    hsn: resolveLineHsn(row),
     qty,
+    unitSalePrice: displayUnit,
     ratePercent: rate,
-    taxableValue: taxable,
+    /** Line sale (taxable) — same as checkout priceSnapshot.total when present. */
+    taxableValue: saleAmount,
+    saleAmount,
     taxAmount: taxAmt,
     total: lineTotal
   };
@@ -108,13 +168,46 @@ function buildGstInvoiceViewModel(order, populatedItems = []) {
 
   const interstate = isInterState(seller.state, buyer.state);
 
-  const lines = (order.items || []).map((item, idx) => {
+  const rawItems = Array.isArray(order.items) ? order.items : [];
+  const lines = rawItems.map((item, idx) => {
+    const populated = populatedItems[idx] || item;
+    const plain = plainOrderItem(item);
     const pname =
-      populatedItems[idx]?.productId?.name ||
-      (typeof item.productId === 'object' && item.productId?.name) ||
+      (populated?.productId && typeof populated.productId === 'object' && populated.productId.name) ||
+      (plain.productId && typeof plain.productId === 'object' && plain.productId.name) ||
       'Product';
-    return lineFromItem(item, pname);
+    const mergedProduct =
+      populated?.productId && typeof populated.productId === 'object'
+        ? populated.productId
+        : plain.productId && typeof plain.productId === 'object'
+          ? plain.productId
+          : plain.productId;
+    const mergedItem = { ...plain, productId: mergedProduct };
+    return lineFromItem(mergedItem, pname);
   });
+
+  // Optional free-gift label row (admin-recorded gift name) when not already an order line.
+  const giftLabel = String(order.appliedFreeGiftOffer?.adminGiftLabel || '').trim();
+  if (giftLabel) {
+    const already = lines.some(
+      (l) => String(l.description || '').trim().toLowerCase() === giftLabel.toLowerCase()
+    );
+    if (!already) {
+      lines.push({
+        description: giftLabel,
+        sku: null,
+        attrs: 'Free gift',
+        hsn: '—',
+        qty: 1,
+        unitSalePrice: 0,
+        ratePercent: 0,
+        taxableValue: 0,
+        saleAmount: 0,
+        taxAmount: 0,
+        total: 0
+      });
+    }
+  }
 
   const subtotal = roundMoney2(Number(order.subtotal) || 0);
   const discount = roundMoney2(Number(order.discount) || 0);
@@ -122,13 +215,41 @@ function buildGstInvoiceViewModel(order, populatedItems = []) {
   const taxTotal = roundMoney2(Number(order.tax) || 0);
   const grand = roundMoney2(Number(order.totalAmount) || 0);
 
-  const lineTaxSum = roundMoney2(lines.reduce((s, l) => s + l.taxAmount, 0));
-  const itemsTaxable = roundMoney2(lines.reduce((s, l) => s + l.taxableValue, 0));
+  let lineTaxSum = roundMoney2(lines.reduce((s, l) => s + l.taxAmount, 0));
+  const itemsTaxable = roundMoney2(lines.reduce((s, l) => s + (Number(l.saleAmount) || l.taxableValue || 0), 0));
+
+  /**
+   * If line GST rates were missing (taxAmt 0) but checkout stored order.tax,
+   * allocate that tax across paid lines by sale share so the invoice shows real amounts.
+   */
+  if (lineTaxSum < 0.001 && taxTotal > 0.001 && itemsTaxable > 0.001) {
+    let allocated = 0;
+    const paidIdx = lines.map((l, i) => ((Number(l.saleAmount) || 0) > 0.001 ? i : -1)).filter((i) => i >= 0);
+    for (let j = 0; j < paidIdx.length; j += 1) {
+      const i = paidIdx[j];
+      const sale = Number(lines[i].saleAmount) || 0;
+      const share =
+        j === paidIdx.length - 1
+          ? roundMoney2(taxTotal - allocated)
+          : roundMoney2((sale / itemsTaxable) * taxTotal);
+      allocated = roundMoney2(allocated + share);
+      lines[i].taxAmount = share;
+      lines[i].total = roundMoney2(sale + share);
+      if (lines[i].ratePercent == null && sale > 0) {
+        lines[i].ratePercent = roundMoney2((share / sale) * 100);
+      }
+    }
+    lineTaxSum = roundMoney2(lines.reduce((s, l) => s + l.taxAmount, 0));
+  }
+
+  const itemsSaleSum = roundMoney2(lines.reduce((s, l) => s + (Number(l.saleAmount) || 0), 0));
   const itemsTotalWithTax = roundMoney2(lines.reduce((s, l) => s + l.total, 0));
-  /** Prefer persisted order.tax (checkout source of truth); fall back to per-line sum. */
-  const taxForSplit = taxTotal > 0.001 ? taxTotal : lineTaxSum;
+  /** Prefer sum of per-line GST (what the table shows); fall back to order.tax. */
+  const taxForSplit = lineTaxSum > 0.001 ? lineTaxSum : taxTotal;
   const gstParts = splitGstAmount(taxForSplit, interstate);
-  const computedGrand = roundMoney2(subtotal + taxTotal + delivery - discount);
+  const computedGrand = roundMoney2(
+    (itemsSaleSum > 0.001 ? itemsSaleSum : subtotal) + taxForSplit + delivery - discount
+  );
 
   const invNo = `INV-${order.orderId}`;
   const invDate = order.createdAt ? new Date(order.createdAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
@@ -163,17 +284,19 @@ function buildGstInvoiceViewModel(order, populatedItems = []) {
     buyerStateCode: buyerStateCode || null,
     lines,
     summary: {
-      subtotal,
+      subtotal: itemsSaleSum > 0.001 ? itemsSaleSum : subtotal,
+      orderSubtotal: subtotal,
       discount,
       deliveryCharges: delivery,
       itemsTaxable,
+      itemsSaleSum,
       itemsTotalWithTax,
       taxableValue: roundMoney2(itemsTaxable + delivery),
       cgst: gstParts.cgst,
       sgst: gstParts.sgst,
       igst: gstParts.igst,
       totalTax: taxForSplit,
-      grandTotal: grand,
+      grandTotal: grand > 0.001 ? grand : computedGrand,
       computedGrand
     },
     payment: {
@@ -236,14 +359,14 @@ function addressLinesHtml(lines) {
     .join('<br/>');
 }
 
-function gstTaxCell(line, interstate) {
+/** GST column cell — always show calculated GST amount + rate (header is "GST"). */
+function gstTaxCell(line) {
   const rateStr =
-    line.ratePercent != null && line.ratePercent > 0 ? `${Number(line.ratePercent)}%` : '0%';
-  if (interstate) {
-    return `${line.taxAmount.toFixed(2)}<br/><span class="tiny">@${rateStr}</span>`;
-  }
-  const half = roundMoney2(line.taxAmount / 2);
-  return `C ${half.toFixed(2)}<br/>S ${roundMoney2(line.taxAmount - half).toFixed(2)}<br/><span class="tiny">@${rateStr}</span>`;
+    line.ratePercent != null && Number(line.ratePercent) > 0
+      ? `${Number(line.ratePercent)}%`
+      : '—';
+  const amt = roundMoney2(Number(line.taxAmount) || 0);
+  return `${amt.toFixed(2)}<br/><span class="tiny">@${rateStr}</span>`;
 }
 
 function buildGstInvoiceHtml(vm) {
@@ -269,24 +392,43 @@ function buildGstInvoiceHtml(vm) {
   const awbDisplay = vm.logistics?.awb ? escapeHtml(vm.logistics.awb) : '—';
   const shippedBy = vm.logistics?.courier ? escapeHtml(vm.logistics.courier) : '—';
   const payMethod = escapeHtml(String(vm.payment.method || '—').toUpperCase());
-  const taxColHeader = vm.interstate ? 'IGST' : 'CGST/SGST';
+  const taxColHeader = 'GST';
 
   const rows = vm.lines
     .map((l, idx) => {
       const descParts = [escapeHtml(l.description)];
       if (l.sku) descParts.push(`<span class="sku"><strong>SKU:</strong> ${escapeHtml(l.sku)}</span>`);
       if (l.attrs) descParts.push(`<span class="sku">${escapeHtml(l.attrs)}</span>`);
+      const unitPrice = roundMoney2(Number(l.unitSalePrice) || 0);
+      const saleAmt = roundMoney2(Number(l.saleAmount != null ? l.saleAmount : l.taxableValue) || 0);
       return `<tr>
         <td class="c col-srno">${idx + 1}</td>
         <td class="desc">${descParts.join('<br/>')}</td>
         <td class="c">${escapeHtml(l.hsn)}</td>
-        <td class="c">${l.qty}</td>
-        <td class="r col-taxable">${l.taxableValue.toFixed(2)}</td>
-        <td class="r gst col-gst">${gstTaxCell(l, vm.interstate)}</td>
-        <td class="r"><strong>${l.total.toFixed(2)}</strong></td>
+        <td class="c col-qty">${l.qty}</td>
+        <td class="r col-price">${unitPrice.toFixed(2)}${
+          l.qty > 1 && saleAmt > 0.001
+            ? `<br/><span class="tiny">Line ${saleAmt.toFixed(2)}</span>`
+            : ''
+        }</td>
+        <td class="r gst col-gst">${gstTaxCell(l)}</td>
+        <td class="r col-total"><strong>${roundMoney2(Number(l.total) || 0).toFixed(2)}</strong></td>
       </tr>`;
     })
     .join('');
+
+  const itemsSaleSum = roundMoney2(Number(vm.summary.itemsSaleSum) || Number(vm.summary.subtotal) || 0);
+  const itemsGstSum = roundMoney2(Number(vm.summary.totalTax) || 0);
+  const itemsTotalSum = roundMoney2(
+    Number(vm.summary.itemsTotalWithTax) || itemsSaleSum + itemsGstSum
+  );
+  const itemsTotalRow = `<tr class="items-total-row">
+        <td class="c col-srno"></td>
+        <td colspan="3" class="r"><strong>Items Total</strong></td>
+        <td class="r col-price"><strong>${itemsSaleSum.toFixed(2)}</strong></td>
+        <td class="r col-gst"><strong>${itemsGstSum.toFixed(2)}</strong></td>
+        <td class="r col-total"><strong>${itemsTotalSum.toFixed(2)}</strong></td>
+      </tr>`;
 
   const del = vm.summary.deliveryCharges || 0;
   const shipRow =
@@ -294,9 +436,9 @@ function buildGstInvoiceHtml(vm) {
       ? `<tr class="alt">
         <td class="c col-srno">+</td>
         <td colspan="3"><strong>Shipping / Other charges</strong></td>
-        <td class="r col-taxable">${del.toFixed(2)}</td>
+        <td class="r col-price">${del.toFixed(2)}</td>
         <td class="r col-gst">—</td>
-        <td class="r"><strong>${del.toFixed(2)}</strong></td>
+        <td class="r col-total"><strong>${del.toFixed(2)}</strong></td>
       </tr>`
       : '';
 
@@ -305,15 +447,13 @@ function buildGstInvoiceHtml(vm) {
       ? `<tr class="alt">
         <td class="c col-srno">−</td>
         <td colspan="3"><strong>Discount</strong></td>
-        <td class="r col-taxable">−${vm.summary.discount.toFixed(2)}</td>
+        <td class="r col-price">−${vm.summary.discount.toFixed(2)}</td>
         <td class="r col-gst">—</td>
-        <td class="r"><strong>−${vm.summary.discount.toFixed(2)}</strong></td>
+        <td class="r col-total"><strong>−${vm.summary.discount.toFixed(2)}</strong></td>
       </tr>`
       : '';
 
-  const taxSummary = vm.interstate
-    ? `IGST ${formatAmount(vm.summary.igst)}`
-    : `CGST ${formatAmount(vm.summary.cgst)} + SGST ${formatAmount(vm.summary.sgst)}`;
+  const taxSummary = `GST ${formatAmount(vm.summary.totalTax)}`;
 
   const discountTotalsRow =
     vm.summary.discount > 0.001
@@ -391,14 +531,24 @@ function buildGstInvoiceHtml(vm) {
       word-wrap: break-word;
     }
     table.items th { background: #f2f2f2; font-weight: 700; text-align: center; white-space: nowrap; }
-    table.items th.col-taxable,
-    table.items td.col-taxable {
+    table.items th.col-qty,
+    table.items td.col-qty { width: 7%; text-align: center; }
+    table.items th.col-price,
+    table.items td.col-price {
       width: 12%;
+      text-align: right;
       white-space: nowrap;
       word-wrap: normal;
     }
     table.items th.col-gst,
-    table.items td.col-gst { width: 13%; }
+    table.items td.col-gst { width: 13%; text-align: right; }
+    table.items th.col-total,
+    table.items td.col-total { width: 14%; text-align: right; }
+    table.items tr.items-total-row td {
+      background: #f7f7f7;
+      border-top: 2px solid #000;
+      font-weight: 700;
+    }
     table.items th.col-srno,
     table.items td.col-srno {
       width: 5%;
@@ -544,26 +694,27 @@ function buildGstInvoiceHtml(vm) {
     <table class="items" cellspacing="0">
       <colgroup>
         <col style="width:5%"/>
-        <col style="width:38%"/>
+        <col style="width:36%"/>
         <col style="width:10%"/>
         <col style="width:7%"/>
         <col style="width:12%"/>
         <col style="width:13%"/>
-        <col style="width:15%"/>
+        <col style="width:17%"/>
       </colgroup>
       <thead>
         <tr>
           <th class="col-srno">Sr.No.</th>
           <th>Description</th>
           <th>HSN</th>
-          <th>Qty</th>
-          <th class="col-taxable">Taxable</th>
+          <th class="col-qty">Qty</th>
+          <th class="col-price">Price</th>
           <th class="col-gst">${taxColHeader}</th>
-          <th>Total</th>
+          <th class="col-total">Total</th>
         </tr>
       </thead>
       <tbody>
         ${rows}
+        ${itemsTotalRow}
         ${discountRow}
         ${shipRow}
       </tbody>
@@ -580,7 +731,7 @@ function buildGstInvoiceHtml(vm) {
       <div class="row"><span class="row-label">Delivery</span><span class="row-val">${formatAmount(vm.summary.deliveryCharges)}</span></div>
       ${discountTotalsRow}
       <div class="row"><span class="row-label">Place of Supply</span><span class="row-val">${escapeHtml(vm.placeOfSupply)}</span></div>
-      <div class="row"><span class="row-label">Tax Split</span><span class="row-val">${escapeHtml(taxSummary)}</span></div>
+      <div class="row"><span class="row-label">GST</span><span class="row-val">${escapeHtml(taxSummary)}</span></div>
       </div>
     </div>
 

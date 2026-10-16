@@ -3662,7 +3662,7 @@ exports.generateInvoice = async (req, res) => {
     try {
         const { orderId } = req.params;
         const order = await Order.findOne({ orderId: orderId })
-            .populate('items.productId', 'name')
+            .populate('items.productId', 'name hsnCode gstRate variants')
             .populate('address');
 
         if (!order) {
