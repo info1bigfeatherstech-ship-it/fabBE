@@ -74,22 +74,25 @@ function barcodeSvgMarkup(text, className) {
 }
 
 /**
- * Column weights from trim settings — Item/SKU don't need huge width when
- * names are already truncated with "…". Qty stays wide enough for the "Qty" header.
+ * Column weights from trim settings.
+ * Item width follows name trim (do not shrink name to “save” SKU).
+ * SKU gets enough width for trimSkuUpto chars; room taken from GST / Price / Total.
  */
 function buildProductColDefs(productsCfg) {
   const p = productsCfg || {};
   const nameMax = Math.max(4, Number(p.trimProductNameUpto) || 18);
-  const skuMax = Math.max(4, Number(p.trimSkuUpto) || 10);
+  const skuMax = Math.max(4, Number(p.trimSkuUpto) || 15);
   const showGst = Boolean(p.showGst);
-  // Item width follows trim length (default 18 chars). GST/Total kept tight — less dead gap.
+  // Keep Item readable for configured name trim (e.g. 18 chars).
   const itemW = Math.min(0.3, Math.max(0.14, 0.04 + nameMax * 0.011));
-  const skuW = Math.min(0.14, Math.max(0.09, 0.03 + skuMax * 0.008));
-  const qtyW = 0.065; // fits header "Qty" + 1–2 digit values
+  // SKU must fit trimmed value (e.g. SKU-2734-1) — was capped too low → "SKU-…".
+  const skuW = Math.min(0.22, Math.max(0.14, 0.055 + skuMax * 0.0095));
+  const qtyW = 0.055;
   const hsnW = 0.08;
-  const priceW = showGst ? 0.135 : 0.17;
-  const gstW = showGst ? 0.2 : 0;
-  const totalW = showGst ? 0.12 : 0.15;
+  // GST / money cols tightened so SKU + Item both stay readable on 4×6.
+  const priceW = showGst ? 0.11 : 0.145;
+  const gstW = showGst ? 0.155 : 0;
+  const totalW = showGst ? 0.11 : 0.14;
   const cols = [];
   if (p.showItem) cols.push({ key: 'name', title: 'Item', w: itemW });
   if (p.showSku) cols.push({ key: 'sku', title: 'SKU', w: skuW });

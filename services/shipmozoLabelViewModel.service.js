@@ -245,7 +245,7 @@ function buildLineItems(order, productsCfg) {
     : Math.max(1, Number(productsCfg.maxLineItems) || 10);
   const items = Array.isArray(order?.items) ? order.items : [];
   const nameMax = Number(productsCfg.trimProductNameUpto) || 18;
-  const skuMax = Number(productsCfg.trimSkuUpto) || 10;
+  const skuMax = Number(productsCfg.trimSkuUpto) || 15;
   const showGst = Boolean(productsCfg.showGst);
   const lines = [];
   let totalQty = 0;

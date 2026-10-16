@@ -79,7 +79,7 @@ function defaultSettings() {
       showCollectableAmount: true,
       showTotalQuantity: true,
       showAllItems: false,
-      trimSkuUpto: 10,
+      trimSkuUpto: 15,
       trimProductNameUpto: 18,
       maxLineItems: 10
     },
