@@ -197,7 +197,7 @@ function computeMetaBandHeight(vm, s) {
   const leftH = 4 + metas.length * lineH + 3;
   let rightH = 14;
   if (s.delivery?.showAwbBarcode) {
-    if (vm.shipmozoId) rightH += 9;
+    if (String(vm.providerChannelId || vm.shipmozoId || '').trim()) rightH += 9;
     rightH += 36 + 2;
     if (vm.awb) rightH += 9;
   }
@@ -474,12 +474,15 @@ async function renderLabelPdf(vm) {
         fontSize: layout.courierFont, bold: true, align: 'left', height: 9
       });
       rcy += 10;
-      const shipmozoId = String(vm.shipmozoId || '').trim();
+      const providerChannelId = String(vm.providerChannelId || vm.shipmozoId || '').trim();
+      const providerChannelIdLabel = String(
+        vm.providerChannelIdLabel || (vm.shipmozoId ? 'Shipmozo ID' : 'Shipment ID')
+      ).trim();
       const awbId = String(vm.awb || '').trim();
       if (s.delivery?.showAwbBarcode) {
         const barH = layout.awbBarH;
-        if (shipmozoId) {
-          txtKeyValue(doc, 'Shipmozo ID', shipmozoId, barX, rcy, barW, {
+        if (providerChannelId && providerChannelIdLabel) {
+          txtKeyValue(doc, providerChannelIdLabel, providerChannelId, barX, rcy, barW, {
             fontSize: layout.secondaryFont, height: 8
           });
           rcy += 9;
@@ -870,7 +873,17 @@ async function renderLabelHtml(vm) {
       ${
         s.delivery?.showAwbBarcode
           ? `<div class="awb-block">
-              ${vm.shipmozoId ? kv('Shipmozo ID', vm.shipmozoId).replace('<div>', '<div class="id-line">') : ''}
+              ${
+                (() => {
+                  const id = String(vm.providerChannelId || vm.shipmozoId || '').trim();
+                  const label = String(
+                    vm.providerChannelIdLabel || (vm.shipmozoId ? 'Shipmozo ID' : 'Shipment ID')
+                  ).trim();
+                  return id && label
+                    ? kv(label, id).replace('<div>', '<div class="id-line">')
+                    : '';
+                })()
+              }
               ${awbBar}
               ${vm.awb ? kv('AWB', vm.awb).replace('<div>', '<div class="awb-line">') : ''}
             </div>`

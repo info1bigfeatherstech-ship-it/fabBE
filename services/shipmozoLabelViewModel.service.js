@@ -1,10 +1,45 @@
 /**
- * Build a print view-model for custom Shipmozo 4×6 labels.
- * Shiprocket orders never call this module.
+ * Build a print view-model for custom 4×6 shipping labels
+ * (Shipmozo + Shiprocket custom downloads share this layout).
  */
 
 const { sanitizeSettings, defaultSettings } = require('./shipmozoLabelSettings.service');
 const { getAppName } = require('../utils/appBrand');
+const {
+  SHIPPING_PROVIDERS,
+  resolveOrderShippingProvider
+} = require('../constants/shippingProviders');
+
+/**
+ * Provider-facing channel / shipment id for the label (never mislabel Shiprocket as Shipmozo).
+ * @param {object} order
+ * @returns {{ providerChannelId: string, providerChannelIdLabel: string, shipmozoId: string }}
+ */
+function resolveProviderChannelIdFields(order) {
+  const si = order?.shipmentInfo && typeof order.shipmentInfo === 'object' ? order.shipmentInfo : {};
+  const provider = resolveOrderShippingProvider(order);
+  const shipmentId = String(si.shipmentId || '').trim();
+  const shipmozoOrderId = String(si.shipmozoOrderId || si.shipmozoReferenceId || '').trim();
+  const shiprocketOrderId = String(si.shiprocketOrderId || '').trim();
+
+  if (provider === SHIPPING_PROVIDERS.SHIPMOZO) {
+    const id = shipmozoOrderId || shipmentId;
+    return {
+      providerChannelId: id,
+      providerChannelIdLabel: id ? 'Shipmozo ID' : '',
+      // Legacy alias — only set for Shipmozo so old PDF paths stay correct.
+      shipmozoId: id
+    };
+  }
+
+  // Shiprocket (and any non-Shipmozo custom label): never caption as Shipmozo ID.
+  const id = shiprocketOrderId || shipmentId;
+  return {
+    providerChannelId: id,
+    providerChannelIdLabel: id ? 'Shipment ID' : '',
+    shipmozoId: ''
+  };
+}
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -313,12 +348,7 @@ async function buildLabelViewModel(order, settingsPatch) {
   ).trim();
   const created = order?.createdAt || new Date();
   const orderId = String(order?.orderId || '').trim();
-  const shipmozoId = String(
-    order?.shipmentInfo?.shipmozoOrderId ||
-      order?.shipmentInfo?.shipmozoReferenceId ||
-      order?.shipmentInfo?.shipmentId ||
-      ''
-  ).trim();
+  const channelIds = resolveProviderChannelIdFields(order);
 
   return {
     settings,
@@ -326,7 +356,10 @@ async function buildLabelViewModel(order, settingsPatch) {
     labelSize: '4x6',
     courier,
     awb,
-    shipmozoId,
+    shippingProvider: resolveOrderShippingProvider(order),
+    providerChannelId: channelIds.providerChannelId,
+    providerChannelIdLabel: channelIds.providerChannelIdLabel,
+    shipmozoId: channelIds.shipmozoId,
     orderId,
     shipToName: customerName(addr),
     shipToLines: addressLines(addr),
@@ -424,6 +457,9 @@ function buildSampleViewModel(settingsPatch, storefront) {
     labelSize: '4x6',
     courier: 'XpressBees 10Kg',
     awb: 'SM1234567890',
+    shippingProvider: SHIPPING_PROVIDERS.SHIPMOZO,
+    providerChannelId: '86543821',
+    providerChannelIdLabel: 'Shipmozo ID',
     shipmozoId: '86543821',
     orderId: sf === 'wholesale' ? 'OWB-WH-865438' : 'OWB-ECOMM-865438',
     shipToName: 'John Wick',
@@ -465,6 +501,7 @@ module.exports = {
   buildLabelViewModel,
   buildSampleViewModel,
   resolvePickupWarehouse,
+  resolveProviderChannelIdFields,
   formatInr,
   trimText,
   labelPaymentMode,
