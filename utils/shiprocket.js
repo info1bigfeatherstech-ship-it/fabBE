@@ -1216,11 +1216,20 @@ class ShiprocketService {
     const courier =
       root.courier_name ?? sh0.courier_name ?? sh0.courier ?? root.courier ?? null;
     const labelUrl = root.label_url ?? sh0.label_url ?? null;
-    const manifestUrl =
+    const manifestUrlDirect =
       root.manifest_url ??
       sh0.manifest_url ??
+      root.manifestUrl ??
+      sh0.manifestUrl ??
       root.manifest ??
       sh0.manifest ??
+      null;
+    const manifestUrl =
+      (manifestUrlDirect != null && String(manifestUrlDirect).trim()
+        ? String(manifestUrlDirect).trim()
+        : null) ||
+      ShiprocketService.extractManifestUrl(sh0) ||
+      ShiprocketService.extractManifestUrl(root) ||
       null;
 
     const pickupDate = ShiprocketService.extractStrictPickupScheduledDateFromOrderShow(root);
@@ -2724,6 +2733,24 @@ class ShiprocketService {
     return { ok: true, date: ymd, preferences };
   }
 
+  /** Collect http(s) strings from nested Shiprocket JSON (bounded depth). */
+  static collectHttpsUrls(data, out = [], depth = 0) {
+    if (depth > 10 || data == null) return out;
+    if (typeof data === 'string') {
+      const s = data.trim();
+      if (/^https?:\/\//i.test(s)) out.push(s);
+      return out;
+    }
+    if (Array.isArray(data)) {
+      for (const row of data) ShiprocketService.collectHttpsUrls(row, out, depth + 1);
+      return out;
+    }
+    if (typeof data === 'object') {
+      for (const v of Object.values(data)) ShiprocketService.collectHttpsUrls(v, out, depth + 1);
+    }
+    return out;
+  }
+
   static extractManifestUrl(data) {
     if (!data) return null;
     if (typeof data === 'string' && /^https?:\/\//i.test(data)) return data.trim();
@@ -2739,12 +2766,45 @@ class ShiprocketService {
       data.url ||
       data.manifest_url ||
       data.manifestUrl ||
+      data.file_url ||
+      data.pdf_url ||
+      data.download_url ||
       (Array.isArray(data.data) && typeof data.data[0] === 'string' ? data.data[0] : null) ||
-      (data.data && typeof data.data === 'object' ? data.data.url || data.data.manifest_url : null);
-    if (direct && String(direct).trim()) return String(direct).trim();
-    if (data.response) return ShiprocketService.extractManifestUrl(data.response);
-    if (data.data) return ShiprocketService.extractManifestUrl(data.data);
-    return null;
+      (data.data && typeof data.data === 'object'
+        ? data.data.url || data.data.manifest_url || data.data.file_url
+        : null);
+    if (direct && String(direct).trim() && /^https?:\/\//i.test(String(direct).trim())) {
+      return String(direct).trim();
+    }
+    if (data.response) {
+      const nested = ShiprocketService.extractManifestUrl(data.response);
+      if (nested) return nested;
+    }
+    if (data.data) {
+      const nested = ShiprocketService.extractManifestUrl(data.data);
+      if (nested) return nested;
+    }
+
+    // Deep scan — prefer explicit manifest links; avoid tax invoice / label PDFs.
+    const urls = ShiprocketService.collectHttpsUrls(data);
+    const manifestHit = urls.find((u) => /manifest/i.test(u));
+    if (manifestHit) return manifestHit;
+    const pdfHit = urls.find(
+      (u) => /\.pdf(\?|#|$)/i.test(u) && !/invoice|label|shipping[_-]?label/i.test(u)
+    );
+    return pdfHit || null;
+  }
+
+  /** True when Shiprocket says manifest was created earlier (generate may 409 / empty URL). */
+  static isManifestAlreadyGeneratedMessage(message) {
+    const msg = String(message || '').toLowerCase();
+    return (
+      /manifest\s+already\s+generated/.test(msg) ||
+      /already\s+been\s+generated/.test(msg) ||
+      /manifest\s+already\s+exists/.test(msg) ||
+      /already\s+generated\s+for\s+(this\s+)?shipment/.test(msg) ||
+      /manifest\s+has\s+already\s+been\s+created/.test(msg)
+    );
   }
 
   /**
@@ -2774,18 +2834,45 @@ class ShiprocketService {
         return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
       }
       const manifestUrl = ShiprocketService.extractManifestUrl(data);
+      const msg =
+        (typeof data?.message === 'string' && data.message) ||
+        ShiprocketService.formatAxiosError({ response: { data } }) ||
+        '';
+      const already =
+        !manifestUrl &&
+        ShiprocketService.isManifestAlreadyGeneratedMessage(msg || JSON.stringify(data || {}));
       return {
         success: true,
-        manifestUrl,
+        alreadyGenerated: already,
+        manifestUrl: manifestUrl || null,
         raw: data,
-        mock: false
+        mock: false,
+        message: msg || null
       };
     } catch (err) {
+      const msg = ShiprocketService.formatAxiosError(err);
+      const fromBody = ShiprocketService.extractManifestUrl(err.response?.data);
+      const status = err.response?.status;
+      // Panel-generated manifests often make generate return 409 / "already generated".
+      const looksAlready =
+        fromBody ||
+        ShiprocketService.isManifestAlreadyGeneratedMessage(msg) ||
+        (status === 409 && !/unauthor|forbidden|token|auth/i.test(msg));
+      if (looksAlready) {
+        return {
+          success: true,
+          alreadyGenerated: true,
+          manifestUrl: fromBody || null,
+          raw: err.response?.data || null,
+          mock: false,
+          message: msg
+        };
+      }
       logger.error('[Shiprocket] generateManifest failed:', err.response?.data || err.message);
       return {
         success: false,
         code: 'MANIFEST_GENERATE_FAILED',
-        message: ShiprocketService.formatAxiosError(err),
+        message: msg,
         details: err.response?.data || null
       };
     }
@@ -2794,12 +2881,33 @@ class ShiprocketService {
   /**
    * POST /external/orders/print/manifest — print manifest PDF URL (after generate).
    */
-  async printManifest({ shiprocketOrderId, channelOrderId }) {
+  async printManifest({ shiprocketOrderId, channelOrderId, shipmentId } = {}) {
     let numericOrderId = this.parseNumericShiprocketOrderId(shiprocketOrderId);
-    if (!numericOrderId && (channelOrderId || shiprocketOrderId)) {
-      const lookup = await this.fetchForwardOrderSnapshot({ shiprocketOrderId, channelOrderId });
+    if (!numericOrderId && (channelOrderId || shiprocketOrderId || shipmentId)) {
+      const lookup = await this.fetchForwardOrderSnapshot({
+        shiprocketOrderId,
+        channelOrderId,
+        shipmentId
+      });
       if (lookup.success && lookup.snapshot?.shiprocketOrderId) {
         numericOrderId = this.parseNumericShiprocketOrderId(lookup.snapshot.shiprocketOrderId);
+      }
+      // Snapshot may already carry manifest_url from panel / shipments show.
+      if (lookup.success) {
+        const fromSnap =
+          lookup.snapshot?.manifestUrl ||
+          ShiprocketService.extractManifestUrl(lookup.raw) ||
+          null;
+        if (fromSnap) {
+          return {
+            success: true,
+            manifestUrl: String(fromSnap).trim(),
+            shiprocketOrderId: numericOrderId ? String(numericOrderId) : null,
+            raw: lookup.raw,
+            mock: false,
+            source: 'snapshot'
+          };
+        }
       }
     }
     if (!numericOrderId) {
@@ -2830,12 +2938,22 @@ class ShiprocketService {
       const manifestUrl = ShiprocketService.extractManifestUrl(data);
       return {
         success: true,
-        manifestUrl,
+        manifestUrl: manifestUrl || null,
         shiprocketOrderId: String(numericOrderId),
         raw: data,
         mock: false
       };
     } catch (err) {
+      const fromBody = ShiprocketService.extractManifestUrl(err.response?.data);
+      if (fromBody) {
+        return {
+          success: true,
+          manifestUrl: fromBody,
+          shiprocketOrderId: String(numericOrderId),
+          raw: err.response?.data || null,
+          mock: false
+        };
+      }
       logger.error('[Shiprocket] printManifest failed:', err.response?.data || err.message);
       return {
         success: false,

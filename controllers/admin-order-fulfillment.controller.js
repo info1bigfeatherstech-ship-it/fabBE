@@ -64,38 +64,51 @@ const { renderLabelPdf } = require('../services/shipmozoLabelPdf.service');
 const { mergeShippingLabelPartsToPdf } = require('../utils/mergeShippingLabelsPdf');
 
 function manifestAlreadyGeneratedMessage(message) {
-  return /manifest already generated|already been generated/i.test(String(message || ''));
+  return ShiprocketService.isManifestAlreadyGeneratedMessage(message);
 }
 
 /**
  * Pull label/manifest URLs Shiprocket already has (e.g. generated on Shiprocket panel).
+ * Matches current AWB when present; also accepts shipmentId match when AWB strings differ slightly.
  * @param {import('mongoose').Document} order
  */
 async function pullPanelFulfillmentUrlsFromSnapshot(order) {
   const si = order.shipmentInfo || {};
   const currentAwb = String(si.awbCode || si.trackingNumber || '').trim();
-  if (!currentAwb) return null;
+  const shipmentId = si.shipmentId != null ? String(si.shipmentId).trim() : '';
+  if (!currentAwb && !shipmentId && !si.shiprocketOrderId) return null;
   const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
     shiprocketOrderId: si.shiprocketOrderId,
-    channelOrderId: order.orderId
+    channelOrderId: order.orderId,
+    shipmentId: si.shipmentId
   });
   if (!lookup.success || !lookup.snapshot) return null;
   const snapAwb = String(lookup.snapshot.awbCode || '').trim();
-  if (!snapAwb || snapAwb !== currentAwb) return null;
+  const snapShipmentId =
+    lookup.snapshot.shipmentId != null ? String(lookup.snapshot.shipmentId).trim() : '';
+  const awbOk = Boolean(currentAwb && snapAwb && snapAwb === currentAwb);
+  const shipmentOk = Boolean(shipmentId && snapShipmentId && shipmentId === snapShipmentId);
+  // Allow URL pull when AWB matches, or shipment id matches (AWB hydrate / panel desync).
+  if (!awbOk && !shipmentOk && currentAwb) return null;
+
+  const fromSnap = lookup.snapshot.manifestUrl || null;
+  const fromRaw = ShiprocketService.extractManifestUrl(lookup.raw);
+  const labelFromSnap = lookup.snapshot.labelUrl || null;
   return {
-    awbCode: snapAwb,
-    labelUrl: lookup.snapshot.labelUrl || null,
-    manifestUrl: lookup.snapshot.manifestUrl || null
+    awbCode: snapAwb || currentAwb || null,
+    labelUrl: labelFromSnap || null,
+    manifestUrl: (fromSnap && String(fromSnap).trim()) || fromRaw || null,
+    shiprocketOrderId: lookup.snapshot.shiprocketOrderId || null
   };
 }
 
 /**
- * Resolve manifest URL — prefers Shiprocket panel state, falls back to print when already generated.
+ * Resolve manifest URL — panel snapshot → generate (incl. already-generated) → print → deep extract.
  * @param {import('mongoose').Document} order
  */
 async function resolveManifestUrlForOrder(order) {
   const shipmentId = order.shipmentInfo?.shipmentId;
-  const shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
+  let shiprocketOrderId = await resolveShiprocketOrderIdForOrder(order);
   if (!shipmentId) {
     return { success: false, code: 'SHIPMENT_ID_MISSING', message: 'No shipment_id on order.' };
   }
@@ -108,6 +121,9 @@ async function resolveManifestUrlForOrder(order) {
   }
 
   const panel = await pullPanelFulfillmentUrlsFromSnapshot(order);
+  if (panel?.shiprocketOrderId) {
+    shiprocketOrderId = panel.shiprocketOrderId;
+  }
   if (panel?.manifestUrl) {
     return {
       success: true,
@@ -119,30 +135,68 @@ async function resolveManifestUrlForOrder(order) {
 
   const generated = await ShiprocketService.generateManifest({ shipmentId });
   const alreadyGenerated =
-    !generated.success && manifestAlreadyGeneratedMessage(generated.message);
+    Boolean(generated.alreadyGenerated) ||
+    (!generated.success && manifestAlreadyGeneratedMessage(generated.message));
   if (!generated.success && !alreadyGenerated) {
     return generated;
+  }
+  if (generated.manifestUrl) {
+    return {
+      success: true,
+      manifestUrl: String(generated.manifestUrl).trim(),
+      shiprocketOrderId,
+      source: alreadyGenerated ? 'generate_existing' : 'generate'
+    };
   }
 
   const printed = await ShiprocketService.printManifest({
     shiprocketOrderId,
-    channelOrderId: order.orderId
+    channelOrderId: order.orderId,
+    shipmentId
   });
-  if (!printed.success) return printed;
-
-  const manifestUrl = String(printed.manifestUrl || generated.manifestUrl || '').trim();
-  if (!manifestUrl) {
+  if (printed.success && printed.manifestUrl) {
     return {
-      success: false,
-      code: 'MANIFEST_URL_MISSING',
-      message: 'Shiprocket did not return a manifest URL.'
+      success: true,
+      manifestUrl: String(printed.manifestUrl).trim(),
+      shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId,
+      source: alreadyGenerated || printed.source === 'snapshot' ? 'print_existing' : 'generate_and_print'
     };
   }
+
+  // Last resort: re-fetch panel / deep-scan generate + print payloads.
+  const fromGeneratedRaw = ShiprocketService.extractManifestUrl(generated.raw);
+  const fromPrintedRaw = ShiprocketService.extractManifestUrl(printed.raw);
+  if (fromGeneratedRaw || fromPrintedRaw) {
+    return {
+      success: true,
+      manifestUrl: String(fromGeneratedRaw || fromPrintedRaw).trim(),
+      shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId,
+      source: 'raw_extract'
+    };
+  }
+
+  const panelRetry = await pullPanelFulfillmentUrlsFromSnapshot(order);
+  if (panelRetry?.manifestUrl) {
+    return {
+      success: true,
+      manifestUrl: String(panelRetry.manifestUrl).trim(),
+      shiprocketOrderId: panelRetry.shiprocketOrderId || shiprocketOrderId,
+      source: 'panel_snapshot_retry'
+    };
+  }
+
+  if (!printed.success) return printed;
+
   return {
-    success: true,
-    manifestUrl,
-    shiprocketOrderId: printed.shiprocketOrderId || shiprocketOrderId,
-    source: alreadyGenerated ? 'print_existing' : 'generate_and_print'
+    success: false,
+    code: 'MANIFEST_URL_MISSING',
+    message:
+      'Shiprocket did not return a manifest URL. Open Download Manifest on the Shiprocket panel once, then retry here — or use Sync from Shiprocket.',
+    details: {
+      generateMessage: generated.message || null,
+      printMessage: printed.message || null,
+      alreadyGenerated
+    }
   };
 }
 

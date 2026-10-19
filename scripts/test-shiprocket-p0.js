@@ -161,6 +161,53 @@ function testShippingLabelVsInvoiceUrl() {
   assert.strictEqual(shiprocketInstance.isPickupAlreadyScheduledMessage('Already in Pickup Queue.'), true);
 }
 
+function testManifestUrlExtraction() {
+  const Cls = shiprocketInstance.constructor;
+  assert.strictEqual(
+    Cls.extractManifestUrl({ manifest_url: 'https://cdn.shiprocket.in/manifest/abc.pdf' }),
+    'https://cdn.shiprocket.in/manifest/abc.pdf'
+  );
+  assert.strictEqual(
+    Cls.extractManifestUrl({
+      data: { file_url: 'https://kr-shipmultichannel.s3.amazonaws.com/manifests/x.pdf' }
+    }),
+    'https://kr-shipmultichannel.s3.amazonaws.com/manifests/x.pdf'
+  );
+  assert.strictEqual(
+    Cls.extractManifestUrl({
+      payload: {
+        docs: [{ type: 'label', url: 'https://cdn.example/label.pdf' }],
+        link: 'https://cdn.example/manifests/ready.pdf'
+      }
+    }),
+    'https://cdn.example/manifests/ready.pdf'
+  );
+  assert.strictEqual(
+    Cls.extractManifestUrl({
+      invoice_url: 'https://cdn.example/invoice.pdf',
+      label_url: 'https://cdn.example/label.pdf'
+    }),
+    null
+  );
+  assert.strictEqual(Cls.isManifestAlreadyGeneratedMessage('Manifest already generated'), true);
+  assert.strictEqual(Cls.isManifestAlreadyGeneratedMessage('Manifest already exists for shipment'), true);
+  assert.strictEqual(Cls.isManifestAlreadyGeneratedMessage('Courier unavailable'), false);
+
+  const snap = Cls.extractForwardOrderSnapshot({
+    id: 53432712,
+    shipment_id: 1653461153,
+    awb: '14326361684789',
+    shipments: [
+      {
+        id: 1653461153,
+        awb: '14326361684789',
+        docs: { manifest: 'https://cdn.shiprocket.in/manifest/panel-ready.pdf' }
+      }
+    ]
+  });
+  assert.strictEqual(snap.manifestUrl, 'https://cdn.shiprocket.in/manifest/panel-ready.pdf');
+}
+
 function testExtractPickupDateDeep() {
   const Cls = shiprocketInstance.constructor;
   const pickupYmd = nearFuturePickupYmd();
@@ -713,6 +760,7 @@ function run() {
   testParsePickupDateFromScheduleResponse();
   testParseNumericShiprocketOrderId();
   testShippingLabelVsInvoiceUrl();
+  testManifestUrlExtraction();
   testExtractPickupDateDeep();
   testPickupDateIgnoredWhenOnlyRequestField();
   testPickupListBatchMatchesShipment();
