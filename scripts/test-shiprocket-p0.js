@@ -65,6 +65,18 @@ function testInstanceDelegatesUsedByControllers() {
   assert.ok(shiprocketInstance.isPlausibleCourierPickupYmd(pickupYmd));
   assert.ok(!shiprocketInstance.isPlausibleCourierPickupYmd('2001-02-28'));
   assert.strictEqual(shiprocketInstance.isPickupAlreadyScheduledMessage('Already in Pickup Queue.'), true);
+  assert.strictEqual(typeof shiprocketInstance.extractManifestUrl, 'function');
+  assert.strictEqual(typeof shiprocketInstance.isManifestAlreadyGeneratedMessage, 'function');
+  assert.strictEqual(
+    shiprocketInstance.extractManifestUrl({
+      manifest_url: 'https://cdn.shiprocket.in/manifest/abc.pdf'
+    }),
+    'https://cdn.shiprocket.in/manifest/abc.pdf'
+  );
+  assert.strictEqual(
+    shiprocketInstance.isManifestAlreadyGeneratedMessage('Manifest already generated'),
+    true
+  );
 }
 
 function testExtractForwardOrderSnapshot() {

@@ -2540,6 +2540,15 @@ class ShiprocketService {
     return ShiprocketService.isLikelyTaxInvoiceUrl(url);
   }
 
+  /** Instance delegate — controllers require('../utils/shiprocket') (singleton), not the class. */
+  extractManifestUrl(data) {
+    return ShiprocketService.extractManifestUrl(data);
+  }
+
+  isManifestAlreadyGeneratedMessage(message) {
+    return ShiprocketService.isManifestAlreadyGeneratedMessage(message);
+  }
+
   normalizeYmdDate(value) {
     return ShiprocketService.normalizeYmdDate(value);
   }
