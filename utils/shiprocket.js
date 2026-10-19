@@ -1424,6 +1424,29 @@ class ShiprocketService {
   }
 
   /**
+   * Parse Shiprocket assign errors like:
+   * "AWB is already assigned with awb - 14326361684789 and status - PICKUP GENERATED"
+   * @returns {{ awbCode: string, statusLabel: string|null }|null}
+   */
+  static parseAlreadyAssignedAwbFromMessage(message) {
+    const msg = String(message || '').trim();
+    if (!msg || !/already\s+assigned/i.test(msg)) return null;
+    const awbMatch =
+      /awb\s*(?:is\s+)?already\s+assigned\s+with\s+awb\s*[-–:]?\s*([A-Za-z0-9]+)/i.exec(msg) ||
+      /already\s+assigned\s+with\s+awb\s*[-–:]?\s*([A-Za-z0-9]+)/i.exec(msg) ||
+      /awb\s*[-–:]?\s*([A-Za-z0-9]{8,})\s+and\s+status/i.exec(msg);
+    if (!awbMatch) return null;
+    const awbCode = String(awbMatch[1] || '').trim();
+    if (!awbCode) return null;
+    const statusMatch = /status\s*[-–:]?\s*([A-Za-z][A-Za-z0-9 _-]{0,80})/i.exec(msg);
+    let statusLabel = statusMatch ? String(statusMatch[1] || '').trim().replace(/\s+/g, ' ') : null;
+    if (statusLabel) {
+      statusLabel = statusLabel.replace(/\s+(customer|order|total|is|not|changed).*$/i, '').trim();
+    }
+    return { awbCode, statusLabel: statusLabel || null };
+  }
+
+  /**
    * True when Shiprocket signals a live pickup booking/queue (not bare leftover "For <date>"
    * text that can linger after cancel → re-AWB).
    * @param {{ statusLabel?: string|null, pickupStatusText?: string|null, shiprocketPickupId?: string|null, signalTexts?: string[] }} input
@@ -1665,6 +1688,20 @@ class ShiprocketService {
         'Shiprocket did not return an AWB. Recharge the Shiprocket wallet or check courier availability.';
 
       if (!assignSucceeded) {
+        const already = ShiprocketService.parseAlreadyAssignedAwbFromMessage(errMsg);
+        if (already?.awbCode) {
+          return {
+            success: true,
+            alreadyAssigned: true,
+            awbCode: already.awbCode,
+            trackingNumber: already.awbCode,
+            courier: courierName || null,
+            labelUrl: labelUrl || null,
+            providerStatus: already.statusLabel || 'PICKUP GENERATED',
+            raw: data,
+            mock: false
+          };
+        }
         const walletish =
           statusCode === 350 ||
           /recharge|wallet|balance|insufficient/i.test(String(errMsg || ''));
@@ -1695,10 +1732,25 @@ class ShiprocketService {
       };
     } catch (err) {
       logger.error('[Shiprocket] assignAwb failed:', err.response?.data || err.message);
+      const errMsg = ShiprocketService.formatAxiosError(err);
+      const already = ShiprocketService.parseAlreadyAssignedAwbFromMessage(errMsg);
+      if (already?.awbCode) {
+        return {
+          success: true,
+          alreadyAssigned: true,
+          awbCode: already.awbCode,
+          trackingNumber: already.awbCode,
+          courier: null,
+          labelUrl: null,
+          providerStatus: already.statusLabel || 'PICKUP GENERATED',
+          raw: err.response?.data || null,
+          mock: false
+        };
+      }
       return {
         success: false,
         code: 'ASSIGN_AWB_FAILED',
-        message: ShiprocketService.formatAxiosError(err),
+        message: errMsg,
         details: err.response?.data || null
       };
     }
@@ -1813,7 +1865,7 @@ class ShiprocketService {
    * GET /external/orders/show/{id} — full forward-order snapshot for DB sync.
    * @returns {Promise<{ success: boolean, snapshot?: object, code?: string, message?: string }>}
    */
-  async fetchForwardOrderSnapshot({ shiprocketOrderId, channelOrderId }) {
+  async fetchForwardOrderSnapshot({ shiprocketOrderId, channelOrderId, shipmentId } = {}) {
     if (!this.enabled) {
       return { success: false, code: 'SHIPROCKET_DISABLED', message: 'Shiprocket is disabled' };
     }
@@ -1843,6 +1895,88 @@ class ShiprocketService {
         });
       }
     }
+
+    // Fallback: local panel may only have shipment_id after AWB wipe / cancel-rebook.
+    const sid = this.parseNumericShipmentId(shipmentId);
+    if (sid) {
+      try {
+        const data = await this.requestWithAuth({
+          method: 'get',
+          url: `${this.baseURL}/external/shipments/${encodeURIComponent(sid)}`,
+          timeout: 20000
+        });
+        if (data) {
+          const root = ShiprocketService.normalizeForwardOrderRoot(data);
+          const asOrderLike =
+            root && (root.id || root.order_id || root.shipments)
+              ? root
+              : {
+                  shipment_id: sid,
+                  shipments: root && typeof root === 'object' ? root : { id: sid },
+                  awb: root?.awb || root?.awb_code || null,
+                  awb_code: root?.awb_code || root?.awb || null,
+                  courier_name: root?.courier_name || null,
+                  status: root?.status || root?.shipment_status || null,
+                  status_code: root?.status_code || null,
+                  label_url: root?.label_url || null,
+                  manifest_url: root?.manifest_url || null,
+                  pickup_scheduled_date: root?.pickup_scheduled_date || null,
+                  pickup_status: root?.pickup_status || null,
+                  pickup_id: root?.pickup_id || null
+                };
+          const snapshot = ShiprocketService.extractForwardOrderSnapshot(asOrderLike);
+          if (snapshot && (snapshot.awbCode || snapshot.shipmentId || snapshot.shiprocketOrderId)) {
+            if (!snapshot.shipmentId) snapshot.shipmentId = String(sid);
+            return { success: true, snapshot, raw: root || data, source: 'shipments_show' };
+          }
+        }
+      } catch (err) {
+        logger.warn('[Shiprocket] fetchForwardOrderSnapshot shipments failed', {
+          shipmentId: sid,
+          status: err.response?.status,
+          message: err?.message
+        });
+      }
+
+      // Last resort: tracking-by-shipment often still returns AWB + status when orders/show 404s.
+      try {
+        const track = await this.getTrackingByShipmentId(sid);
+        if (track?.success) {
+          const awbFromTrack = String(
+            track.awbCode || track.trackingNumber || track.awb || ''
+          ).trim();
+          const statusLabel = String(track.currentStatus || track.providerStatus || '').trim();
+          if (awbFromTrack || statusLabel) {
+            const snapshot = ShiprocketService.extractForwardOrderSnapshot({
+              shipment_id: sid,
+              awb: awbFromTrack || null,
+              status: statusLabel || 'assigned',
+              courier_name: track.courier || track.courierName || null
+            });
+            if (snapshot) {
+              if (!snapshot.shipmentId) snapshot.shipmentId = String(sid);
+              if (awbFromTrack) {
+                snapshot.awbCode = awbFromTrack;
+                snapshot.trackingNumber = awbFromTrack;
+              }
+              if (statusLabel) snapshot.providerStatus = statusLabel;
+              return {
+                success: true,
+                snapshot,
+                raw: track,
+                source: 'track_shipment'
+              };
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn('[Shiprocket] fetchForwardOrderSnapshot track-by-shipment failed', {
+          shipmentId: sid,
+          message: err?.message
+        });
+      }
+    }
+
     return {
       success: false,
       code: 'FORWARD_ORDER_LOOKUP_FAILED',
@@ -2383,6 +2517,10 @@ class ShiprocketService {
 
   hasLivePickupQueueSignals(input) {
     return ShiprocketService.hasLivePickupQueueSignals(input);
+  }
+
+  parseAlreadyAssignedAwbFromMessage(message) {
+    return ShiprocketService.parseAlreadyAssignedAwbFromMessage(message);
   }
 
   parsePickupDateFromScheduleResponse(raw, fallbackYmd) {

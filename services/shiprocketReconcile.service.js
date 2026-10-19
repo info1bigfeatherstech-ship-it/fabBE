@@ -375,7 +375,8 @@ async function reconcileOrderFromShiprocket(orderOrId, options = {}) {
   if (mode === 'forward' || mode === 'full') {
     const lookup = await ShiprocketService.fetchForwardOrderSnapshot({
       shiprocketOrderId: si.shiprocketOrderId,
-      channelOrderId: order.orderId
+      channelOrderId: order.orderId,
+      shipmentId: si.shipmentId
     });
     if (!lookup.success || !lookup.snapshot) {
       return {

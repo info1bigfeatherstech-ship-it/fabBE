@@ -608,6 +608,39 @@ async function runShiprocketAssignAwb(order, opts = {}) {
         });
       }
 
+      // SR often returns assign failure while AWB is already live (auto label/pickup).
+      // Hydrate instead of offering a substitute — substitute would create a mess.
+      const Cls = ShiprocketService.constructor || ShiprocketService;
+      const alreadyFromMsg =
+        typeof Cls.parseAlreadyAssignedAwbFromMessage === 'function'
+          ? Cls.parseAlreadyAssignedAwbFromMessage(direct.assign?.message)
+          : null;
+      if (alreadyFromMsg?.awbCode || direct.assign?.alreadyAssigned) {
+        const awbCode = String(
+          alreadyFromMsg?.awbCode || direct.assign?.awbCode || direct.assign?.trackingNumber || ''
+        ).trim();
+        return finishSuccess({
+          assign: {
+            success: true,
+            alreadyAssigned: true,
+            awbCode,
+            trackingNumber: awbCode,
+            courier: direct.assign?.courier || quoted.courierName || null,
+            labelUrl: direct.assign?.labelUrl || null,
+            providerStatus:
+              alreadyFromMsg?.statusLabel ||
+              direct.assign?.providerStatus ||
+              'PICKUP GENERATED',
+            raw: direct.assign?.details || direct.assign?.raw || null,
+            mock: false
+          },
+          courierId: Number(quoted.courierId),
+          courierName: direct.assign?.courier || quoted.courierName,
+          substituted: false,
+          substituteMeta: null
+        });
+      }
+
       if (isWalletAssignFailure(direct.assign)) {
         return {
           success: false,

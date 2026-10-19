@@ -1182,34 +1182,56 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
     const assign = assignRes.assign;
     const courierId = assignRes.courierId;
     const quotedCourierName = String(working.shippingSnapshot?.courierName || '').trim() || null;
+    const alreadyAssigned = Boolean(assign?.alreadyAssigned);
 
-    await applyUpsertShipmentInfo({
-      order: working,
-      shipmentPayload: {
-        ...assign,
-        courier: assign.courier || assignRes.courierName || quotedCourierName,
-        assignedCourierId: String(courierId),
-        shiprocketOrderId: working.shipmentInfo?.shiprocketOrderId || undefined,
-        events: [],
-        pickupDate: null,
-        pickupScheduledAt: null,
-        ...(assignRes.substituted
-          ? {
-              courierAssignNote: assignRes.courierAssignNote,
-              courierSubstitutedFromId: assignRes.courierSubstitutedFromId,
-              courierSubstitutedFromName: assignRes.courierSubstitutedFromName
-            }
+    const shipmentPayload = {
+      ...assign,
+      courier: assign.courier || assignRes.courierName || quotedCourierName,
+      assignedCourierId:
+        courierId != null && Number.isFinite(Number(courierId))
+          ? String(courierId)
+          : working.shipmentInfo?.assignedCourierId || undefined,
+      shiprocketOrderId: working.shipmentInfo?.shiprocketOrderId || undefined,
+      ...(assignRes.substituted
+        ? {
+            courierAssignNote: assignRes.courierAssignNote,
+            courierSubstitutedFromId: assignRes.courierSubstitutedFromId,
+            courierSubstitutedFromName: assignRes.courierSubstitutedFromName
+          }
+        : alreadyAssigned
+          ? {}
           : {
               courierAssignNote: null,
               courierSubstitutedFromId: null,
               courierSubstitutedFromName: null
             })
-      },
-      trigger: 'admin_assign_awb',
+    };
+
+    // Fresh Ship Now clears pickup for a new AWB cycle. Hydrating an AWB that
+    // Shiprocket already booked must NOT wipe label/manifest/pickup state.
+    if (!alreadyAssigned) {
+      shipmentPayload.events = [];
+      shipmentPayload.pickupDate = null;
+      shipmentPayload.pickupScheduledAt = null;
+    } else {
+      const statusHint = String(assign.providerStatus || '').toUpperCase();
+      if (
+        !working.shipmentInfo?.pickupScheduledAt &&
+        (/PICKUP\s*GENERATED|PICKUP\s*SCHEDULED|MANIFEST|QUEUE/i.test(statusHint) ||
+          ShiprocketService.isPickupAlreadyScheduledMessage(statusHint))
+      ) {
+        shipmentPayload.pickupScheduledAt = new Date();
+      }
+    }
+
+    await applyUpsertShipmentInfo({
+      order: working,
+      shipmentPayload,
+      trigger: alreadyAssigned ? 'admin_assign_awb_hydrate' : 'admin_assign_awb',
       allowOrderStatusUpdate: false
     });
 
-    await syncShipmentFromShiprocket(working, 'admin_assign_awb_sync');
+    await syncShipmentFromShiprocket(working, alreadyAssigned ? 'admin_assign_awb_hydrate_sync' : 'admin_assign_awb_sync');
 
     let fresh = await Order.findOne({ orderId: working.orderId });
     if (fresh) {
@@ -1276,9 +1298,12 @@ async function runAssignShipFromOrder(order, courierIdOverride, opts = {}) {
 
     return {
       success: true,
-      message: assignRes.substituted
-        ? `Courier assigned (substituted): ${assignRes.courierName || assign.courier || 'AWB generated'} (customer bill unchanged)`
-        : 'Courier assigned and AWB generated',
+      alreadyAssigned: alreadyAssigned || undefined,
+      message: alreadyAssigned
+        ? `AWB already on Shiprocket (${assign.awbCode || assign.trackingNumber}). Local shipment restored — refresh if needed.`
+        : assignRes.substituted
+          ? `Courier assigned (substituted): ${assignRes.courierName || assign.courier || 'AWB generated'} (customer bill unchanged)`
+          : 'Courier assigned and AWB generated',
       courierId,
       courierSubstituted: Boolean(assignRes.substituted),
       courierAssignNote: assignRes.courierAssignNote || null,

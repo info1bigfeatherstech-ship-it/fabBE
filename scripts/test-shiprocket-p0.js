@@ -99,6 +99,22 @@ function testPickupAlreadyScheduledMessage() {
   assert.strictEqual(ShiprocketService.isPickupAlreadyScheduledMessage('Invalid date'), false);
 }
 
+function testParseAlreadyAssignedAwbFromMessage() {
+  const parsed = ShiprocketService.parseAlreadyAssignedAwbFromMessage(
+    'AWB is already assigned with awb - 14326361684789 and status - PICKUP GENERATED Customer order total is not changed.'
+  );
+  assert.ok(parsed);
+  assert.strictEqual(parsed.awbCode, '14326361684789');
+  assert.ok(/PICKUP\s*GENERATED/i.test(String(parsed.statusLabel || '')));
+  assert.strictEqual(ShiprocketService.parseAlreadyAssignedAwbFromMessage('Courier unavailable'), null);
+  assert.strictEqual(
+    shiprocketInstance.parseAlreadyAssignedAwbFromMessage(
+      'AWB is already assigned with awb - 999 and status - ASSIGNED'
+    ).awbCode,
+    '999'
+  );
+}
+
 function testParsePickupDateFromScheduleResponse() {
   const pickupYmd = nearFuturePickupYmd();
   const fallbackYmd = nearFuturePickupYmd(6);
@@ -693,6 +709,7 @@ function run() {
   testPickupScheduledWithoutAwbIsStaleCycle();
   testMirrorProviderStatusWhenPickupScheduled();
   testPickupAlreadyScheduledMessage();
+  testParseAlreadyAssignedAwbFromMessage();
   testParsePickupDateFromScheduleResponse();
   testParseNumericShiprocketOrderId();
   testShippingLabelVsInvoiceUrl();
