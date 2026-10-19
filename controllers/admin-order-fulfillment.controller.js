@@ -539,9 +539,25 @@ async function applyPickupScheduleOutcome(order, { sched, requestedPickupDate, t
     const synced = await syncShipmentFromShiprocket(order, `${trigger || 'admin_schedule_pickup'}_already`);
     let fresh = await Order.findOne({ orderId: order.orderId });
     const snap = synced.snapshot;
-    const opsState = fresh ? computeOpsState(fresh) : null;
 
-    if (snap?.pickupScheduled === false || opsState === 'AWB_ASSIGNED') {
+    const liveAwb = String(
+      snap?.awbCode ||
+        fresh?.shipmentInfo?.awbCode ||
+        fresh?.shipmentInfo?.trackingNumber ||
+        order?.shipmentInfo?.awbCode ||
+        order?.shipmentInfo?.trackingNumber ||
+        ''
+    ).trim();
+    const livePickupId = String(
+      snap?.shiprocketPickupId || fresh?.shipmentInfo?.shiprocketPickupId || ''
+    ).trim();
+
+    /**
+     * SR auto-queues pickup after label/manifest; schedule API then returns
+     * "Already in Pickup Queue" while orders/show may still say "assigned".
+     * Clear ONLY when there is no live AWB — never because opsState is AWB_ASSIGNED.
+     */
+    if (!liveAwb) {
       await ensureForwardPickupStateForSchedule(fresh || order, `${trigger || 'admin_schedule_pickup'}_clear_stale`);
       fresh = await Order.findOne({ orderId: order.orderId });
       return {
@@ -560,20 +576,36 @@ async function applyPickupScheduleOutcome(order, { sched, requestedPickupDate, t
       synced.pickupDate ||
       fresh?.shipmentInfo?.pickupDate ||
       null;
-    if (savedDate && fresh) {
+
+    if (fresh) {
+      const shipmentPayload = {
+        pickupScheduledAt: fresh.shipmentInfo?.pickupScheduledAt || new Date(),
+        lastPickupError: null
+      };
+      if (savedDate) shipmentPayload.pickupDate = savedDate;
+      if (livePickupId && !fresh.shipmentInfo?.shiprocketPickupId) {
+        shipmentPayload.shiprocketPickupId = livePickupId;
+      }
+      const mirroredStatus = String(snap?.providerStatus || '').trim();
+      if (mirroredStatus) {
+        shipmentPayload.providerStatus = mirroredStatus;
+      } else if (
+        snap?.pickupScheduled === true ||
+        livePickupId ||
+        ShiprocketService.isPickupAlreadyScheduledMessage(schedMsg)
+      ) {
+        shipmentPayload.providerStatus = 'PICKUP SCHEDULED';
+      }
+
       await applyUpsertShipmentInfo({
         order: fresh,
-        shipmentPayload: {
-          pickupDate: savedDate,
-          pickupScheduledAt: fresh.shipmentInfo?.pickupScheduledAt || new Date(),
-          lastPickupError: null,
-          providerStatus: snap?.providerStatus || fresh.shipmentInfo?.providerStatus
-        },
+        shipmentPayload,
         trigger: trigger || 'admin_schedule_pickup_already',
         allowOrderStatusUpdate: false
       });
       await evaluateAndPersistShipmentOps(fresh, { source: trigger || 'admin_schedule_pickup_already' });
     }
+
     return {
       success: true,
       skipped: true,

@@ -339,6 +339,47 @@ function testAwbAssignedIgnoresStalePickupFieldsAfterReship() {
   assert.strictEqual(snap.providerSnapshot.pickupScheduled, false);
 }
 
+/** Auto-queue on SR: status still "assigned" but pickup is live (SRPID / PICKUP SCHEDULED). */
+function testAssignedWithLivePickupQueueIsBooked() {
+  const Cls = shiprocketInstance.constructor;
+  assert.strictEqual(
+    Cls.hasLivePickupQueueSignals({
+      statusLabel: 'assigned',
+      pickupStatusText: 'For 18 May 2026'
+    }),
+    false
+  );
+  assert.strictEqual(
+    Cls.hasLivePickupQueueSignals({
+      statusLabel: 'assigned',
+      shiprocketPickupId: 'SRPID-53432712'
+    }),
+    true
+  );
+
+  const withPickupId = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1653461153,
+    shipment_id: 1653461153,
+    status: 'assigned',
+    awb: '14326361684789',
+    courier_name: 'Xpressbees Surface 2kg',
+    pickup_id: 'SRPID-53432712',
+    pickup_status: 'For 19 Oct 2026'
+  });
+  assert.strictEqual(withPickupId.pickupScheduled, true);
+  assert.strictEqual(withPickupId.awbCode, '14326361684789');
+  assert.strictEqual(withPickupId.shiprocketPickupId, 'SRPID-53432712');
+
+  const withPickupStatus = ShiprocketService.extractForwardOrderSnapshot({
+    id: 1653461153,
+    shipment_id: 1653461153,
+    status: 'AWB Assigned',
+    awb: '14326361684789',
+    pickup_status: 'PICKUP SCHEDULED For 19 Oct 2026'
+  });
+  assert.strictEqual(withPickupStatus.pickupScheduled, true);
+}
+
 function testMirrorProviderStatusWhenPickupScheduled() {
   const status = ShiprocketService.resolveMirrorProviderStatusFromOrderShow(
     {
@@ -647,6 +688,7 @@ function run() {
   testExtractForwardOrderSnapshot();
   testExtractForwardOrderAutoCancelSnapshot();
   testAwbAssignedIgnoresStalePickupFieldsAfterReship();
+  testAssignedWithLivePickupQueueIsBooked();
   testForwardProgressIgnoresStalePickupCancelledInResetDetection();
   testPickupScheduledWithoutAwbIsStaleCycle();
   testMirrorProviderStatusWhenPickupScheduled();

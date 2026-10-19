@@ -1276,6 +1276,22 @@ class ShiprocketService {
       statusLabel
     );
 
+    const pickupStatusText = [root.pickup_status, sh0.pickup_status]
+      .filter(Boolean)
+      .map((x) => String(x).trim())
+      .join(' ');
+
+    /**
+     * Live queue / booked pickup (auto-schedule on SR after label/manifest).
+     * Must NOT match bare leftover "For 18 May 2026" after re-ship (AWB Assigned + stale date).
+     */
+    const livePickupQueueSignals = ShiprocketService.hasLivePickupQueueSignals({
+      statusLabel,
+      pickupStatusText,
+      shiprocketPickupId,
+      signalTexts
+    });
+
     let effectivePickupDate = pickupDate;
     let pickupScheduled;
     let resetDetected = resetInfo.resetDetected;
@@ -1286,6 +1302,14 @@ class ShiprocketService {
       forwardClass === CLASSIFICATION.MANIFEST
     ) {
       pickupScheduled = Boolean(trimmedAwb);
+    } else if (
+      forwardClass === CLASSIFICATION.AWB_ASSIGNED &&
+      trimmedAwb &&
+      livePickupQueueSignals &&
+      !resetInfo.resetDetected
+    ) {
+      // SR often lags label as "assigned" while pickup is already in queue / SRPID exists.
+      pickupScheduled = true;
     } else if (
       forwardClass === CLASSIFICATION.AWB_ASSIGNED ||
       forwardClass === CLASSIFICATION.PROVIDER_RESET ||
@@ -1396,6 +1420,28 @@ class ShiprocketService {
       /in\s+pickup\s+queue/.test(msg) ||
       /pickup\s+queue/.test(msg) ||
       /pickup\s+scheduled/.test(msg)
+    );
+  }
+
+  /**
+   * True when Shiprocket signals a live pickup booking/queue (not bare leftover "For <date>"
+   * text that can linger after cancel → re-AWB).
+   * @param {{ statusLabel?: string|null, pickupStatusText?: string|null, shiprocketPickupId?: string|null, signalTexts?: string[] }} input
+   */
+  static hasLivePickupQueueSignals(input = {}) {
+    if (input.shiprocketPickupId && String(input.shiprocketPickupId).trim()) {
+      return true;
+    }
+    const parts = [
+      input.statusLabel,
+      input.pickupStatusText,
+      ...(Array.isArray(input.signalTexts) ? input.signalTexts : [])
+    ]
+      .filter(Boolean)
+      .map((x) => String(x));
+    if (!parts.length) return false;
+    return /pickup\s*scheduled|pickup\s*generated|in\s+pickup\s+queue|pickup\s*queued|\bmanifested\b|srpid[-\s]?\d+/i.test(
+      parts.join(' ')
     );
   }
 
@@ -2333,6 +2379,10 @@ class ShiprocketService {
 
   isPickupAlreadyScheduledMessage(message) {
     return ShiprocketService.isPickupAlreadyScheduledMessage(message);
+  }
+
+  hasLivePickupQueueSignals(input) {
+    return ShiprocketService.hasLivePickupQueueSignals(input);
   }
 
   parsePickupDateFromScheduleResponse(raw, fallbackYmd) {
