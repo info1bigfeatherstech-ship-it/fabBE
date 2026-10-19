@@ -195,7 +195,17 @@ async function resolveManifestUrlForOrder(order) {
     details: {
       generateMessage: generated.message || null,
       printMessage: printed.message || null,
-      alreadyGenerated
+      printSource: printed.source || null,
+      printAttempts: printed.attempts || null,
+      alreadyGenerated,
+      // Truncated raw helps diagnose SR response shape without dumping huge payloads.
+      printRawPreview:
+        printed.raw != null
+          ? String(typeof printed.raw === 'string' ? printed.raw : JSON.stringify(printed.raw)).slice(
+              0,
+              600
+            )
+          : null
     }
   };
 }

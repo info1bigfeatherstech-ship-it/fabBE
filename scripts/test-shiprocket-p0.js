@@ -201,6 +201,15 @@ function testManifestUrlExtraction() {
     }),
     null
   );
+  // Panel-style scheme-relative CDN link
+  assert.strictEqual(
+    Cls.extractManifestUrl({ manifest_url: '//cdn.shiprocket.in/manifest/panel.pdf' }),
+    'https://cdn.shiprocket.in/manifest/panel.pdf'
+  );
+  assert.strictEqual(
+    Cls.extractManifestUrl({ data: ['https://cdn.shiprocket.in/manifests/arr.pdf'] }),
+    'https://cdn.shiprocket.in/manifests/arr.pdf'
+  );
   assert.strictEqual(Cls.isManifestAlreadyGeneratedMessage('Manifest already generated'), true);
   assert.strictEqual(Cls.isManifestAlreadyGeneratedMessage('Manifest already exists for shipment'), true);
   assert.strictEqual(Cls.isManifestAlreadyGeneratedMessage('Courier unavailable'), false);

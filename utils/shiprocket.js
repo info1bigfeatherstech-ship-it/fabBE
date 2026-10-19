@@ -2742,12 +2742,29 @@ class ShiprocketService {
     return { ok: true, date: ymd, preferences };
   }
 
+  /** Normalize Shiprocket CDN / scheme-relative links to https URLs. */
+  static coerceHttpUrl(value) {
+    if (value == null) return null;
+    if (Array.isArray(value)) {
+      for (const row of value) {
+        const u = ShiprocketService.coerceHttpUrl(row);
+        if (u) return u;
+      }
+      return null;
+    }
+    const s = String(value).trim();
+    if (!s) return null;
+    if (/^https?:\/\//i.test(s)) return s;
+    if (/^\/\//.test(s)) return `https:${s}`;
+    return null;
+  }
+
   /** Collect http(s) strings from nested Shiprocket JSON (bounded depth). */
   static collectHttpsUrls(data, out = [], depth = 0) {
     if (depth > 10 || data == null) return out;
     if (typeof data === 'string') {
-      const s = data.trim();
-      if (/^https?:\/\//i.test(s)) out.push(s);
+      const u = ShiprocketService.coerceHttpUrl(data);
+      if (u) out.push(u);
       return out;
     }
     if (Array.isArray(data)) {
@@ -2762,7 +2779,7 @@ class ShiprocketService {
 
   static extractManifestUrl(data) {
     if (!data) return null;
-    if (typeof data === 'string' && /^https?:\/\//i.test(data)) return data.trim();
+    if (typeof data === 'string') return ShiprocketService.coerceHttpUrl(data);
     if (Array.isArray(data)) {
       for (const row of data) {
         const u = ShiprocketService.extractManifestUrl(row);
@@ -2771,19 +2788,22 @@ class ShiprocketService {
       return null;
     }
     if (typeof data !== 'object') return null;
-    const direct =
-      data.url ||
-      data.manifest_url ||
-      data.manifestUrl ||
-      data.file_url ||
-      data.pdf_url ||
-      data.download_url ||
-      (Array.isArray(data.data) && typeof data.data[0] === 'string' ? data.data[0] : null) ||
-      (data.data && typeof data.data === 'object'
-        ? data.data.url || data.data.manifest_url || data.data.file_url
-        : null);
-    if (direct && String(direct).trim() && /^https?:\/\//i.test(String(direct).trim())) {
-      return String(direct).trim();
+    const directCandidates = [
+      data.url,
+      data.manifest_url,
+      data.manifestUrl,
+      data.file_url,
+      data.pdf_url,
+      data.download_url,
+      data.pdf,
+      Array.isArray(data.data) ? data.data[0] : null,
+      data.data && typeof data.data === 'object'
+        ? data.data.url || data.data.manifest_url || data.data.file_url || data.data.pdf_url
+        : null
+    ];
+    for (const c of directCandidates) {
+      const u = ShiprocketService.coerceHttpUrl(c);
+      if (u) return u;
     }
     if (data.response) {
       const nested = ShiprocketService.extractManifestUrl(data.response);
@@ -2888,38 +2908,80 @@ class ShiprocketService {
   }
 
   /**
-   * POST /external/orders/print/manifest — print manifest PDF URL (after generate).
+   * One print-manifest HTTP attempt. Does not throw — returns extracted URL or error info.
+   * @private
+   */
+  async _tryManifestPrintRequest({ label, url, body }) {
+    try {
+      const data = await this.requestWithAuth({
+        method: 'post',
+        url,
+        data: body,
+        timeout: 45000
+      });
+      if (!data) {
+        return { label, ok: false, authFailed: true, message: 'Shiprocket auth failed', raw: null };
+      }
+      const manifestUrl = ShiprocketService.extractManifestUrl(data);
+      return {
+        label,
+        ok: true,
+        manifestUrl: manifestUrl || null,
+        raw: data,
+        message: typeof data?.message === 'string' ? data.message : null
+      };
+    } catch (err) {
+      const raw = err.response?.data || null;
+      const fromBody = ShiprocketService.extractManifestUrl(raw);
+      if (fromBody) {
+        return { label, ok: true, manifestUrl: fromBody, raw, message: null };
+      }
+      return {
+        label,
+        ok: false,
+        authFailed: false,
+        message: ShiprocketService.formatAxiosError(err),
+        raw,
+        status: err.response?.status || null
+      };
+    }
+  }
+
+  /**
+   * Print manifest PDF URL after generate.
+   * Tries official `/manifests/print` (panel Download path) then `/orders/print/manifest`.
+   * Always refreshes Shiprocket order id from live snapshot (cancel/rebook-safe).
    */
   async printManifest({ shiprocketOrderId, channelOrderId, shipmentId } = {}) {
     let numericOrderId = this.parseNumericShiprocketOrderId(shiprocketOrderId);
-    if (!numericOrderId && (channelOrderId || shiprocketOrderId || shipmentId)) {
-      const lookup = await this.fetchForwardOrderSnapshot({
-        shiprocketOrderId,
-        channelOrderId,
-        shipmentId
-      });
-      if (lookup.success && lookup.snapshot?.shiprocketOrderId) {
-        numericOrderId = this.parseNumericShiprocketOrderId(lookup.snapshot.shiprocketOrderId);
-      }
-      // Snapshot may already carry manifest_url from panel / shipments show.
-      if (lookup.success) {
-        const fromSnap =
-          lookup.snapshot?.manifestUrl ||
-          ShiprocketService.extractManifestUrl(lookup.raw) ||
-          null;
-        if (fromSnap) {
-          return {
-            success: true,
-            manifestUrl: String(fromSnap).trim(),
-            shiprocketOrderId: numericOrderId ? String(numericOrderId) : null,
-            raw: lookup.raw,
-            mock: false,
-            source: 'snapshot'
-          };
-        }
+    const sid = this.parseNumericShipmentId(shipmentId);
+
+    // Always refresh from SR — local shiprocketOrderId can be stale after cancel/rebook/hydrate.
+    const lookup = await this.fetchForwardOrderSnapshot({
+      shiprocketOrderId,
+      channelOrderId,
+      shipmentId
+    });
+    if (lookup.success) {
+      const liveId = this.parseNumericShiprocketOrderId(lookup.snapshot?.shiprocketOrderId);
+      if (liveId) numericOrderId = liveId;
+      const fromSnap =
+        lookup.snapshot?.manifestUrl ||
+        ShiprocketService.extractManifestUrl(lookup.raw) ||
+        null;
+      if (fromSnap) {
+        return {
+          success: true,
+          manifestUrl: String(fromSnap).trim(),
+          shiprocketOrderId: numericOrderId ? String(numericOrderId) : null,
+          raw: lookup.raw,
+          mock: false,
+          source: 'snapshot'
+        };
       }
     }
-    if (!numericOrderId) {
+
+    if (!numericOrderId && !sid) {
       return {
         success: false,
         code: 'SHIPROCKET_ORDER_ID_REQUIRED',
@@ -2930,47 +2992,98 @@ class ShiprocketService {
       return {
         success: true,
         mock: true,
-        manifestUrl: `https://example.invalid/mock-manifest-order-${numericOrderId}.pdf`,
-        raw: { mock: true }
+        manifestUrl: `https://example.invalid/mock-manifest-order-${numericOrderId || sid}.pdf`,
+        raw: { mock: true },
+        shiprocketOrderId: numericOrderId ? String(numericOrderId) : null
       };
     }
-    try {
-      const data = await this.requestWithAuth({
-        method: 'post',
-        url: `${this.baseURL}/external/orders/print/manifest`,
-        data: { order_ids: [numericOrderId] },
-        timeout: 45000
+
+    /** @type {Array<{label:string,url:string,body:object}>} */
+    const attempts = [];
+    // Official helpsheet: POST /external/manifests/print → PDF URL (same as panel Download).
+    if (numericOrderId) {
+      attempts.push({
+        label: 'manifests_print_order_ids',
+        url: `${this.baseURL}/external/manifests/print`,
+        body: { order_ids: [numericOrderId] }
       });
-      if (!data) {
-        return { success: false, code: 'SHIPROCKET_AUTH_FAILED', message: 'Shiprocket auth failed' };
+    }
+    if (sid) {
+      attempts.push({
+        label: 'manifests_print_shipment_id',
+        url: `${this.baseURL}/external/manifests/print`,
+        body: { shipment_id: [sid] }
+      });
+    }
+    // Legacy / SDK alias.
+    if (numericOrderId) {
+      attempts.push({
+        label: 'orders_print_manifest',
+        url: `${this.baseURL}/external/orders/print/manifest`,
+        body: { order_ids: [numericOrderId] }
+      });
+    }
+
+    const attemptResults = [];
+    let lastOkRaw = null;
+    let lastOkMessage = null;
+    for (const attempt of attempts) {
+      const result = await this._tryManifestPrintRequest(attempt);
+      attemptResults.push({
+        label: result.label,
+        ok: result.ok,
+        hasUrl: Boolean(result.manifestUrl),
+        message: result.message || null,
+        status: result.status || null
+      });
+      if (result.ok) {
+        lastOkRaw = result.raw;
+        lastOkMessage = result.message || lastOkMessage;
       }
-      const manifestUrl = ShiprocketService.extractManifestUrl(data);
-      return {
-        success: true,
-        manifestUrl: manifestUrl || null,
-        shiprocketOrderId: String(numericOrderId),
-        raw: data,
-        mock: false
-      };
-    } catch (err) {
-      const fromBody = ShiprocketService.extractManifestUrl(err.response?.data);
-      if (fromBody) {
+      if (result.manifestUrl) {
         return {
           success: true,
-          manifestUrl: fromBody,
-          shiprocketOrderId: String(numericOrderId),
-          raw: err.response?.data || null,
-          mock: false
+          manifestUrl: String(result.manifestUrl).trim(),
+          shiprocketOrderId: numericOrderId ? String(numericOrderId) : null,
+          raw: result.raw,
+          mock: false,
+          source: result.label,
+          attempts: attemptResults
         };
       }
-      logger.error('[Shiprocket] printManifest failed:', err.response?.data || err.message);
+    }
+
+    const lastErr = [...attemptResults].reverse().find((a) => !a.ok && a.message);
+    const anyOk = attemptResults.some((a) => a.ok);
+
+    // Soft miss: HTTP OK but empty body (panel already generated) —
+    // resolveManifestUrlForOrder surfaces MANIFEST_URL_MISSING with attempt details.
+    if (anyOk) {
+      logger.warn('[Shiprocket] printManifest returned no URL', {
+        shiprocketOrderId: numericOrderId,
+        shipmentId: sid,
+        attempts: attemptResults
+      });
       return {
-        success: false,
-        code: 'MANIFEST_PRINT_FAILED',
-        message: ShiprocketService.formatAxiosError(err),
-        details: err.response?.data || null
+        success: true,
+        manifestUrl: null,
+        shiprocketOrderId: numericOrderId ? String(numericOrderId) : null,
+        raw: lastOkRaw,
+        mock: false,
+        message: lastOkMessage,
+        attempts: attemptResults,
+        source: 'print_empty'
       };
     }
+
+    logger.error('[Shiprocket] printManifest failed all attempts', { attempts: attemptResults });
+    return {
+      success: false,
+      code: 'MANIFEST_PRINT_FAILED',
+      message: lastErr?.message || 'Shiprocket print manifest failed',
+      details: { attempts: attemptResults },
+      attempts: attemptResults
+    };
   }
 
   /**
