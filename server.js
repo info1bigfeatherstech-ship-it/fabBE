@@ -75,6 +75,10 @@ const {
   publicRouter: festiveOfferPublicRoutes,
   adminRouter: festiveOfferAdminRoutes
 } = require('./routes/festive-offer.route');
+const {
+  publicRouter: saleLivePublicRoutes,
+  adminRouter: saleLiveAdminRoutes
+} = require('./routes/sale-live.route');
 const userCouponRoutes = require('./routes/user-coupons.route');
 const wholesalerRoutes = require('./routes/wholesaler.route');
 const productReviewPublicRoutes = require('./routes/product-review.public.route');
@@ -792,6 +796,8 @@ app.use('/api/admin/free-shipping-offers', adminFreeShippingOfferRoutes);
 app.use('/api/admin/free-gift-offers', adminFreeGiftOfferRoutes);
 app.use('/api/marketing/festive-offer', festiveOfferPublicRoutes);
 app.use('/api/admin/marketing/festive-offer', festiveOfferAdminRoutes);
+app.use('/api/marketing/sale-live', saleLivePublicRoutes);
+app.use('/api/admin/marketing/sale-live', saleLiveAdminRoutes);
 app.use('/api/coupons', userCouponRoutes);
 app.use('/api/push', limiters.pushWrite, pushRoutes);
 app.use('/api/notifications', limiters.write, userNotificationRoutes);
