@@ -13,6 +13,7 @@ const {
   MAX_BULK_RECIPIENTS: MAX_BULK_PUSH_RECIPIENTS
 } = require('../services/cartReminderPush.service');
 const leadsPushSettingsService = require('../services/leadsPushSettings.service');
+const engagementAnalytics = require('../services/engagementAnalytics.service');
 
 const scopedUserQueryFromReq = (req) => req.adminScope?.userMatch || { userType: 'user' };
 const scopeLabelFromReq = (req) => req.adminScope?.storefront || 'ecomm';
@@ -101,7 +102,7 @@ function formatAdminCart(cart, extra = {}) {
 // =============================================
 const getAllUsers = async (req, res) => {
   try {
-    let { page = 1, limit = 20, search = '', role = '' } = req.query;
+    let { page = 1, limit = 20, search = '', role = '', engagement = 'all' } = req.query;
 
     page = Math.max(1, Number(page));
     limit = Math.min(100, Math.max(1, Number(limit)));
@@ -109,18 +110,26 @@ const getAllUsers = async (req, res) => {
 
     // Build query (always scoped by admin storefront)
     let query = scopedUserQueryFromReq(req);
-    
+
     if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } }
-      ];
+      query = mergeAnd(query, {
+        $or: [
+          { name: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } },
+          { phone: { $regex: search, $options: 'i' } }
+        ]
+      });
     }
-    
+
     if (role && ['user', 'wholesaler', 'admin'].includes(role)) {
       query = mergeAnd(query, { role });
     }
+
+    const engagementApplied = await engagementAnalytics.applyEngagementFilter(
+      query,
+      engagement
+    );
+    query = engagementApplied.query;
 
     const [users, total] = await Promise.all([
       User.find(query)
@@ -132,33 +141,37 @@ const getAllUsers = async (req, res) => {
       User.countDocuments(query)
     ]);
 
-    // Get additional stats for each user
+    const pushMap = await engagementAnalytics.getPushStatsByUserIds(users.map((u) => u._id));
+
+    // Get additional stats for each user (cart / wishlist unchanged)
     const usersWithStats = await Promise.all(users.map(async (user) => {
-      // Get cart count
       const cartt = await findCartForStorefront(user._id, resolveCustomerStorefrontFromReq(req));
       const cartItemsCount = cartt?.items?.length || 0;
-      
-      // Get wishlist count
+
       const wishlist = await Wishlist.findOne({ userId: user._id });
       const wishlistCount = wishlist?.products?.length || 0;
-      
-      return {
-        ...user,
-        cartItemsCount,
-        wishlistCount,
-        lastActive: user.updatedAt || user.createdAt
-      };
+
+      return engagementAnalytics.attachEngagementFields(
+        {
+          ...user,
+          cartItemsCount,
+          wishlistCount,
+          lastActive: user.updatedAt || user.createdAt
+        },
+        pushMap
+      );
     }));
 
     return res.status(200).json({
       success: true,
       scope: scopeLabelFromReq(req),
+      engagement: engagementApplied.engagement,
       data: usersWithStats,
       pagination: {
         total,
         page,
         limit,
-        totalPages: Math.ceil(total / limit)
+        totalPages: Math.ceil(total / limit) || 0
       }
     });
 
@@ -167,6 +180,28 @@ const getAllUsers = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Error fetching users',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Engagement summary for Leads → Customers stat cards.
+ * GET /api/admin/analytics/engagement/summary
+ */
+const getEngagementSummary = async (req, res) => {
+  try {
+    const summary = await engagementAnalytics.getEngagementSummary(scopedUserQueryFromReq(req));
+    return res.status(200).json({
+      success: true,
+      scope: scopeLabelFromReq(req),
+      data: summary
+    });
+  } catch (error) {
+    console.error('Get engagement summary error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error fetching engagement summary',
       error: error.message
     });
   }
@@ -189,7 +224,7 @@ const exportUsersExcel = async (req, res) => {
       })
     )
       .select(
-        'name email phone userType role status isEmailVerified isPhoneVerified registrationMethod isProfileComplete lastLoginMethod createdAt updatedAt'
+        'name email phone userType role status isEmailVerified isPhoneVerified registrationMethod isProfileComplete lastLoginMethod createdAt updatedAt pwaInstall'
       )
       .sort({ createdAt: -1 })
       .lean();
@@ -200,6 +235,8 @@ const exportUsersExcel = async (req, res) => {
         message: 'No customers found to export.'
       });
     }
+
+    const pushMap = await engagementAnalytics.getPushStatsByUserIds(users.map((u) => u._id));
 
     const HEADERS = [
       'Name',
@@ -213,6 +250,11 @@ const exportUsersExcel = async (req, res) => {
       'Registration Method',
       'Profile Complete',
       'Last Login Method',
+      'Notifications',
+      'Push Device Count',
+      'Push Subscribed At',
+      'PWA Installed',
+      'PWA Installed At',
       'Created At',
       'Updated At'
     ];
@@ -224,21 +266,29 @@ const exportUsersExcel = async (req, res) => {
       return Number.isNaN(d.getTime()) ? '' : d.toISOString();
     };
 
-    const dataRows = users.map((u) => [
-      u.name || '',
-      u.email || '',
-      u.phone || '',
-      u.userType || '',
-      u.role || '',
-      u.status || '',
-      toYesNo(u.isEmailVerified),
-      toYesNo(u.isPhoneVerified),
-      u.registrationMethod || '',
-      toYesNo(u.isProfileComplete),
-      u.lastLoginMethod || '',
-      toIso(u.createdAt),
-      toIso(u.updatedAt)
-    ]);
+    const dataRows = users.map((u) => {
+      const enriched = engagementAnalytics.attachEngagementFields(u, pushMap);
+      return [
+        enriched.name || '',
+        enriched.email || '',
+        enriched.phone || '',
+        enriched.userType || '',
+        enriched.role || '',
+        enriched.status || '',
+        toYesNo(enriched.isEmailVerified),
+        toYesNo(enriched.isPhoneVerified),
+        enriched.registrationMethod || '',
+        toYesNo(enriched.isProfileComplete),
+        enriched.lastLoginMethod || '',
+        enriched.notificationsEnabled ? 'On' : 'Off',
+        enriched.pushDeviceCount || 0,
+        toIso(enriched.pushSubscribedAt),
+        enriched.pwaInstalled ? 'Yes' : 'No',
+        toIso(enriched.pwaInstalledAt),
+        toIso(enriched.createdAt),
+        toIso(enriched.updatedAt)
+      ];
+    });
 
     const wb = XLSX.utils.book_new();
     const sheetData = [HEADERS, ...dataRows];
@@ -312,11 +362,14 @@ const           getUserById = async (req, res) => {
       .populate('products.productId', 'name slug price variants')
       .lean();
 
+    const pushMap = await engagementAnalytics.getPushStatsByUserIds([user._id]);
+    const userWithEngagement = engagementAnalytics.attachEngagementFields(user, pushMap);
+
     return res.status(200).json({
       success: true,
       scope: scopeLabelFromReq(req),
       data: {
-        user,
+        user: userWithEngagement,
         cart: userCart ? formatAdminCart(userCart) : { items: [], totalAmount: 0, itemCount: 0 },
         wishlist: wishlist || { products: [] }
       }
@@ -1089,6 +1142,7 @@ const bulkCartReminderEmail = async (req, res) => {
 
 module.exports = {
   getAllUsers,
+  getEngagementSummary,
   exportUsersExcel,
   getUserById,
   getLeadsPushSettings,

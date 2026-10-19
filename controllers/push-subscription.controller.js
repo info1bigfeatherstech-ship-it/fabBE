@@ -7,6 +7,7 @@ const {
   removePushSubscription,
   getPushStatusForUser,
 } = require('../services/pushSubscription.service');
+const { recordPwaInstall } = require('../services/engagementAnalytics.service');
 
 const getVapidPublicKeyHandler = async (req, res) => {
   try {
@@ -125,9 +126,46 @@ const getPushStatus = async (req, res) => {
   }
 };
 
+/** POST /api/push/pwa-install — idempotent PWA install signal for authenticated users. */
+const reportPwaInstall = async (req, res) => {
+  try {
+    const userId = req.user?._id || req.user?.id || req.userId;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        code: 'AUTH_REQUIRED',
+        message: 'Authentication required',
+      });
+    }
+
+    const platform =
+      req.body && typeof req.body.platform === 'string' ? req.body.platform : null;
+
+    const result = await recordPwaInstall(userId, {
+      platform,
+      userAgent: req.headers['user-agent'] || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: result.firstInstall ? 'PWA install recorded' : 'PWA install confirmed',
+      ...result,
+    });
+  } catch (error) {
+    const code = error.code || 'PWA_INSTALL_FAILED';
+    const status = code === 'AUTH_REQUIRED' ? 401 : code === 'USER_NOT_FOUND' ? 404 : 500;
+    return res.status(status).json({
+      success: false,
+      code,
+      message: error.message || 'Could not record PWA install',
+    });
+  }
+};
+
 module.exports = {
   getVapidPublicKeyHandler,
   subscribePush,
   unsubscribePush,
   getPushStatus,
+  reportPwaInstall,
 };

@@ -252,6 +252,17 @@ const userSchema = new mongoose.Schema(
       pointsBalance: { type: Number, default: 0, min: 0 },
       pointsLifetimeEarned: { type: Number, default: 0, min: 0 },
       pointsLifetimeRedeemed: { type: Number, default: 0, min: 0 }
+    },
+
+    /**
+     * PWA / installed-app signal for Leads → Customers.
+     * “App installed” = installedAt is set (not a bare boolean on User).
+     */
+    pwaInstall: {
+      installedAt: { type: Date, default: null, index: true },
+      lastConfirmedAt: { type: Date, default: null },
+      platform: { type: String, default: null, trim: true, maxlength: 64 },
+      userAgent: { type: String, default: null, trim: true, maxlength: 512 }
     }
   },
   { timestamps: true }
