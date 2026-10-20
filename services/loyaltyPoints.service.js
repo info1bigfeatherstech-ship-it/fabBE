@@ -368,10 +368,11 @@ async function applyLedgerDelta({
   next = Math.max(0, next);
 
   user.loyalty.pointsBalance = next;
-  if (delta > 0 && (type === 'earn' || type === 'adjust' || type === 'redeem_restore')) {
+  if (delta > 0 && (type === 'earn' || type === 'adjust' || type === 'redeem_restore' || type === 'referral_reward')) {
     user.loyalty.pointsLifetimeEarned = Math.max(
       0,
-      floorPoints(user.loyalty.pointsLifetimeEarned || 0) + (type === 'earn' ? delta : 0)
+      floorPoints(user.loyalty.pointsLifetimeEarned || 0) +
+        (type === 'earn' || type === 'referral_reward' ? delta : 0)
     );
   }
   if (delta < 0 && type === 'redeem') {
@@ -633,10 +634,17 @@ function scheduleLoyaltyPointsSideEffectsForOrder(order, options = {}) {
     const run = async () => {
       try {
         // Re-load lean flags if needed — work on the in-memory order when possible
+        const referralService = require('./referral.service');
         if (isRto || isReturnRefunded) {
           await clawbackEarnForOrder(order, { reason: isRto ? 'rto' : 'return_refund' });
           await restoreRedeemForOrder(order, { reason: isRto ? 'rto' : 'return_refund' });
-          if (typeof order.save === 'function' && order.isModified?.('loyaltyPoints')) {
+          await referralService.syncReferralForOrder(order, {
+            reason: isRto ? 'rto' : 'return_refund'
+          });
+          if (
+            typeof order.save === 'function' &&
+            (order.isModified?.('loyaltyPoints') || order.isModified?.('appliedReferral'))
+          ) {
             await order.save();
           }
           return;
@@ -644,7 +652,13 @@ function scheduleLoyaltyPointsSideEffectsForOrder(order, options = {}) {
 
         if (unpaidDead && !paidLike) {
           await restoreRedeemForOrder(order, { reason: options.reason || 'unpaid_cancel' });
-          if (typeof order.save === 'function' && order.isModified?.('loyaltyPoints')) {
+          await referralService.syncReferralForOrder(order, {
+            reason: options.reason || 'unpaid_cancel'
+          });
+          if (
+            typeof order.save === 'function' &&
+            (order.isModified?.('loyaltyPoints') || order.isModified?.('appliedReferral'))
+          ) {
             await order.save();
           }
           return;
@@ -652,7 +666,13 @@ function scheduleLoyaltyPointsSideEffectsForOrder(order, options = {}) {
 
         if (paidLike || codDelivered) {
           await creditEarnForOrder(order, { reason: options.reason || 'payment_success' });
-          if (typeof order.save === 'function' && order.isModified?.('loyaltyPoints')) {
+          await referralService.syncReferralForOrder(order, {
+            reason: options.reason || 'payment_success'
+          });
+          if (
+            typeof order.save === 'function' &&
+            (order.isModified?.('loyaltyPoints') || order.isModified?.('appliedReferral'))
+          ) {
             await order.save();
           }
         }
@@ -841,7 +861,11 @@ async function repairUserPointsBalanceFromLedger(userId, { force = false } = {})
         _id: null,
         lifetimeEarned: {
           $sum: {
-            $cond: [{ $eq: ['$type', 'earn'] }, { $max: ['$points', 0] }, 0]
+            $cond: [
+              { $in: ['$type', ['earn', 'referral_reward']] },
+              { $max: ['$points', 0] },
+              0
+            ]
           }
         },
         lifetimeRedeemed: {

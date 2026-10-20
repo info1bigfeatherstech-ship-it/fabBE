@@ -6,7 +6,7 @@ const {
   roundMoney2,
   cartFingerprintFromItems,
   evaluateCartForCheckout,
-  resolveCouponDiscount,
+  resolvePromotionDiscount,
   calculateTax
 } = require('../services/checkoutComputation.service');
 const {
@@ -137,12 +137,12 @@ async function buildFinalTotals({
 
   if (allowDemoMockShipping(req)) {
     const evaluated = await evaluateCartForCheckout(cartDoc, finalUserType, null, storefront);
-    const { discount, appliedCouponCode } = await resolveCouponDiscount(
+    const { discount, appliedCouponCode, appliedReferral } = await resolvePromotionDiscount(
       couponCode,
       evaluated.subtotal,
       finalUserType,
       null,
-      { consumeUsage: false, userId: resolvedUserId }
+      { consumeUsage: false, userId: resolvedUserId, storefront }
     );
     let deliveryCharges = roundMoney2(35 + Math.floor(Math.random() * 56));
     const originalDeliveryCharges = deliveryCharges;
@@ -182,6 +182,7 @@ async function buildFinalTotals({
         ...evaluated,
         discount,
         appliedCouponCode,
+        appliedReferral: appliedReferral || null,
         deliveryCharges,
         tax,
         freeShippingApplied,
@@ -443,7 +444,8 @@ exports.quoteCheckout = async (req, res) => {
         taxes: finalTotals.tax,
         amountPayable: finalTotals.totalAmount,
         includesShippingAndHandling: true,
-        couponApplied: finalTotals.appliedCouponCode,
+        couponApplied: finalTotals.appliedCouponCode || null,
+        referralApplied: finalTotals.appliedReferral?.code || null,
         ...buildLoyaltyClientFields(finalTotals),
         ...buildFreeShippingClientFields(finalTotals)
       });
@@ -569,7 +571,8 @@ exports.quoteCheckout = async (req, res) => {
       taxes: finalTotals.tax,
       amountPayable: finalTotals.totalAmount,
       includesShippingAndHandling: true,
-      couponApplied: finalTotals.appliedCouponCode,
+      couponApplied: finalTotals.appliedCouponCode || null,
+      referralApplied: finalTotals.appliedReferral?.code || null,
       quoteExpiresAt: quoteExpiresAt.toISOString(),
       cartFingerprint: fp,
       demoMockShipping: Boolean(allowDemoMockShipping(req)),

@@ -14,6 +14,7 @@ const FIRST_ORDER_COUPON_CODE = 'WELC01';
 
 const normalizeCouponCode = (code) => String(code || '').trim().toUpperCase();
 const isFirstOrderCoupon = (coupon) => normalizeCouponCode(coupon?.code) === FIRST_ORDER_COUPON_CODE;
+const isReservedReferralCode = (code) => /^RF-\d+$/i.test(String(code || '').trim());
 
 async function hasPlacedAnyOrder(userId) {
     if (!userId) return false;
@@ -53,6 +54,13 @@ const createCoupon = async (req, res) => {
             expiryDate,
             isActive
         } = req.body;
+
+        if (isReservedReferralCode(code)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Codes like RF-001 are reserved for customer referrals'
+            });
+        }
 
         // Check if coupon code already exists
         const existingCoupon = await Coupon.findOne({ code: code.toUpperCase() });
@@ -173,6 +181,12 @@ const updateCoupon = async (req, res) => {
         // Don't allow code change if already exists
         if (updates.code) {
             updates.code = updates.code.toUpperCase();
+            if (isReservedReferralCode(updates.code)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Codes like RF-001 are reserved for customer referrals'
+                });
+            }
             const existing = await Coupon.findOne({ 
                 code: updates.code, 
                 _id: { $ne: id } 
@@ -292,6 +306,15 @@ const validateCoupon = async (req, res) => {
 
         if (!couponCode) {
             return couponError(res, 400, 'COUPON_CODE_REQUIRED', 'Coupon code is required');
+        }
+
+        if (isReservedReferralCode(couponCode)) {
+            return couponError(
+                res,
+                400,
+                'COUPON_IS_REFERRAL',
+                'That is a referral code. Apply it as a referral at checkout — coupons and referrals cannot be combined.'
+            );
         }
 
         let effectiveSubtotal = Number(subtotal);

@@ -10,7 +10,9 @@ const ENTRY_TYPES = [
   'redeem_restore',
   'earn_clawback',
   'expire',
-  'adjust'
+  'adjust',
+  'referral_reward',
+  'referral_clawback'
 ];
 
 const loyaltyPointLedgerSchema = new mongoose.Schema(

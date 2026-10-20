@@ -354,6 +354,20 @@ const orderSchema = new mongoose.Schema(
         discount: { type: Number, default: 0 }
     },
 
+    appliedReferral: {
+      code: { type: String, default: null },
+      ownerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      discount: { type: Number, default: 0 },
+      discountType: { type: String, default: null },
+      discountValue: { type: Number, default: null },
+      rewardPoints: { type: Number, default: 0 },
+      rewardStatus: {
+        type: String,
+        enum: ['none', 'pending', 'credited', 'voided', 'clawed_back'],
+        default: 'none'
+      }
+    },
+
     /** Auto free-shipping offer applied at checkout (not a coupon code) */
     appliedFreeShippingOffer: {
       offerId: { type: String, default: null },

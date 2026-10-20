@@ -952,6 +952,10 @@ async function previewOrApplyPendingOrderEdit(opts) {
     order.appliedCoupon.discount = priced.discount;
     order.markModified('appliedCoupon');
   }
+  if (order.appliedReferral && typeof order.appliedReferral === 'object' && order.appliedReferral.code) {
+    order.appliedReferral.discount = priced.discount;
+    order.markModified('appliedReferral');
+  }
   order.totalAmount = priced.totalAmount;
   order.shippingSnapshot = priced.shippingSnapshot;
   order.shippingWeightSnapshot = priced.weightSnapshot;

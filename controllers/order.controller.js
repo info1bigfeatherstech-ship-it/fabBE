@@ -51,6 +51,7 @@ const {
     getSettings: getLoyaltyPointsSettings,
     computeEarnPointsForOrder
 } = require('../services/loyaltyPoints.service');
+const referralService = require('../services/referral.service');
 const { buildGstInvoiceViewModel } = require('../utils/gstInvoice');
 const {
     buildShippingWeightSnapshotFromCheckoutLines,
@@ -1009,6 +1010,13 @@ function buildOrderResponsePayload(order, {
             orderIntent: toPublicOrderIntent(order.orderIntent)
         },
         appliedCoupon: appliedCouponCode ?? order.appliedCoupon?.code ?? null,
+        appliedReferral: order.appliedReferral?.code
+            ? {
+                code: order.appliedReferral.code,
+                discount: order.appliedReferral.discount || 0,
+                rewardStatus: order.appliedReferral.rewardStatus || 'pending'
+              }
+            : null,
         razorpayOrder: razorpayOrder ? {
             id: razorpayOrder.id,
             amount: razorpayOrder.amount,
@@ -1567,6 +1575,7 @@ exports.createOrder = async (req, res) => {
             tax,
             discount,
             appliedCouponCode,
+            appliedReferral,
             totalAmount,
             lines,
             loyaltyDiscount,
@@ -1729,6 +1738,25 @@ exports.createOrder = async (req, res) => {
             appliedCoupon: appliedCouponCode
                 ? { code: appliedCouponCode, discount }
                 : { code: null, discount: 0 },
+            appliedReferral: appliedReferral?.code
+                ? {
+                    code: appliedReferral.code,
+                    ownerUserId: appliedReferral.ownerUserId || null,
+                    discount: appliedReferral.discount || discount || 0,
+                    discountType: appliedReferral.discountType || null,
+                    discountValue: appliedReferral.discountValue ?? null,
+                    rewardPoints: appliedReferral.rewardPoints || 0,
+                    rewardStatus: 'pending'
+                  }
+                : {
+                    code: null,
+                    ownerUserId: null,
+                    discount: 0,
+                    discountType: null,
+                    discountValue: null,
+                    rewardPoints: 0,
+                    rewardStatus: 'none'
+                  },
             appliedFreeShippingOffer: (() => {
                 const fs =
                     priced.freeShippingOffer ||
@@ -1870,6 +1898,33 @@ exports.createOrder = async (req, res) => {
                 message: loyaltyErr?.message || String(loyaltyErr)
             });
             throw loyaltyErr;
+        }
+
+        try {
+            if (appliedReferral?.code) {
+                await referralService.reserveRedemptionForOrder(order, appliedReferral, { session });
+            }
+        } catch (referralErr) {
+            if (
+                referralErr?.code === 'REFERRAL_ALREADY_USED' ||
+                referralErr?.code === 'REFERRAL_OWN_CODE' ||
+                referralErr?.code === 'REFERRAL_DISABLED' ||
+                referralErr?.statusCode === 409 ||
+                referralErr?.statusCode === 400
+            ) {
+                throw createCheckoutFlowError({
+                    statusCode: referralErr.statusCode || 409,
+                    code: referralErr.code || 'REFERRAL_ALREADY_USED',
+                    message:
+                        referralErr.message ||
+                        'Referral code could not be applied. Please refresh checkout.'
+                });
+            }
+            logger.error('Referral reserve failed at order create', {
+                orderId: order.orderId,
+                message: referralErr?.message || String(referralErr)
+            });
+            throw referralErr;
         }
 
         if (normalizedPaymentMethod === 'online') {
@@ -3425,7 +3480,7 @@ exports.getUserOrders = async (req, res) => {
         const orders = await Order.find({ userId: req.userId })
             .sort({ createdAt: -1 })
             .select(
-                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount loyaltyPoints appliedCoupon paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes orderIntent shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
+                'orderId totalAmount orderStatus paymentStatus createdAt deliveryCharges tax subtotal discount loyaltyPoints appliedCoupon appliedReferral paymentHoldExpiresAt balanceDueInr amountPaidInr paymentInfo customerFacingNotes orderIntent shipmentInfo.courierCollectableInr shipmentInfo.courierDeliveryInr shipmentInfo.courierFacingTotalInr shipmentInfo.codLockedAt shipmentInfo.codLockSource'
             );
         const normalizedOrders = orders.map((doc) => {
             const plain = doc.toObject();

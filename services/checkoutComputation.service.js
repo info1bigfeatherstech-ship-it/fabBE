@@ -255,6 +255,45 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
   };
 }
 
+async function resolvePromotionDiscount(
+  couponCode,
+  subtotal,
+  finalUserType,
+  session,
+  { consumeUsage, userId, storefront } = {}
+) {
+  const empty = {
+    discount: 0,
+    appliedCouponCode: null,
+    couponDoc: null,
+    appliedReferral: null
+  };
+  const code = String(couponCode || '').trim();
+  if (!code) return empty;
+
+  const referralService = require('./referral.service');
+  if (referralService.isReferralCodeFormat(code)) {
+    const quoted = await referralService.quoteDiscount({
+      code,
+      subtotal,
+      refereeUserId: userId,
+      storefront: storefront || 'ecomm'
+    });
+    return {
+      discount: quoted.discount,
+      appliedCouponCode: null,
+      couponDoc: null,
+      appliedReferral: quoted
+    };
+  }
+
+  const couponResult = await resolveCouponDiscount(couponCode, subtotal, finalUserType, session, {
+    consumeUsage,
+    userId
+  });
+  return { ...couponResult, appliedReferral: null };
+}
+
 async function resolveCouponDiscount(couponCode, subtotal, finalUserType, session, { consumeUsage, userId } = {}) {
   let discount = 0;
   let appliedCouponCode = null;
@@ -342,12 +381,12 @@ async function computeCheckoutTotals({
 }) {
   const evaluated = await evaluateCartForCheckout(cart, finalUserType, session, storefront);
   const resolvedUserId = userId || cart?.userId || null;
-  const { discount, appliedCouponCode } = await resolveCouponDiscount(
+  const { discount, appliedCouponCode, appliedReferral } = await resolvePromotionDiscount(
     couponCode,
     evaluated.subtotal,
     finalUserType,
     session,
-    { consumeUsage: consumeCoupon, userId: resolvedUserId }
+    { consumeUsage: consumeCoupon, userId: resolvedUserId, storefront }
   );
 
   const { attachLoyaltyDiscountToTotals } = require('./loyaltyPoints.service');
@@ -402,6 +441,7 @@ async function computeCheckoutTotals({
         lines: evaluated.lines,
         discount,
         appliedCouponCode,
+        appliedReferral: appliedReferral || null,
         deliveryCharges,
         deliveryMeta,
         tax,
@@ -538,6 +578,7 @@ async function computeCheckoutTotals({
       lines: evaluated.lines,
       discount,
       appliedCouponCode,
+      appliedReferral: appliedReferral || null,
       deliveryCharges,
       deliveryMeta,
       tax,
@@ -579,6 +620,7 @@ module.exports = {
   cartFingerprintFromItems,
   evaluateCartForCheckout,
   resolveCouponDiscount,
+  resolvePromotionDiscount,
   computeCheckoutTotals,
   calculateTax,
   aggregateShipping,

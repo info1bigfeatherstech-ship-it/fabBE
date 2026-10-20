@@ -69,6 +69,8 @@ const adminCouponRoutes = require('./routes/admin-coupons.route');
 const adminLoyaltyBadgeRoutes = require('./routes/admin-loyalty-badges.route');
 const adminLoyaltyPointsRoutes = require('./routes/admin-loyalty-points.route');
 const loyaltyPointsRoutes = require('./routes/loyalty-points.route');
+const adminReferralRoutes = require('./routes/admin-referral.route');
+const referralRoutes = require('./routes/referral.route');
 const adminFreeShippingOfferRoutes = require('./routes/admin-free-shipping-offers.route');
 const adminFreeGiftOfferRoutes = require('./routes/admin-free-gift-offers.route');
 const {
@@ -792,6 +794,8 @@ app.use('/api/admin/coupons', adminCouponRoutes);
 app.use('/api/admin/loyalty-badges', adminLoyaltyBadgeRoutes);
 app.use('/api/admin/loyalty-points', adminLoyaltyPointsRoutes);
 app.use('/api/loyalty-points', loyaltyPointsRoutes);
+app.use('/api/admin/referral', adminReferralRoutes);
+app.use('/api/referral', referralRoutes);
 app.use('/api/admin/free-shipping-offers', adminFreeShippingOfferRoutes);
 app.use('/api/admin/free-gift-offers', adminFreeGiftOfferRoutes);
 app.use('/api/marketing/festive-offer', festiveOfferPublicRoutes);
