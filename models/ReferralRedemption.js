@@ -35,6 +35,12 @@ const referralRedemptionSchema = new mongoose.Schema(
     discountType: { type: String, enum: ['percentage', 'fixed'], default: 'percentage' },
     discountValue: { type: Number, default: 0 },
     rewardPoints: { type: Number, default: 0, min: 0 },
+    /** True after wallet credit (prepaid/partial capture, or COD delivered). */
+    rewardCredited: { type: Boolean, default: false, index: true },
+    rewardSkipReason: { type: String, default: null },
+    /** Last credit/sync outcome for owner activity (never blocks checkout). */
+    lastSyncReason: { type: String, default: null, maxlength: 120 },
+    lastSyncedAt: { type: Date, default: null },
     status: {
       type: String,
       enum: STATUSES,

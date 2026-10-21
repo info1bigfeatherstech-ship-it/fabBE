@@ -363,7 +363,7 @@ const orderSchema = new mongoose.Schema(
       rewardPoints: { type: Number, default: 0 },
       rewardStatus: {
         type: String,
-        enum: ['none', 'pending', 'credited', 'voided', 'clawed_back'],
+        enum: ['none', 'pending', 'credited', 'skipped', 'voided', 'clawed_back'],
         default: 'none'
       }
     },

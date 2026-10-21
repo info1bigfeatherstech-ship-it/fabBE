@@ -3,7 +3,15 @@ const Category = require('../models/Category');
 const ProductTag = require('../models/ProductTag');
 const mongoose = require('mongoose');
 const slugify = require('slugify');
-const { generateSlug, resolveVariantSku, assertSkuAvailable } = require('../utils/productUtils');
+const {
+  generateSlug,
+  resolveVariantSku,
+  assertSkuAvailable,
+  BULK_PRODUCT_TEMPLATE_HEADERS,
+  BULK_PRODUCT_EXPORT_HEADERS,
+  reorderBulkProductRows,
+  patchBulkInstructionColumns
+} = require('../utils/productUtils');
 const {
   uploadToCloudinary,
   deleteFromCloudinary,
@@ -7335,15 +7343,8 @@ const exportProductsCSV = async (req, res) => {
       return res.status(200).json({ success: true, message: 'No products found to export.' });
     }
 
-    // Column headers matching bulk upload template + images field
-    const HEADERS = [
-      'name', 'title', 'description', 'category', 'brand', 'status', 'isfeatured',
-      'basePrice', 'salePrice', 'quantity', 'productCode', 'variantAttributes',
-      'weight', 'length', 'width', 'height',
-      'soldEnabled', 'soldCount', 'fomoEnabled', 'fomoType', 'viewingNow', 'productLeft', 'customMessage',
-      'productAttributes', 'images', 'hsnCode', 'gstRate', 'isFragile',
-      'wholesale', 'wholesaleBase', 'wholesaleSale', 'minimumOrderQuantity', 'countryOfOrigin'
-    ];
+    // Column headers matching bulk upload template (FabUniqo 29 Aug 2026 order)
+    const HEADERS = BULK_PRODUCT_EXPORT_HEADERS;
 
     // Build data rows as array-of-arrays (faster than json2xlsx for large sets)
     const dataRows = [];
@@ -7412,9 +7413,8 @@ const exportProductsCSV = async (req, res) => {
         const minimumOrderQty     = variant && variant.minimumOrderQuantity != null ? variant.minimumOrderQuantity : '';
 
         dataRows.push([
+          productCode,
           product.name        || '',
-          product.title       || '',
-          product.description || '',
           categoryName,
           product.brand       || '',
           product.status      || '',
@@ -7422,7 +7422,6 @@ const exportProductsCSV = async (req, res) => {
           basePrice,
           salePrice,
           quantity,
-          productCode,
           variantAttributes,
           weight,
           dimLength,
@@ -7444,7 +7443,9 @@ const exportProductsCSV = async (req, res) => {
           wholesaleBase,
           wholesaleSale,
           minimumOrderQty,
-          '' // countryOfOrigin — not in current schema
+          '', // countryOfOrigin — not in current schema
+          product.title       || '',
+          product.description || ''
         ]);
       }
     }
@@ -7545,8 +7546,11 @@ const downloadBulkUploadTemplate = async (req, res) => {
       // ── Use SheetJS (xlsx) to read the template file ───────────────────────
       const workbookTemplate = XLSX.readFile(templatePath);
       
-      // 1. Read Instructions
-      const instructionsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Instructions'], { header: 1 });
+      // 1. Read Instructions — keep copy, but column letters follow the live header order
+      const instructionsRows = patchBulkInstructionColumns(
+        XLSX.utils.sheet_to_json(workbookTemplate.Sheets['Instructions'], { header: 1 }),
+        BULK_PRODUCT_TEMPLATE_HEADERS
+      );
       instructionsRows.forEach(row => {
         const fieldName = String(row[1] || '').trim();
         if (['weight', 'length', 'width', 'height'].includes(fieldName)) {
@@ -7578,8 +7582,11 @@ const downloadBulkUploadTemplate = async (req, res) => {
         { width: 70 }  // Notes
       ];
 
-      // 2. Read Products & examples
-      productsRows = XLSX.utils.sheet_to_json(workbookTemplate.Sheets['BulkUpload_NewProducts'], { header: 1 });
+      // 2. Read Products & examples, then apply the canonical column order
+      productsRows = reorderBulkProductRows(
+        XLSX.utils.sheet_to_json(workbookTemplate.Sheets['BulkUpload_NewProducts'], { header: 1 }),
+        BULK_PRODUCT_TEMPLATE_HEADERS
+      );
       productsRows.forEach(row => {
         wsProducts.addRow(row);
       });
@@ -7615,15 +7622,8 @@ const downloadBulkUploadTemplate = async (req, res) => {
         { width: 80 }
       ];
     } else {
-      // Fallback if template is not found
-      productsRows = [[
-        'name', 'title', 'description', 'category', 'brand', 'status', 'isfeatured',
-        'basePrice', 'salePrice', 'quantity', 'productCode', 'variantAttributes',
-        'weight', 'length', 'width', 'height',
-        'soldEnabled', 'soldCount', 'fomoEnabled', 'fomoType', 'viewingNow', 'productLeft', 'customMessage',
-        'productAttributes', 'images (LEAVE BLANK)', 'hsnCode', 'gstRate', 'isFragile',
-        'wholesale', 'wholesaleBase', 'wholesaleSale', 'minimumOrderQuantity', 'countryOfOrigin'
-      ]];
+      // Fallback if template is not found — same column order as the FabUniqo listing sheet
+      productsRows = [BULK_PRODUCT_TEMPLATE_HEADERS.slice()];
       wsProducts.addRow(productsRows[0]);
       
       const prodHeader = wsProducts.getRow(1);

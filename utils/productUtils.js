@@ -134,11 +134,117 @@ const validateProductPrices = (price) => {
   }
 };
 
+/**
+ * Bulk listing column order — matches FabUniqo Bulk Listing Final Template (29 Aug 2026).
+ * Import maps by header NAME, not position. Reordering here only changes the Excel layout.
+ */
+const BULK_PRODUCT_TEMPLATE_HEADERS = [
+  'productCode',
+  'name',
+  'category',
+  'brand',
+  'status',
+  'isfeatured',
+  'basePrice',
+  'salePrice',
+  'quantity',
+  'variantAttributes',
+  'weight',
+  'length',
+  'width',
+  'height',
+  'soldEnabled',
+  'soldCount',
+  'fomoEnabled',
+  'fomoType',
+  'viewingNow',
+  'productLeft',
+  'customMessage',
+  'productAttributes',
+  'images (LEAVE BLANK)',
+  'hsnCode',
+  'gstRate',
+  'isFragile',
+  'wholesale',
+  'wholesaleBase',
+  'wholesaleSale',
+  'minimumOrderQuantity',
+  'countryOfOrigin',
+  'title',
+  'description'
+];
+
+/** Export uses the same order; images column is filled with URLs. */
+const BULK_PRODUCT_EXPORT_HEADERS = BULK_PRODUCT_TEMPLATE_HEADERS.map((h) =>
+  h === 'images (LEAVE BLANK)' ? 'images' : h
+);
+
+function bulkHeaderKey(header) {
+  return String(header || '')
+    .trim()
+    .replace(/\s*\(.*\)\s*$/, '')
+    .trim()
+    .toLowerCase();
+}
+
+function excelColLetter(colNumber) {
+  let n = Number(colNumber);
+  if (!Number.isFinite(n) || n < 1) return '';
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function reorderBulkProductRows(rows, targetHeaders = BULK_PRODUCT_TEMPLATE_HEADERS) {
+  const headers = Array.isArray(targetHeaders) ? targetHeaders : BULK_PRODUCT_TEMPLATE_HEADERS;
+  if (!Array.isArray(rows) || rows.length === 0) return [headers.slice()];
+  const srcHeaders = Array.isArray(rows[0]) ? rows[0] : [];
+  const indexByKey = new Map();
+  srcHeaders.forEach((h, i) => {
+    const key = bulkHeaderKey(h);
+    if (key && !indexByKey.has(key)) indexByKey.set(key, i);
+  });
+  const out = [headers.slice()];
+  for (let r = 1; r < rows.length; r += 1) {
+    const src = Array.isArray(rows[r]) ? rows[r] : [];
+    out.push(
+      headers.map((h) => {
+        const idx = indexByKey.get(bulkHeaderKey(h));
+        return idx == null ? '' : src[idx] ?? '';
+      })
+    );
+  }
+  return out;
+}
+
+function patchBulkInstructionColumns(instructionRows, targetHeaders = BULK_PRODUCT_TEMPLATE_HEADERS) {
+  const colByField = new Map();
+  (targetHeaders || []).forEach((h, i) => {
+    colByField.set(bulkHeaderKey(h), excelColLetter(i + 1));
+  });
+  return (Array.isArray(instructionRows) ? instructionRows : []).map((row) => {
+    const next = Array.isArray(row) ? row.slice() : [];
+    const field = bulkHeaderKey(next[1]);
+    if (field && colByField.has(field)) next[0] = colByField.get(field);
+    return next;
+  });
+}
+
 module.exports = {
   generateSlug,
   generateSku,
   buildSkuFromProductCode,
   resolveVariantSku,
   assertSkuAvailable,
-  validateProductPrices
+  validateProductPrices,
+  BULK_PRODUCT_TEMPLATE_HEADERS,
+  BULK_PRODUCT_EXPORT_HEADERS,
+  bulkHeaderKey,
+  excelColLetter,
+  reorderBulkProductRows,
+  patchBulkInstructionColumns
 };

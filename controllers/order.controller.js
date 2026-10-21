@@ -75,10 +75,13 @@ const {
 /** Badge recompute + points earn/clawback/restore — never throws into payment paths. */
 function scheduleLoyaltyAfterOrderPersist(order, options = {}) {
     // Sequence: badge fields first (dot-path $set, does not touch points), then points ledger.
+    // Referral credit is also scheduled independently so a loyalty earn failure cannot skip it.
     // Still fire-and-forget so payment / shipment paths never await.
     void Promise.resolve(scheduleLoyaltyRecomputeForOrder(order, options))
         .catch(() => null)
         .then(() => scheduleLoyaltyPointsSideEffectsForOrder(order, options))
+        .catch(() => null)
+        .then(() => referralService.scheduleReferralSideEffectsForOrder(order, options))
         .catch(() => null);
 }
 const {

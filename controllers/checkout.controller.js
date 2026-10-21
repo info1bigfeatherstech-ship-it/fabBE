@@ -105,6 +105,7 @@ function buildLoyaltyClientFields(totals) {
     loyaltyMaxRedeemable: Math.max(0, Math.floor(Number(totals.loyaltyMaxRedeemable) || 0)),
     loyaltyBalance: Math.max(0, Math.floor(Number(totals.loyaltyBalance) || 0)),
     loyaltyEnabled: Boolean(totals.loyaltyEnabled),
+    loyaltyRedeemAvailable: Boolean(totals.loyaltyRedeemAvailable),
     loyaltyRedeemReason: totals.loyaltyRedeemReason || null,
     redeemRupeePerPoint: Math.max(0, Number(totals.redeemRupeePerPoint) || 0),
     earnPointsPerRupee: Math.max(0, Number(totals.earnPointsPerRupee) || 0),

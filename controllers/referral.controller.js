@@ -118,7 +118,7 @@ exports.validate = async (req, res) => {
 exports.adminGetSettings = async (req, res) => {
   try {
     const sf = String(req.query.storefront || 'ecomm');
-    const settings = await referralService.getSettings(sf, { bypassCache: true });
+    const settings = await referralService.getAdminSettings(sf);
     return res.json({ success: true, settings });
   } catch (err) {
     return sendPromoError(res, err, 'Failed to load referral settings', 'REFERRAL_SETTINGS_FAILED');

@@ -1,7 +1,8 @@
 /**
  * Customer referral codes (RF-001…) — separate from coupons and loyalty earn rules.
  * Discount is applied at checkout (exclusive with coupons).
- * Reward points credit the code owner via the existing loyalty ledger.
+ * Reward points credit the code owner via the existing loyalty ledger
+ * after prepaid/partial capture at checkout, or when a full COD order is delivered.
  */
 const mongoose = require('mongoose');
 const ReferralSettings = require('../models/ReferralSettings');
@@ -89,6 +90,26 @@ function invalidateSettingsCache(storefront) {
   else settingsCache.clear();
 }
 
+async function attachWalletRedeemRate(settingsDoc, storefront) {
+  const sf = normalizeStorefront(storefront || settingsDoc?.storefront);
+  let rate = 0;
+  try {
+    const loyalty = await loyaltyPointsService.getSettings(sf, { bypassCache: true });
+    rate = roundMoney2(Number(loyalty?.redeemRupeePerPoint) || 0);
+  } catch (err) {
+    logger.error('[referral] attach wallet redeem rate failed', {
+      storefront: sf,
+      message: err?.message || String(err)
+    });
+  }
+  return { ...(settingsDoc || {}), redeemRupeePerPoint: rate };
+}
+
+async function getAdminSettings(storefront = 'ecomm') {
+  const settings = await getSettings(storefront, { bypassCache: true });
+  return attachWalletRedeemRate(settings, storefront);
+}
+
 async function updateSettings(storefront, patch, updatedBy = null) {
   const sf = normalizeStorefront(storefront);
   const $set = {};
@@ -141,14 +162,101 @@ async function updateSettings(storefront, patch, updatedBy = null) {
     throw promoError('INVALID_DISCOUNT_VALUE', 'Percentage discount cannot exceed 100');
   }
 
+  // Shared wallet rate — never stored on ReferralSettings.
+  let nextRate = null;
+  if (patch.redeemRupeePerPoint !== undefined) {
+    try {
+      nextRate = loyaltyPointsService.normalizeRedeemRupeePerPoint(patch.redeemRupeePerPoint);
+    } catch (err) {
+      throw promoError(err?.code || 'INVALID_REDEEM_RATE', err?.message || 'Invalid ₹ per point');
+    }
+  }
+
+  if (nextRate != null) {
+    await loyaltyPointsService.updateSettings(
+      sf,
+      { redeemRupeePerPoint: nextRate },
+      updatedBy
+    );
+  }
+
   const doc = await ReferralSettings.findOneAndUpdate(
     { storefront: sf },
     { $set, $setOnInsert: { storefront: sf } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   ).lean();
   invalidateSettingsCache(sf);
-  return doc;
+  return attachWalletRedeemRate(doc, sf);
 }
+
+function capturedAmountInr(order) {
+  const n = Number(order?.amountPaidInr || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function paymentMethodOf(order) {
+  return String(order?.paymentInfo?.method || '').trim().toLowerCase();
+}
+
+/**
+ * Money captured on prepaid / partial — independent of admin accept / orderStatus.
+ * orderStatus pending (awaiting approval) must still credit.
+ */
+function isPrepaidOrPartialPaid(order) {
+  const pay = String(order?.paymentStatus || '').toLowerCase();
+  if (pay === 'paid' || pay === 'partially_paid') return true;
+  const method = paymentMethodOf(order);
+  if (method === 'cod') return false;
+  return capturedAmountInr(order) > 0.01;
+}
+
+function isFullCodOrder(order) {
+  return paymentMethodOf(order) === 'cod' && !isPrepaidOrPartialPaid(order);
+}
+
+function isCodDelivered(order) {
+  const status = String(order?.orderStatus || '').toLowerCase();
+  return isFullCodOrder(order) && status === 'delivered';
+}
+
+function canCreditReferralReward(order) {
+  return isPrepaidOrPartialPaid(order) || isCodDelivered(order);
+}
+
+function humanizeSyncReason(code, order) {
+  const key = String(code || '').trim();
+  if (!key) return '';
+  if (key === 'awaiting_cod_delivery' || key === 'reopened_until_delivered') {
+    return 'COD — points credit when the order is delivered';
+  }
+  if (key === 'not_eligible_yet') {
+    return isFullCodOrder(order)
+      ? 'COD — points credit when the order is delivered'
+      : 'Waiting for prepaid / partial payment';
+  }
+  if (key === 'order_missing') return 'Order was not found';
+  if (key === 'no_redemption') return 'Referral was not reserved on this order';
+  if (key === 'no_order') return 'Order is missing';
+  if (key === 'already_completed' || key === 'already_credited') return '';
+  if (key === 'zero_points') return 'Reward points are set to 0';
+  if (key === 'clawed_back' || key === 'already_clawed') return 'Points were reversed';
+  if (key === 'voided' || key === 'already_voided') return 'Referral was cancelled';
+  if (key === 'unpaid_cancel') return 'Order was cancelled before payment';
+  return key.replace(/_/g, ' ');
+}
+
+/** Wallet points actually given (skipped COD rows have rewardCredited=false). */
+function awardedPointsFromRedemption(row) {
+  if (!row) return 0;
+  if (row.rewardCredited === false) return 0;
+  return floorPoints(row.rewardPoints || 0);
+}
+
+const AWARDED_POINTS_SUM = {
+  $sum: {
+    $cond: [{ $eq: ['$rewardCredited', false] }, 0, '$rewardPoints']
+  }
+};
 
 function publicSettingsView(settings) {
   const s = settings || defaultSettingsDoc('ecomm');
@@ -236,6 +344,242 @@ async function getCodeForUser(userId, storefront = 'ecomm') {
   }).lean();
 }
 
+async function persistReferralOrderFlags(order) {
+  if (
+    order &&
+    typeof order.save === 'function' &&
+    (order.isModified?.('appliedReferral') || order.isModified?.('loyaltyPoints'))
+  ) {
+    await order.save();
+  }
+}
+
+async function stampRedemptionSync(orderId, reason, { clear = false } = {}) {
+  if (!orderId) return;
+  try {
+    const $set = { lastSyncedAt: new Date() };
+    if (clear) $set.lastSyncReason = null;
+    else if (reason) $set.lastSyncReason = String(reason).slice(0, 120);
+    await ReferralRedemption.updateOne({ orderId }, { $set });
+  } catch (err) {
+    logger.warn('[referral] stamp sync reason failed', {
+      orderId,
+      message: err?.message || String(err)
+    });
+  }
+}
+
+function noteFromSyncResult(order, result) {
+  if (!result) {
+    return {
+      code: 'no_sync',
+      message: humanizeSyncReason('not_eligible_yet', order)
+    };
+  }
+  const code = result.reason || (result.skipped ? 'skipped' : 'credited');
+  if (!result.skipped || code === 'already_completed' || code === 'already_credited' || code === 'idempotent') {
+    return null;
+  }
+  return { code, message: humanizeSyncReason(code, order) || result.message || code };
+}
+
+async function ensureRedemptionFromAppliedOrder(order) {
+  if (!order?.orderId || !order.appliedReferral?.code) return null;
+  const existing = await ReferralRedemption.findOne({ orderId: order.orderId });
+  if (existing) return existing;
+  const sf = normalizeStorefront(order.storefront || 'ecomm');
+  const code = normalizeCode(order.appliedReferral.code);
+  const row = await ReferralCode.findOne({ storefront: sf, code }).lean();
+  if (!row) return null;
+  const settings = await getSettings(sf);
+  await reserveRedemptionForOrder(order, {
+    code: row.code,
+    referralCodeId: row._id,
+    ownerUserId: order.appliedReferral.ownerUserId || row.ownerUserId,
+    discount: order.appliedReferral.discount,
+    discountType: order.appliedReferral.discountType,
+    discountValue: order.appliedReferral.discountValue,
+    rewardPoints: order.appliedReferral.rewardPoints || settings.rewardPoints
+  });
+  return ReferralRedemption.findOne({ orderId: order.orderId });
+}
+
+async function reconcileReservedRedemptions(code, storefront, notes) {
+  const sf = normalizeStorefront(storefront);
+  const reserved = await ReferralRedemption.find({
+    storefront: sf,
+    code,
+    $or: [
+      { status: 'reserved' },
+      { status: 'completed', rewardCredited: false }
+    ]
+  })
+    .sort({ createdAt: -1 })
+    .limit(50)
+    .lean();
+  if (!reserved.length) return;
+
+  const Order = require('../models/Order');
+  const orderIds = reserved.map((r) => r.orderId).filter(Boolean);
+  const orders = await Order.find({ orderId: { $in: orderIds } });
+  const byOrderId = new Map(orders.map((o) => [String(o.orderId), o]));
+
+  for (const row of reserved) {
+    const orderId = String(row.orderId || '');
+    const order = byOrderId.get(orderId);
+    if (!order) {
+      logger.warn('[referral] reconcile skipped — order missing', { orderId, code });
+      await stampRedemptionSync(orderId, 'order_missing');
+      notes?.set(orderId, { code: 'order_missing', message: 'Order was not found' });
+      continue;
+    }
+    try {
+      const result = await syncReferralForOrder(order, { reason: 'reconcile_reserved' });
+      await persistReferralOrderFlags(order);
+      const note = noteFromSyncResult(order, result);
+      if (note) {
+        await stampRedemptionSync(orderId, note.code);
+        notes?.set(orderId, note);
+      } else {
+        await stampRedemptionSync(orderId, null, { clear: true });
+      }
+      logger.info('[referral] reconcile reserved', {
+        orderId,
+        paymentStatus: order.paymentStatus,
+        orderStatus: order.orderStatus,
+        skipped: Boolean(result?.skipped),
+        reason: result?.reason || null
+      });
+    } catch (err) {
+      logger.error('[referral] reconcile reserved failed', {
+        orderId,
+        paymentStatus: order.paymentStatus,
+        orderStatus: order.orderStatus,
+        message: err?.message || String(err)
+      });
+      await stampRedemptionSync(orderId, 'sync_failed');
+      notes?.set(orderId, {
+        code: 'sync_failed',
+        message: err?.message || 'Could not credit points'
+      });
+    }
+  }
+}
+
+async function healOwnerReferralState(code, storefront) {
+  const sf = normalizeStorefront(storefront);
+  const notes = new Map();
+  await reconcileReservedRedemptions(code, sf, notes);
+
+  const Order = require('../models/Order');
+  const appliedOrders = await Order.find({
+    storefront: sf,
+    'appliedReferral.code': code,
+    $or: [
+      { paymentStatus: { $in: ['paid', 'partially_paid'] } },
+      { amountPaidInr: { $gt: 0.01 } },
+      { orderStatus: 'delivered' }
+    ]
+  })
+    .sort({ createdAt: -1 })
+    .limit(50);
+
+  for (const order of appliedOrders) {
+    const orderId = String(order?.orderId || '');
+    try {
+      await ensureRedemptionFromAppliedOrder(order);
+      const result = await syncReferralForOrder(order, { reason: 'heal_applied_order' });
+      await persistReferralOrderFlags(order);
+      const note = noteFromSyncResult(order, result);
+      if (note) {
+        await stampRedemptionSync(orderId, note.code);
+        notes.set(orderId, note);
+      } else {
+        await stampRedemptionSync(orderId, null, { clear: true });
+      }
+    } catch (err) {
+      logger.error('[referral] heal applied order failed', {
+        orderId,
+        paymentStatus: order.paymentStatus,
+        orderStatus: order.orderStatus,
+        message: err?.message || String(err)
+      });
+      await stampRedemptionSync(orderId, 'sync_failed');
+      notes.set(orderId, {
+        code: 'sync_failed',
+        message: err?.message || 'Could not credit points'
+      });
+    }
+  }
+  return notes;
+}
+
+function publicLedgerRow(row) {
+  if (!row) return null;
+  const pts = Math.trunc(Number(row.points) || 0);
+  const type = String(row.type || 'adjust');
+  const hidesRefereeOrder =
+    type === 'referral_reward' || type === 'referral_clawback';
+  return {
+    id: String(row._id),
+    type,
+    points: pts,
+    orderId: hidesRefereeOrder ? null : row.orderId || null,
+    rupeeValue: roundMoney2(row.rupeeValue || 0),
+    note: row.note || '',
+    createdAt: row.createdAt || null
+  };
+}
+
+async function walletViewForUser(userId, storefront) {
+  const empty = {
+    balance: 0,
+    lifetimeEarned: 0,
+    lifetimeRedeemed: 0,
+    approxInr: 0,
+    usedApproxInr: 0,
+    redeemRupeePerPoint: 0,
+    loyaltyEnabled: false,
+    canRedeem: false
+  };
+  try {
+    const loyaltySettings = await loyaltyPointsService.getSettings(storefront);
+    if (userId && typeof loyaltyPointsService.ensureUserPointsBalanceSynced === 'function') {
+      await loyaltyPointsService.ensureUserPointsBalanceSynced(userId);
+    }
+    let balance = 0;
+    let lifetimeEarned = 0;
+    let lifetimeRedeemed = 0;
+    if (userId) {
+      const user = await User.findById(userId)
+        .select('loyalty.pointsBalance loyalty.pointsLifetimeEarned loyalty.pointsLifetimeRedeemed')
+        .lean();
+      balance = floorPoints(user?.loyalty?.pointsBalance || 0);
+      lifetimeEarned = floorPoints(user?.loyalty?.pointsLifetimeEarned || 0);
+      lifetimeRedeemed = floorPoints(user?.loyalty?.pointsLifetimeRedeemed || 0);
+    }
+    const rate = Number(loyaltySettings?.redeemRupeePerPoint) || 0;
+    const approxInr = rate > 0 ? roundMoney2(balance * rate) : 0;
+    const usedApproxInr = rate > 0 ? roundMoney2(lifetimeRedeemed * rate) : 0;
+    return {
+      balance,
+      lifetimeEarned,
+      lifetimeRedeemed,
+      approxInr,
+      usedApproxInr,
+      redeemRupeePerPoint: rate,
+      loyaltyEnabled: Boolean(loyaltySettings?.enabled),
+      canRedeem: balance > 0 && rate > 0
+    };
+  } catch (err) {
+    logger.error('[referral] wallet view failed', {
+      userId: userId ? String(userId) : '',
+      message: err?.message || String(err)
+    });
+    return empty;
+  }
+}
+
 async function getMyReferral(userId, storefront = 'ecomm') {
   const sf = normalizeStorefront(storefront);
   const settings = await getSettings(sf);
@@ -243,10 +587,19 @@ async function getMyReferral(userId, storefront = 'ecomm') {
   const used = userId ? await refereeHasUsedReferral(sf, userId) : null;
   let stats = { completedUses: 0, pendingUses: 0, pointsAwarded: 0 };
   if (codeDoc?.code) {
+    try {
+      await healOwnerReferralState(codeDoc.code, sf);
+    } catch (err) {
+      logger.error('[referral] heal owner state failed', {
+        userId: String(userId),
+        code: codeDoc.code,
+        message: err?.message || String(err)
+      });
+    }
     const [completed, pendingUses] = await Promise.all([
       ReferralRedemption.aggregate([
         { $match: { storefront: sf, code: codeDoc.code, status: 'completed' } },
-        { $group: { _id: null, count: { $sum: 1 }, points: { $sum: '$rewardPoints' } } }
+        { $group: { _id: null, count: { $sum: 1 }, points: AWARDED_POINTS_SUM } }
       ]),
       ReferralRedemption.countDocuments({ storefront: sf, code: codeDoc.code, status: 'reserved' })
     ]);
@@ -256,12 +609,36 @@ async function getMyReferral(userId, storefront = 'ecomm') {
       pointsAwarded: floorPoints(completed[0]?.points || 0)
     };
   }
+  const wallet = await walletViewForUser(userId, sf);
+  let ledger = { items: [], total: 0, failed: false };
+  if (userId) {
+    try {
+      const raw = await loyaltyPointsService.listLedgerForUser(userId, { page: 1, limit: 30 });
+      ledger = {
+        items: (raw.items || []).map(publicLedgerRow).filter(Boolean),
+        total: Number(raw.total) || 0,
+        failed: false
+      };
+    } catch (err) {
+      logger.error('[referral] ledger fetch failed', {
+        userId: String(userId),
+        message: err?.message || String(err)
+      });
+      ledger = { items: [], total: 0, failed: true };
+    }
+  }
   return {
     settings: publicSettingsView(settings),
     code: codeDoc
       ? { code: codeDoc.code, generatedAt: codeDoc.generatedAt || codeDoc.createdAt }
       : null,
-    stats,
+    stats: {
+      ...stats,
+      pointsUsed: wallet.lifetimeRedeemed || 0
+    },
+    wallet,
+    activity: [],
+    ledger,
     alreadyUsedAsReferee: Boolean(used)
   };
 }
@@ -385,20 +762,53 @@ async function reserveRedemptionForOrder(order, quoted, { session = null } = {})
 
 async function creditReferrerForOrder(order, { session = null, reason = 'payment_success' } = {}) {
   if (!order?.orderId) return { skipped: true, reason: 'no_order' };
+  if (!canCreditReferralReward(order)) {
+    const skipReason = isFullCodOrder(order) ? 'awaiting_cod_delivery' : 'not_eligible_yet';
+    logger.info('[referral] credit skipped', {
+      orderId: order.orderId,
+      reason: skipReason,
+      paymentStatus: order.paymentStatus,
+      orderStatus: order.orderStatus,
+      amountPaidInr: order.amountPaidInr || 0
+    });
+    await stampRedemptionSync(order.orderId, skipReason);
+    return { skipped: true, reason: skipReason };
+  }
   const redemption = await ReferralRedemption.findOne({ orderId: order.orderId }).session(
     session || null
   );
-  if (!redemption) return { skipped: true, reason: 'no_redemption' };
-  if (redemption.status === 'completed') return { skipped: true, reason: 'already_completed' };
+  if (!redemption) {
+    logger.warn('[referral] credit skipped — no redemption', { orderId: order.orderId });
+    return { skipped: true, reason: 'no_redemption' };
+  }
   if (redemption.status === 'clawed_back') return { skipped: true, reason: 'clawed_back' };
   if (redemption.status === 'voided') return { skipped: true, reason: 'voided' };
+  if (redemption.status === 'completed') {
+    const credited = redemption.rewardCredited === true || Boolean(redemption.rewardLedgerId);
+    if (credited) return { skipped: true, reason: 'already_completed' };
+  }
 
   const points = floorPoints(redemption.rewardPoints);
   if (!(points > 0)) {
     redemption.status = 'completed';
     redemption.completedAt = new Date();
+    redemption.rewardCredited = false;
+    redemption.rewardSkipReason = 'zero_points';
     await redemption.save(session ? { session } : undefined);
+    if (order.appliedReferral && typeof order.appliedReferral === 'object') {
+      order.appliedReferral.rewardStatus = 'skipped';
+      if (typeof order.markModified === 'function') order.markModified('appliedReferral');
+    }
     return { skipped: true, reason: 'zero_points' };
+  }
+
+  let rupeeValue = 0;
+  try {
+    const loyaltySettings = await loyaltyPointsService.getSettings(redemption.storefront);
+    const rate = Number(loyaltySettings?.redeemRupeePerPoint) || 0;
+    if (rate > 0) rupeeValue = roundMoney2(points * rate);
+  } catch (_) {
+    rupeeValue = 0;
   }
 
   const result = await loyaltyPointsService.applyLedgerDelta({
@@ -409,7 +819,7 @@ async function creditReferrerForOrder(order, { session = null, reason = 'payment
     idempotencyKey: `referral_reward:${order.orderId}`,
     orderId: order.orderId,
     orderMongoId: order._id || redemption.orderMongoId || null,
-    rupeeValue: 0,
+    rupeeValue,
     meta: {
       reason,
       refereeUserId: String(redemption.refereeUserId),
@@ -422,14 +832,29 @@ async function creditReferrerForOrder(order, { session = null, reason = 'payment
   if (!result.skipped || result.reason === 'idempotent' || result.reason === 'idempotent_race') {
     redemption.status = 'completed';
     redemption.completedAt = new Date();
+    redemption.rewardCredited = true;
+    redemption.rewardSkipReason = null;
     redemption.rewardLedgerId = result.entry?._id || redemption.rewardLedgerId;
     await redemption.save(session ? { session } : undefined);
+    await stampRedemptionSync(order.orderId, null, { clear: true });
+    if (order.appliedReferral && typeof order.appliedReferral === 'object') {
+      order.appliedReferral.rewardStatus = 'credited';
+      if (typeof order.markModified === 'function') order.markModified('appliedReferral');
+    }
+    logger.info('[referral] credited', {
+      orderId: order.orderId,
+      points,
+      paymentStatus: order.paymentStatus,
+      orderStatus: order.orderStatus
+    });
+    return result;
   }
 
-  if (order.appliedReferral && typeof order.appliedReferral === 'object') {
-    order.appliedReferral.rewardStatus = 'credited';
-    if (typeof order.markModified === 'function') order.markModified('appliedReferral');
-  }
+  logger.warn('[referral] ledger did not apply', {
+    orderId: order.orderId,
+    reason: result.reason || null
+  });
+  await stampRedemptionSync(order.orderId, result.reason || 'ledger_skipped');
   return result;
 }
 
@@ -439,8 +864,12 @@ async function voidRedemptionForOrder(order, { session = null, reason = 'void' }
     session || null
   );
   if (!redemption) return { skipped: true, reason: 'no_redemption' };
-  if (redemption.status === 'completed' || redemption.status === 'clawed_back') {
+  if (redemption.status === 'clawed_back') {
     return { skipped: true, reason: redemption.status };
+  }
+  if (redemption.status === 'completed') {
+    const credited = redemption.rewardCredited === true || Boolean(redemption.rewardLedgerId);
+    if (credited) return { skipped: true, reason: 'completed' };
   }
   if (redemption.status === 'voided') return { skipped: true, reason: 'already_voided' };
   redemption.status = 'voided';
@@ -464,6 +893,18 @@ async function clawbackReferrerForOrder(order, { session = null, reason = 'clawb
   if (redemption.status === 'voided') return { skipped: true, reason: 'voided' };
   if (redemption.status !== 'completed') {
     return voidRedemptionForOrder(order, { session, reason });
+  }
+
+  const credited = redemption.rewardCredited === true || Boolean(redemption.rewardLedgerId);
+  if (!credited) {
+    redemption.status = 'clawed_back';
+    redemption.clawedBackAt = new Date();
+    await redemption.save(session ? { session } : undefined);
+    if (order.appliedReferral && typeof order.appliedReferral === 'object') {
+      order.appliedReferral.rewardStatus = 'clawed_back';
+      if (typeof order.markModified === 'function') order.markModified('appliedReferral');
+    }
+    return { skipped: true, reason: 'no_points_to_claw' };
   }
 
   const points = floorPoints(redemption.rewardPoints);
@@ -499,16 +940,61 @@ async function clawbackReferrerForOrder(order, { session = null, reason = 'clawb
   return { skipped: false, reason };
 }
 
+async function finalizeRedemptionWithoutReward(order, { session = null, reason = 'cod_no_reward' } = {}) {
+  if (!order?.orderId) return { skipped: true, reason: 'no_order' };
+  const redemption = await ReferralRedemption.findOne({ orderId: order.orderId }).session(
+    session || null
+  );
+  if (!redemption) return { skipped: true, reason: 'no_redemption' };
+  if (redemption.status === 'completed') return { skipped: true, reason: 'already_completed' };
+  if (redemption.status === 'clawed_back') return { skipped: true, reason: 'clawed_back' };
+  if (redemption.status === 'voided') return { skipped: true, reason: 'already_voided' };
+
+  redemption.status = 'completed';
+  redemption.completedAt = new Date();
+  redemption.rewardCredited = false;
+  redemption.rewardSkipReason = reason || 'cod_no_reward';
+  await redemption.save(session ? { session } : undefined);
+
+  if (order.appliedReferral && typeof order.appliedReferral === 'object') {
+    order.appliedReferral.rewardStatus = 'skipped';
+    if (typeof order.markModified === 'function') order.markModified('appliedReferral');
+  }
+  logger.info('[referral] completed without reward', { orderId: order.orderId, reason });
+  return { skipped: true, reason: redemption.rewardSkipReason };
+}
+
+async function reopenSkippedCodRedemption(order, { session = null } = {}) {
+  if (!order?.orderId) return { skipped: true, reason: 'no_order' };
+  const redemption = await ReferralRedemption.findOne({ orderId: order.orderId }).session(
+    session || null
+  );
+  if (!redemption) return { skipped: true, reason: 'no_redemption' };
+  if (redemption.status !== 'completed') return { skipped: true, reason: redemption.status };
+  const credited = redemption.rewardCredited === true || Boolean(redemption.rewardLedgerId);
+  if (credited) return { skipped: true, reason: 'already_credited' };
+
+  redemption.status = 'reserved';
+  redemption.completedAt = null;
+  redemption.rewardCredited = false;
+  redemption.rewardSkipReason = null;
+  await redemption.save(session ? { session } : undefined);
+  if (order.appliedReferral && typeof order.appliedReferral === 'object') {
+    order.appliedReferral.rewardStatus = 'pending';
+    if (typeof order.markModified === 'function') order.markModified('appliedReferral');
+  }
+  logger.info('[referral] reopened skipped COD until delivered', { orderId: order.orderId });
+  return { skipped: false, reason: 'reopened_until_delivered' };
+}
+
 async function syncReferralForOrder(order, options = {}) {
   try {
     if (!order?.orderId) return null;
     const pay = String(order.paymentStatus || '').toLowerCase();
     const status = String(order.orderStatus || '').toLowerCase();
-    const method = String(order?.paymentInfo?.method || '').trim().toLowerCase();
     const returnStatus = String(order?.returnInfo?.status || '').toLowerCase();
 
-    const paidLike = pay === 'paid' || pay === 'partially_paid';
-    const codDelivered = method === 'cod' && status === 'delivered';
+    const paidLike = isPrepaidOrPartialPaid(order);
     const isRto = status === 'rto';
     const isReturnRefunded = returnStatus === 'refunded';
     const unpaidDead =
@@ -522,16 +1008,29 @@ async function syncReferralForOrder(order, options = {}) {
     if (unpaidDead && !paidLike) {
       return voidRedemptionForOrder(order, { reason: options.reason || 'unpaid_cancel' });
     }
-    if (paidLike || codDelivered) {
+    if (paidLike) {
       return creditReferrerForOrder(order, { reason: options.reason || 'payment_success' });
     }
-    return null;
+    if (isCodDelivered(order)) {
+      return creditReferrerForOrder(order, { reason: options.reason || 'cod_delivered' });
+    }
+    if (isFullCodOrder(order)) {
+      return reopenSkippedCodRedemption(order);
+    }
+    logger.info('[referral] sync idle', {
+      orderId: order.orderId,
+      paymentStatus: order.paymentStatus,
+      orderStatus: order.orderStatus
+    });
+    return { skipped: true, reason: 'not_eligible_yet' };
   } catch (err) {
     logger.error('[referral] sync failed', {
       orderId: order?.orderId,
+      paymentStatus: order?.paymentStatus,
+      orderStatus: order?.orderStatus,
       message: err?.message || String(err)
     });
-    return null;
+    return { skipped: true, reason: 'sync_failed', message: err?.message || String(err) };
   }
 }
 
@@ -581,7 +1080,7 @@ async function listCodesForAdmin({ storefront = 'ecomm', page = 1, limit = 20, s
   const [completed, reserved] = await Promise.all([
     ReferralRedemption.aggregate([
       { $match: { storefront: sf, code: { $in: codes }, status: 'completed' } },
-      { $group: { _id: '$code', count: { $sum: 1 }, points: { $sum: '$rewardPoints' } } }
+      { $group: { _id: '$code', count: { $sum: 1 }, points: AWARDED_POINTS_SUM } }
     ]),
     ReferralRedemption.aggregate([
       { $match: { storefront: sf, code: { $in: codes }, status: 'reserved' } },
@@ -651,7 +1150,8 @@ async function getCodeDetailForAdmin(code, storefront = 'ecomm') {
         status: r.status,
         orderId: r.orderId,
         discountInr: roundMoney2(r.discountInr || 0),
-        rewardPoints: floorPoints(r.rewardPoints || 0),
+        rewardPoints: awardedPointsFromRedemption(r),
+        rewardCredited: r.rewardCredited !== false && Boolean(r.rewardLedgerId || r.rewardCredited),
         createdAt: r.createdAt,
         completedAt: r.completedAt,
         referee: u
@@ -719,7 +1219,8 @@ async function listRedemptionsForAdmin({
       status: r.status,
       orderId: r.orderId,
       discountInr: roundMoney2(r.discountInr || 0),
-      rewardPoints: floorPoints(r.rewardPoints || 0),
+      rewardPoints: awardedPointsFromRedemption(r),
+      rewardCredited: r.rewardCredited !== false && Boolean(r.rewardLedgerId || r.rewardCredited),
       createdAt: r.createdAt,
       completedAt: r.completedAt,
       owner: toUser(r.ownerUserId),
@@ -736,6 +1237,7 @@ module.exports = {
   normalizeCode,
   formatReferralCode,
   getSettings,
+  getAdminSettings,
   updateSettings,
   publicSettingsView,
   generateCodeForUser,
@@ -745,8 +1247,10 @@ module.exports = {
   computeDiscountFromSettings,
   reserveRedemptionForOrder,
   creditReferrerForOrder,
+  finalizeRedemptionWithoutReward,
   voidRedemptionForOrder,
   clawbackReferrerForOrder,
+  isPrepaidOrPartialPaid,
   syncReferralForOrder,
   scheduleReferralSideEffectsForOrder,
   listCodesForAdmin,

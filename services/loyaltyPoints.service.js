@@ -1,7 +1,7 @@
 /**
  * Loyalty points (redeem / earn / clawback) — separate from badge tiers in loyalty.service.js.
  * Production rules:
- * - Master switch off → no discount, no ledger writes (checkout math unchanged).
+ * - Master switch off → no new earn. Existing wallet (referral rewards) can still redeem.
  * - Redeem stacks with coupon when settings.stackWithCoupon is true.
  * - Final payable / COD / advance split use total after loyalty discount.
  * - Earn on first money-capture (online) or COD delivered; clawback on RTO / return refund.
@@ -21,6 +21,26 @@ function roundMoney2(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return 0;
   return Math.round((x + Number.EPSILON) * 100) / 100;
+}
+
+const MAX_REDEEM_RUPEE_PER_POINT = 1000;
+
+/** Shared wallet ₹/point (loyalty redeem + referral reward value). 2 decimals = paise. */
+function normalizeRedeemRupeePerPoint(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    const err = new Error('₹ per point must be 0 or more');
+    err.statusCode = 400;
+    err.code = 'INVALID_REDEEM_RATE';
+    throw err;
+  }
+  if (n > MAX_REDEEM_RUPEE_PER_POINT) {
+    const err = new Error(`₹ per point cannot exceed ₹${MAX_REDEEM_RUPEE_PER_POINT}`);
+    err.statusCode = 400;
+    err.code = 'INVALID_REDEEM_RATE';
+    throw err;
+  }
+  return roundMoney2(n);
 }
 
 function floorPoints(n) {
@@ -98,6 +118,10 @@ async function updateSettings(storefront, patch, updatedBy = null) {
   const $set = {};
   for (const key of allowed) {
     if (patch[key] === undefined) continue;
+    if (key === 'redeemRupeePerPoint') {
+      $set[key] = normalizeRedeemRupeePerPoint(patch[key]);
+      continue;
+    }
     $set[key] = patch[key];
   }
   if (updatedBy) $set.updatedBy = updatedBy;
@@ -166,7 +190,8 @@ function computeRedeemQuote({
     reason: null
   };
 
-  if (!settings?.enabled) {
+  // Earn program off still allows spending an existing wallet (referral rewards).
+  if (!settings?.enabled && !(floorPoints(balancePoints) > 0)) {
     return { ...empty, reason: 'disabled' };
   }
 
@@ -266,30 +291,40 @@ async function attachLoyaltyDiscountToTotals(totals, {
     loyaltyMaxRedeemable: 0,
     loyaltyBalance: 0,
     loyaltyEnabled: false,
-    loyaltyRedeemReason: null
+    loyaltyRedeemAvailable: false,
+    loyaltyRedeemReason: null,
+    redeemRupeePerPoint: 0,
+    earnPointsPerRupee: 0
   };
 
   const settings = await getSettings(storefront);
   const pub = publicSettingsView(settings);
-  base.loyaltyEnabled = pub.enabled;
-
   const preLoyalty = roundMoney2(
     Number(totals.subtotal || 0) +
       Number(totals.deliveryCharges || 0) +
       Number(totals.tax || 0) -
       Number(totals.discount || 0)
   );
+  const balance = userId ? await getUserPointsBalance(userId, session) : 0;
+  const rate = Number(settings.redeemRupeePerPoint) || 0;
+  const redeemUnlocked = Boolean(settings.enabled) || (balance > 0 && rate > 0);
 
-  if (!settings.enabled) {
+  base.loyaltyEnabled = pub.enabled;
+  base.loyaltyBalance = balance;
+  base.loyaltyRedeemAvailable = redeemUnlocked && balance > 0 && rate > 0;
+  base.redeemRupeePerPoint = rate;
+  base.earnPointsPerRupee = Number(settings.earnPointsPerRupee) || 0;
+  base.preLoyaltyAmount = preLoyalty;
+  base.totalAmount = Math.max(0, preLoyalty);
+
+  if (!redeemUnlocked) {
     return {
       ...totals,
       ...base,
-      totalAmount: Math.max(0, preLoyalty),
-      preLoyaltyAmount: preLoyalty
+      loyaltyRedeemReason: settings.enabled ? null : 'disabled'
     };
   }
 
-  const balance = userId ? await getUserPointsBalance(userId, session) : 0;
   const quote = computeRedeemQuote({
     settings,
     balancePoints: balance,
@@ -308,15 +343,47 @@ async function attachLoyaltyDiscountToTotals(totals, {
     loyaltyPointsRequested: quote.pointsRequested,
     loyaltyMaxRedeemable: quote.maxRedeemablePoints,
     loyaltyBalance: quote.balancePoints,
-    loyaltyEnabled: true,
+    loyaltyEnabled: pub.enabled,
+    loyaltyRedeemAvailable: quote.maxRedeemablePoints > 0 || (balance > 0 && rate > 0),
     loyaltyRedeemReason: quote.reason,
     preLoyaltyAmount: preLoyalty,
     totalAmount,
-    redeemRupeePerPoint: Number(settings.redeemRupeePerPoint) || 0,
+    redeemRupeePerPoint: rate,
     earnPointsPerRupee: Number(settings.earnPointsPerRupee) || 0
   };
 }
 
+function loyaltyIncForDelta(type, delta) {
+  const $inc = { 'loyalty.pointsBalance': delta };
+  if (delta > 0 && (type === 'earn' || type === 'referral_reward')) {
+    $inc['loyalty.pointsLifetimeEarned'] = delta;
+  }
+  if (delta < 0 && type === 'redeem') {
+    $inc['loyalty.pointsLifetimeRedeemed'] = Math.abs(delta);
+  }
+  return $inc;
+}
+
+function reverseLoyaltyInc($inc) {
+  const out = {};
+  for (const [key, val] of Object.entries($inc || {})) {
+    out[key] = -Number(val || 0);
+  }
+  return out;
+}
+
+function updateCount(upd) {
+  return {
+    matched: Number(upd?.matchedCount ?? upd?.n ?? 0),
+    modified: Number(upd?.modifiedCount ?? upd?.nModified ?? 0)
+  };
+}
+
+/**
+ * Wallet write must never load+save a partial User document.
+ * `.select('loyalty')` then `save()` trips ecomm identity validation and can
+ * wipe email/phone. Atomic $inc on loyalty.* only.
+ */
 async function applyLedgerDelta({
   userId,
   storefront,
@@ -337,58 +404,70 @@ async function applyLedgerDelta({
     return { skipped: true, reason: 'noop' };
   }
 
-  const existing = await LoyaltyPointLedger.findOne({ userId, idempotencyKey })
-    .session(session || null)
-    .lean();
-  if (existing) {
-    return { skipped: true, reason: 'idempotent', entry: existing };
-  }
-
-  const userQuery = User.findById(userId).select('loyalty');
-  if (session) userQuery.session(session);
-  const user = await userQuery;
-  if (!user) {
+  const oid = toUserObjectId(userId);
+  if (!oid) {
     const err = new Error('User not found for loyalty points');
     err.statusCode = 404;
     err.code = 'USER_NOT_FOUND';
     throw err;
   }
 
-  if (!user.loyalty || typeof user.loyalty !== 'object') {
-    user.loyalty = {};
+  const writeOpts = session ? { session } : undefined;
+
+  const existing = await LoyaltyPointLedger.findOne({ userId: oid, idempotencyKey })
+    .session(session || null)
+    .lean();
+  if (existing) {
+    return { skipped: true, reason: 'idempotent', entry: existing };
   }
-  const prev = Math.max(0, floorPoints(user.loyalty.pointsBalance || 0));
-  let next = prev + delta;
-  if (next < 0) {
+
+  const filter = { _id: oid };
+  if (delta < 0) {
+    filter['loyalty.pointsBalance'] = { $gte: Math.abs(delta) };
+  }
+
+  const $inc = loyaltyIncForDelta(type, delta);
+  const upd = await User.updateOne(filter, { $inc }, writeOpts);
+  const counts = updateCount(upd);
+
+  if (!counts.matched) {
+    const exists = await User.exists({ _id: oid }).session(session || null);
+    if (!exists) {
+      const err = new Error('User not found for loyalty points');
+      err.statusCode = 404;
+      err.code = 'USER_NOT_FOUND';
+      throw err;
+    }
+    if (delta < 0) {
+      const err = new Error('Insufficient loyalty points');
+      err.statusCode = 400;
+      err.code = 'LOYALTY_INSUFFICIENT_POINTS';
+      throw err;
+    }
+    const err = new Error('User not found for loyalty points');
+    err.statusCode = 404;
+    err.code = 'USER_NOT_FOUND';
+    throw err;
+  }
+
+  if (delta < 0 && !counts.modified) {
     const err = new Error('Insufficient loyalty points');
     err.statusCode = 400;
     err.code = 'LOYALTY_INSUFFICIENT_POINTS';
     throw err;
   }
-  next = Math.max(0, next);
 
-  user.loyalty.pointsBalance = next;
-  if (delta > 0 && (type === 'earn' || type === 'adjust' || type === 'redeem_restore' || type === 'referral_reward')) {
-    user.loyalty.pointsLifetimeEarned = Math.max(
-      0,
-      floorPoints(user.loyalty.pointsLifetimeEarned || 0) +
-        (type === 'earn' || type === 'referral_reward' ? delta : 0)
-    );
-  }
-  if (delta < 0 && type === 'redeem') {
-    user.loyalty.pointsLifetimeRedeemed = Math.max(
-      0,
-      floorPoints(user.loyalty.pointsLifetimeRedeemed || 0) + Math.abs(delta)
-    );
-  }
-  user.markModified('loyalty');
-  await user.save(session ? { session } : undefined);
+  const fresh = await User.findById(oid)
+    .select('loyalty.pointsBalance')
+    .session(session || null)
+    .lean();
+  const next = Math.max(0, floorPoints(fresh?.loyalty?.pointsBalance || 0));
 
   try {
     const entry = await LoyaltyPointLedger.create(
       [
         {
-          userId,
+          userId: oid,
           storefront: normalizeStorefront(storefront),
           type,
           points: delta,
@@ -403,25 +482,28 @@ async function applyLedgerDelta({
           createdBy: createdBy || null
         }
       ],
-      session ? { session } : undefined
+      writeOpts
     );
     return { skipped: false, entry: Array.isArray(entry) ? entry[0] : entry, balance: next };
   } catch (err) {
-    // Unique race — treat as idempotent
+    const reverse = reverseLoyaltyInc($inc);
+    const rollback = async () => {
+      try {
+        await User.updateOne({ _id: oid }, { $inc: reverse }, writeOpts);
+      } catch (_) {
+        /* best-effort */
+      }
+    };
+
     if (err && (err.code === 11000 || String(err.message || '').includes('duplicate'))) {
-      const again = await LoyaltyPointLedger.findOne({ userId, idempotencyKey })
+      await rollback();
+      const again = await LoyaltyPointLedger.findOne({ userId: oid, idempotencyKey })
         .session(session || null)
         .lean();
       return { skipped: true, reason: 'idempotent_race', entry: again };
     }
-    // Roll balance back best-effort if ledger insert failed for other reasons
-    try {
-      user.loyalty.pointsBalance = prev;
-      user.markModified('loyalty');
-      await user.save(session ? { session } : undefined);
-    } catch (_) {
-      /* ignore */
-    }
+
+    await rollback();
     throw err;
   }
 }
@@ -432,9 +514,6 @@ async function applyLedgerDelta({
 async function debitRedeemForOrder(order, { session = null } = {}) {
   const points = floorPoints(order?.loyaltyPoints?.redeemed || order?.loyaltyPointsRedeemed || 0);
   if (!(points > 0) || !order?.userId) return { skipped: true, reason: 'none' };
-
-  const settings = await getSettings(order.storefront || 'ecomm');
-  if (!settings.enabled) return { skipped: true, reason: 'disabled' };
 
   const orderId = order.orderId;
   const result = await applyLedgerDelta({
@@ -635,46 +714,82 @@ function scheduleLoyaltyPointsSideEffectsForOrder(order, options = {}) {
       try {
         // Re-load lean flags if needed — work on the in-memory order when possible
         const referralService = require('./referral.service');
-        if (isRto || isReturnRefunded) {
-          await clawbackEarnForOrder(order, { reason: isRto ? 'rto' : 'return_refund' });
-          await restoreRedeemForOrder(order, { reason: isRto ? 'rto' : 'return_refund' });
-          await referralService.syncReferralForOrder(order, {
-            reason: isRto ? 'rto' : 'return_refund'
-          });
+        const persistFlags = async () => {
           if (
             typeof order.save === 'function' &&
             (order.isModified?.('loyaltyPoints') || order.isModified?.('appliedReferral'))
           ) {
             await order.save();
           }
+        };
+
+        if (isRto || isReturnRefunded) {
+          try {
+            await clawbackEarnForOrder(order, { reason: isRto ? 'rto' : 'return_refund' });
+            await restoreRedeemForOrder(order, { reason: isRto ? 'rto' : 'return_refund' });
+          } catch (err) {
+            logger.error('[loyaltyPoints] earn clawback failed', {
+              orderId: order.orderId,
+              message: err?.message || String(err)
+            });
+          }
+          try {
+            await referralService.syncReferralForOrder(order, {
+              reason: isRto ? 'rto' : 'return_refund'
+            });
+          } catch (err) {
+            logger.error('[loyaltyPoints] referral sync failed', {
+              orderId: order.orderId,
+              message: err?.message || String(err)
+            });
+          }
+          await persistFlags();
           return;
         }
 
         if (unpaidDead && !paidLike) {
-          await restoreRedeemForOrder(order, { reason: options.reason || 'unpaid_cancel' });
-          await referralService.syncReferralForOrder(order, {
-            reason: options.reason || 'unpaid_cancel'
-          });
-          if (
-            typeof order.save === 'function' &&
-            (order.isModified?.('loyaltyPoints') || order.isModified?.('appliedReferral'))
-          ) {
-            await order.save();
+          try {
+            await restoreRedeemForOrder(order, { reason: options.reason || 'unpaid_cancel' });
+          } catch (err) {
+            logger.error('[loyaltyPoints] redeem restore failed', {
+              orderId: order.orderId,
+              message: err?.message || String(err)
+            });
           }
+          try {
+            await referralService.syncReferralForOrder(order, {
+              reason: options.reason || 'unpaid_cancel'
+            });
+          } catch (err) {
+            logger.error('[loyaltyPoints] referral sync failed', {
+              orderId: order.orderId,
+              message: err?.message || String(err)
+            });
+          }
+          await persistFlags();
           return;
         }
 
         if (paidLike || codDelivered) {
-          await creditEarnForOrder(order, { reason: options.reason || 'payment_success' });
-          await referralService.syncReferralForOrder(order, {
-            reason: options.reason || 'payment_success'
-          });
-          if (
-            typeof order.save === 'function' &&
-            (order.isModified?.('loyaltyPoints') || order.isModified?.('appliedReferral'))
-          ) {
-            await order.save();
+          try {
+            await creditEarnForOrder(order, { reason: options.reason || 'payment_success' });
+          } catch (err) {
+            logger.error('[loyaltyPoints] earn credit failed', {
+              orderId: order.orderId,
+              message: err?.message || String(err)
+            });
           }
+          try {
+            await referralService.syncReferralForOrder(order, {
+              reason: options.reason || 'payment_success'
+            });
+          } catch (err) {
+            logger.error('[loyaltyPoints] referral sync failed', {
+              orderId: order.orderId,
+              message: err?.message || String(err)
+            });
+          }
+          await persistFlags();
         }
       } catch (err) {
         logger.error('[loyaltyPoints] side-effect failed', {
@@ -731,7 +846,9 @@ async function adminAdjustPoints({
 async function listLedgerForUser(userId, { page = 1, limit = 20 } = {}) {
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Math.max(1, Number(limit) || 20));
-  const filter = { userId };
+  const oid = toUserObjectId(userId);
+  if (!oid) return { items: [], total: 0, page: p, limit: l };
+  const filter = { userId: oid };
   const [items, total] = await Promise.all([
     LoyaltyPointLedger.find(filter)
       .sort({ createdAt: -1 })
@@ -971,6 +1088,7 @@ async function repairAllStalePointsBalances({ limit = 500 } = {}) {
 module.exports = {
   roundMoney2,
   floorPoints,
+  normalizeRedeemRupeePerPoint,
   getSettings,
   updateSettings,
   invalidateSettingsCache,
