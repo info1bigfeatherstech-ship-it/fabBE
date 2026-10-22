@@ -9,6 +9,8 @@ const {
   assertSkuAvailable,
   BULK_PRODUCT_TEMPLATE_HEADERS,
   BULK_PRODUCT_EXPORT_HEADERS,
+  GST_RATE_OPTIONS,
+  parseBulkGstRate,
   reorderBulkProductRows,
   patchBulkInstructionColumns
 } = require('../utils/productUtils');
@@ -2842,7 +2844,7 @@ async function buildNewProductWithVariants(productName, productRows, variants) {
   
   // HSN, Tax, Fragile
   const finalHsnCode = firstRow.hsnCode?.trim().toUpperCase() || null;
-  const finalgstRate = firstRow.gstRate ? parseFloat(firstRow.gstRate) : null;
+  const finalgstRate = parseBulkGstRate(firstRow.gstRate);
  const finalIsFragile = parseBoolean(firstRow.isFragile);
   
   const productObj = {
@@ -3869,7 +3871,7 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
 
       // Parse product-level fields
       const finalHsnCode = row.hsnCode?.trim().toUpperCase() || null;
-      const finalgstRate = row.gstRate ? parseFloat(row.gstRate) : null;
+      const finalgstRate = parseBulkGstRate(row.gstRate);
       const finalIsFragile = parseBoolean(row.isFragile);
       const productAttributes = sanitizeVariantAttributes(
         parseAttributePipeList(row.productAttributes)
@@ -7645,7 +7647,7 @@ const downloadBulkUploadTemplate = async (req, res) => {
     const STATUS_OPTIONS    = ['active', 'draft', 'archived'];
     const BOOL_OPTIONS      = ['true', 'false'];
     const FOMO_TYPE_OPTIONS = ['viewing_now', 'product_left', 'custom'];
-    const GST_OPTIONS       = ['0', '5', '12', '18', '28'];
+    const GST_OPTIONS       = GST_RATE_OPTIONS.map(String);
 
     // Write lists to Lookups sheet columns
     wsLookups.getColumn(1).values = ['category', ...categoryNames];

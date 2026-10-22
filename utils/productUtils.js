@@ -179,6 +179,41 @@ const BULK_PRODUCT_EXPORT_HEADERS = BULK_PRODUCT_TEMPLATE_HEADERS.map((h) =>
   h === 'images (LEAVE BLANK)' ? 'images' : h
 );
 
+/**
+ * GST slabs on single listing + bulk Excel dropdown.
+ * Import is not a closed whitelist: any number >= 0 is stored (same as createProduct).
+ */
+const GST_RATE_OPTIONS = [0, 3, 5, 12, 18, 28];
+
+function gstRateAllowedValuesText() {
+  return GST_RATE_OPTIONS.join(', ');
+}
+
+/**
+ * Parse gstRate from a bulk Excel/CSV cell.
+ * Accepts 0, 3, "3", "3%", "3.0". Blank → null. Does not reject 3.
+ */
+function parseBulkGstRate(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw < 0) {
+      throw new Error('gstRate must be a number greater than or equal to 0');
+    }
+    return raw;
+  }
+  const text = String(raw).trim();
+  if (!text) return null;
+  const cleaned = text.replace(/%\s*$/i, '').replace(/,/g, '').trim();
+  if (!cleaned) return null;
+  const parsed = Number(cleaned);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(
+      `Invalid gstRate "${text}". Enter a number such as ${gstRateAllowedValuesText()}.`
+    );
+  }
+  return parsed;
+}
+
 function bulkHeaderKey(header) {
   return String(header || '')
     .trim()
@@ -226,10 +261,12 @@ function patchBulkInstructionColumns(instructionRows, targetHeaders = BULK_PRODU
   (targetHeaders || []).forEach((h, i) => {
     colByField.set(bulkHeaderKey(h), excelColLetter(i + 1));
   });
+  const allowedGst = gstRateAllowedValuesText();
   return (Array.isArray(instructionRows) ? instructionRows : []).map((row) => {
     const next = Array.isArray(row) ? row.slice() : [];
     const field = bulkHeaderKey(next[1]);
     if (field && colByField.has(field)) next[0] = colByField.get(field);
+    if (field === 'gstrate') next[4] = allowedGst;
     return next;
   });
 }
@@ -243,6 +280,9 @@ module.exports = {
   validateProductPrices,
   BULK_PRODUCT_TEMPLATE_HEADERS,
   BULK_PRODUCT_EXPORT_HEADERS,
+  GST_RATE_OPTIONS,
+  gstRateAllowedValuesText,
+  parseBulkGstRate,
   bulkHeaderKey,
   excelColLetter,
   reorderBulkProductRows,
