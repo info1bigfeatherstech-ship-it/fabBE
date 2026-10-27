@@ -22,61 +22,91 @@ const {
 } = require('../utils/productTagQuery');
 const { buildNameAndProductCodeSearch } = require('../utils/productCode');
 const { resolveStorefrontVariantPrice } = require('../utils/variantPrice');
+const {
+  sliceSeededShuffle,
+  parseShuffleSeed,
+  fallbackShuffleSeed,
+} = require('../utils/seededShuffle');
 
 const storefrontFrom = (req) => req.storefront || 'ecomm';
 
-/** Max docs Mongo `$sample` may return in one storefront request (DoS / memory guard). */
-const RANDOM_SAMPLE_MAX = 100;
 /** Hard cap for any storefront list query. */
 const STOREFRONT_LIST_MAX = 200;
+/**
+ * Max ids loaded for seeded random pagination.
+ * Deterministic `_id` order before shuffle so page 2 cannot drift if the cap is hit.
+ */
+const RANDOM_ID_POOL_MAX = 20000;
 
 function isRandomSortParam(sort) {
   const s = String(sort || '').trim().toLowerCase();
   return s === 'random' || s === 'shuffle';
 }
 
+function resolveRequestShuffleSeed(req) {
+  return parseShuffleSeed(req?.query?.shuffleSeed, fallbackShuffleSeed());
+}
+
+function emptyProductMatch() {
+  return { _id: null };
+}
+
 /**
- * Load storefront product docs: newest-first by default, or uniform random sample
- * across the full matched set (not only the newest page).
- * On `$sample` failure, falls back to newest-first so listings never hard-fail.
+ * Load one storefront page. Random sort shuffles the *matched* id set with a stable
+ * seed, then slices skip/limit — Load More is the next slice, not a new $sample.
+ * Newest-first is unchanged. On shuffle failure, fall back to newest + skip (still pageable).
  */
-async function fetchStorefrontProductDocs(filters, { sort, skip = 0, limit = 12 } = {}) {
+async function fetchStorefrontProductDocs(filters, { sort, skip = 0, limit = 12, seed } = {}) {
   const lim = Math.min(Math.max(1, Number(limit) || 12), STOREFRONT_LIST_MAX);
   const sk = Math.max(0, Number(skip) || 0);
+  const match =
+    filters && typeof filters === 'object' && !Array.isArray(filters)
+      ? filters
+      : emptyProductMatch();
 
   if (isRandomSortParam(sort)) {
     try {
-      const sampleSize = Math.min(lim, RANDOM_SAMPLE_MAX);
-      const sampled = await Product.aggregate([
-        { $match: filters && typeof filters === 'object' ? filters : {} },
-        { $sample: { size: sampleSize } },
-        { $project: { _id: 1 } },
-      ]);
-      const ids = (Array.isArray(sampled) ? sampled : [])
+      const idDocs = await Product.find(match)
+        .select('_id')
+        .sort({ _id: 1 })
+        .limit(RANDOM_ID_POOL_MAX)
+        .lean();
+      const ids = (Array.isArray(idDocs) ? idDocs : [])
         .map((d) => d && d._id)
         .filter(Boolean);
-      if (!ids.length) return [];
+      const total = ids.length;
+      const pageIds = sliceSeededShuffle(ids, {
+        seed: seed >>> 0,
+        skip: sk,
+        limit: lim,
+      });
+      if (!pageIds.length) return { products: [], total };
 
-      const docs = await Product.find({ _id: { $in: ids } })
+      const docs = await Product.find({ _id: { $in: pageIds } })
         .populate('category')
         .lean({ virtuals: true });
-
       const byId = new Map((docs || []).map((d) => [String(d._id), d]));
-      return ids.map((id) => byId.get(String(id))).filter(Boolean);
+      const products = pageIds.map((id) => byId.get(String(id))).filter(Boolean);
+      return { products, total };
     } catch (err) {
       console.error(
-        '[products] random $sample failed, falling back to newest-first:',
+        '[products] seeded random failed, falling back to newest-first:',
         err?.message || err
       );
     }
   }
 
-  return Product.find(filters)
-    .sort({ createdAt: -1 })
-    .skip(sk)
-    .limit(lim)
-    .populate('category')
-    .lean({ virtuals: true });
+  const [total, products] = await Promise.all([
+    Product.countDocuments(match),
+    Product.find(match)
+      .sort({ createdAt: -1 })
+      .skip(sk)
+      .limit(lim)
+      .populate('category')
+      .lean({ virtuals: true }),
+  ]);
+
+  return { products: products || [], total: total || 0 };
 }
 
 /** Deep-clone cached JSON so inventory overlay never mutates Redis/memory cache entries. */
@@ -277,8 +307,8 @@ const getProducts = async (req, res) => {
     // search — name + productCode only (same rules as /products/search)
     const sortParam = String(req.query.sort || '').trim().toLowerCase();
     const useRandom = isRandomSortParam(sortParam);
-    // Random samples the full match set; page>1 still returns a fresh sample (browse variety).
-    const skip = useRandom ? 0 : (page - 1) * limit;
+    const skip = (page - 1) * limit;
+    const shuffleSeed = useRandom ? resolveRequestShuffleSeed(req) : null;
 
     if (req.query.q) {
       const searchClause = buildNameAndProductCodeSearch(req.query.q);
@@ -287,19 +317,16 @@ const getProducts = async (req, res) => {
 
     const filters = mongoCatalogAnd(storefront, ...extraClauses);
 
-    // Bucket random cache ~5 min so order rotates without bypassing cache entirely.
-    const randomBucket = useRandom ? Math.floor(Date.now() / (5 * 60 * 1000)) : null;
-
     const cacheKey = cacheConfig.generateKey("PRODUCT", {
-      v: "name-code-v3",
-      page: useRandom ? 1 : page,
+      v: "seeded-random-v1",
+      page,
       limit,
       category: req.query.category,
       featured: req.query.featured,
       q: req.query.q,
       tags: tagsFilter.join(","),
       sort: useRandom ? 'random' : 'newest',
-      randomBucket,
+      shuffleSeed: useRandom ? shuffleSeed : null,
       userType: currentUserType,
       storefront,
     });
@@ -321,14 +348,12 @@ const getProducts = async (req, res) => {
       return res.json(withLiveStock);
     }
 
-    const [total, products] = await Promise.all([
-      Product.countDocuments(filters),
-      fetchStorefrontProductDocs(filters, {
-        sort: useRandom ? 'random' : undefined,
-        skip,
-        limit,
-      }),
-    ]);
+    const { products, total } = await fetchStorefrontProductDocs(filters, {
+      sort: useRandom ? 'random' : undefined,
+      skip,
+      limit,
+      seed: shuffleSeed,
+    });
 
     const productsWithData = await decorateStorefrontProducts(
       products,
@@ -607,15 +632,17 @@ const getProductsByCategory = async (req, res) => {
     // tags
     const tagsFilter = normalizeTagSlugs(req.query.tags);
 
+    const useRandom = isRandomSortParam(req.query.sort);
+    const shuffleSeed = useRandom ? resolveRequestShuffleSeed(req) : null;
+
     const cacheKey = cacheConfig.generateKey("PRODUCT", {
+      v: "seeded-random-v1",
       categorySlug: slug,
       page,
       limit,
       tags: tagsFilter.join(","),
-      sort: isRandomSortParam(req.query.sort) ? 'random' : 'newest',
-      randomBucket: isRandomSortParam(req.query.sort)
-        ? Math.floor(Date.now() / (5 * 60 * 1000))
-        : null,
+      sort: useRandom ? 'random' : 'newest',
+      shuffleSeed: useRandom ? shuffleSeed : null,
       userType: currentUserType,
       storefront: currentStorefront,
     });
@@ -678,13 +705,11 @@ const getProductsByCategory = async (req, res) => {
       ...extraClauses
     );
 
-    const useRandom = isRandomSortParam(req.query.sort);
-    const total = await Product.countDocuments(filters);
-
-    const products = await fetchStorefrontProductDocs(filters, {
+    const { products, total } = await fetchStorefrontProductDocs(filters, {
       sort: useRandom ? 'random' : undefined,
-      skip: useRandom ? 0 : skip,
+      skip,
       limit,
+      seed: shuffleSeed,
     });
 
     const productsWithData = await decorateStorefrontProducts(
@@ -704,6 +729,9 @@ const getProductsByCategory = async (req, res) => {
       total,
       page,
       limit,
+      totalPages: Math.ceil(total / limit) || 0,
+      hasNextPage: page * limit < total,
+      hasPrevPage: page > 1,
       products: productsWithData,
       category,
       userType: currentUserType,
