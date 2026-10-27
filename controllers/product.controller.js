@@ -11,6 +11,7 @@ const {
   BULK_PRODUCT_EXPORT_HEADERS,
   GST_RATE_OPTIONS,
   parseBulkGstRate,
+  parseOptionalOnSalePrice,
   reorderBulkProductRows,
   patchBulkInstructionColumns
 } = require('../utils/productUtils');
@@ -34,6 +35,15 @@ const {
   sanitizeVariantAttributes,
   parseAttributePipeList
 } = require('../utils/variantAttributes');
+const { readIncomingPromoPrice } = require('../utils/variantPrice');
+const {
+  resolveImageAxisKey,
+  imageGroupToken,
+  applyInheritedGroupImages,
+  shareImagesAcrossGroup,
+  dropRedundantVariantImageFiles,
+  rowHasCsvImageUrls
+} = require('../utils/imageAxis');
 
 function queueNewProductDigestSafe(product) {
   Promise.resolve()
@@ -1024,6 +1034,86 @@ function resolveImageFolderByCandidates(rootFolder, candidates = []) {
   return { folderPath: null, matchedCode: null };
 }
 
+function countValidImagesInFolder(imageFolder) {
+  if (!imageFolder) return 0;
+  try {
+    return fs.readdirSync(imageFolder).filter((file) =>
+      /\.(jpg|jpeg|png|gif|webp)$/i.test(file)
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+function bulkRowImageAttrs(row) {
+  return sanitizeVariantAttributes(parseAttributePipeList(row?.variantAttributes));
+}
+
+/**
+ * Same-look rows may omit ZIP folders / CSV URLs and inherit photos.
+ * A group needs at least one source (folder, URLs, or existing SKU images).
+ */
+function attachBulkImageInheritance(rows, options = {}) {
+  const { rootFolder = null, existingByBase = new Map(), requireZipFolder = false, errors = null } = options;
+  const groups = groupBulkImportRowsByCodeBase(rows);
+  for (const [codeBase, group] of groups) {
+    const groupRows = Array.isArray(group?.rows) ? group.rows : [];
+    const axisKey = resolveImageAxisKey(groupRows.map(bulkRowImageAttrs));
+    const existing = existingByBase.get(codeBase) || existingByBase.get(String(codeBase || '').toUpperCase()) || null;
+    const clusters = new Map();
+    for (const row of groupRows) {
+      const token = imageGroupToken(bulkRowImageAttrs(row), axisKey);
+      if (!clusters.has(token)) clusters.set(token, []);
+      clusters.get(token).push(row);
+    }
+    for (const [token, cluster] of clusters) {
+      const existingHas = Array.isArray(existing?.variants)
+        && existing.variants.some((v) =>
+          imageGroupToken(v?.attributes, axisKey) === token
+          && Array.isArray(v?.images)
+          && v.images.some((img) => img?.url)
+        );
+      const source = cluster.find((row) => {
+        if (rowHasCsvImageUrls(row)) return true;
+        if (Number(row._imageFolderCount) > 0) return true;
+        if (rootFolder) {
+          const { folderPath } = resolveImageFolderByCandidates(rootFolder, getImageFolderCandidatesForRow(row));
+          return countValidImagesInFolder(folderPath) > 0;
+        }
+        return false;
+      });
+      for (const row of cluster) {
+        const ownFolder = Number(row._imageFolderCount) > 0
+          || (rootFolder && countValidImagesInFolder(
+            resolveImageFolderByCandidates(rootFolder, getImageFolderCandidatesForRow(row)).folderPath
+          ) > 0);
+        const ownCsv = rowHasCsvImageUrls(row);
+        if (ownFolder || ownCsv) {
+          row._inheritImages = false;
+          continue;
+        }
+        if (source || existingHas) {
+          row._inheritImages = true;
+          continue;
+        }
+        row._inheritImages = false;
+        if (errors) {
+          const productCode = normalizeProductCode(row.productCode);
+          const look = axisKey ? `${axisKey} group` : 'look group';
+          errors.push({
+            rowNumber: row.rowNumber,
+            productName: row.name,
+            productCode,
+            error: requireZipFolder
+              ? `Image folder not found for productCode ${productCode} and no same-${look} row has photos to inherit.`
+              : `No images for productCode ${productCode} and no same-${look} row has photos to inherit.`
+          });
+        }
+      }
+    }
+  }
+}
+
 /**
  * Build a human-readable, length-capped sample of real subdirectories under
  * `rootFolder`. Used only for error diagnostics so users can see exactly what
@@ -1454,7 +1544,7 @@ const createProduct = async (req, res) => {
 
     const slug = await generateSlug(name);
     const variants = [];
-    const filesByVariant = {};
+    let filesByVariant = {};
 
     // =============================
     // Group variant images
@@ -1469,6 +1559,7 @@ const createProduct = async (req, res) => {
         }
       }
     }
+    filesByVariant = dropRedundantVariantImageFiles(variantsInput, filesByVariant);
 
     for (const idxStr of Object.keys(filesByVariant)) {
       const idx = Number(idxStr);
@@ -1522,9 +1613,11 @@ const createProduct = async (req, res) => {
       const wholesale = !!v.wholesale;
 
       // Price object
+      const incomingOnSale = readIncomingPromoPrice(v.price);
       const priceObj = {
         base: Number(v.price?.base) || 0,
         sale: v.price?.sale != null ? Number(v.price.sale) : null,
+        promo: incomingOnSale != null && incomingOnSale !== '' ? Number(incomingOnSale) : null,
         wholesaleBase: wholesale ? Number(v.price?.wholesaleBase) : undefined,
         wholesaleSale: wholesale ? (v.price?.wholesaleSale != null ? Number(v.price.wholesaleSale) : null) : undefined
       };
@@ -1534,6 +1627,27 @@ const createProduct = async (req, res) => {
           success: false,
           message: `Sale price must be less than base price for variant ${i}`
         });
+      }
+
+      if (incomingOnSale != null && incomingOnSale !== '') {
+        if (!Number.isFinite(priceObj.promo) || priceObj.promo <= 0) {
+          return res.status(400).json({
+            success: false,
+            message: `On-sale price must be a positive number for variant ${i}`
+          });
+        }
+        if (
+          priceObj.promo >= priceObj.base ||
+          priceObj.sale == null ||
+          priceObj.promo >= priceObj.sale
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: `On-sale price must be less than sale price and base price for variant ${i}`
+          });
+        }
+      } else {
+        priceObj.promo = null;
       }
 
       if (wholesale && priceObj.wholesaleSale != null && priceObj.wholesaleSale >= priceObj.wholesaleBase) {
@@ -1621,6 +1735,7 @@ const createProduct = async (req, res) => {
       }
       variants.push(variantDoc);
     }
+    applyInheritedGroupImages(variants);
 
     // =============================
     // Parse Optional JSON Fields
@@ -2230,6 +2345,14 @@ function collectImportCsvRowFieldErrors(row, productName) {
   ) {
     errors.push(`Sale price (${cleanSalePrice}) must be less than base price (${cleanBasePrice})`);
   }
+  try {
+    parseOptionalOnSalePrice(row.onSalePrice, {
+      base: cleanBasePrice,
+      sale: cleanSalePrice,
+    });
+  } catch (onSaleErr) {
+    errors.push(onSaleErr.message);
+  }
 
   const wholesale = parseBoolean(row.wholesale);
   if (wholesale) {
@@ -2683,6 +2806,7 @@ async function processProductWithRollback(productName, productRows, stats, optio
       }
     );
     variants.push(...builtVariants);
+    applyInheritedGroupImages(variants);
     
     // THIRD: Save to database
     if (existingProduct) {
@@ -2720,6 +2844,7 @@ async function processProductWithRollback(productName, productRows, stats, optio
         existingProduct.variants.push(variant);
         addedCount++;
       }
+      applyInheritedGroupImages(existingProduct.variants);
       
       if (addedCount === 0) {
         return { success: true, action: 'skipped', product: existingProduct };
@@ -2773,6 +2898,11 @@ async function buildVariantWithValidation(row, productName, options = {}) {
   if (cleanSalePrice && cleanSalePrice >= cleanBasePrice) {
     throw new Error(`Sale price (${cleanSalePrice}) must be less than base price (${cleanBasePrice}) (Row ${row.rowNumber})`);
   }
+
+  const onSalePrice = parseOptionalOnSalePrice(row.onSalePrice, {
+    base: cleanBasePrice,
+    sale: cleanSalePrice,
+  });
   
   // Attributes (optional Color:Name:#HEX)
   const variantAttributes = sanitizeVariantAttributes(
@@ -2794,6 +2924,7 @@ async function buildVariantWithValidation(row, productName, options = {}) {
     price: {
       base: cleanBasePrice,
       sale: cleanSalePrice ? Number(cleanSalePrice) : null,
+      ...(onSalePrice != null && { promo: onSalePrice }),
       ...(wholesale && { wholesaleBase }),
       ...(wholesale && wholesaleSale !== null && { wholesaleSale }),
     },
@@ -2822,6 +2953,7 @@ async function buildVariantWithValidation(row, productName, options = {}) {
 // HELPER: Build new product with variants
 // =============================================
 async function buildNewProductWithVariants(productName, productRows, variants) {
+  applyInheritedGroupImages(variants);
   const firstRow = productRows[0];
   
   // Generate unique slug
@@ -3190,6 +3322,16 @@ async function collectZipBulkPreflightErrors(rows, rootFolder) {
         error: `Sale price (${salePrice}) must be less than base price (${basePrice})`
       });
     }
+    try {
+      parseOptionalOnSalePrice(row.onSalePrice, { base: basePrice, sale: salePrice });
+    } catch (onSaleErr) {
+      errors.push({
+        rowNumber,
+        productName,
+        productCode,
+        error: onSaleErr.message
+      });
+    }
 
     const wholesale = parseBoolean(row.wholesale);
     if (wholesale && (!row.wholesaleBase || String(row.wholesaleBase).trim() === '')) {
@@ -3222,45 +3364,24 @@ async function collectZipBulkPreflightErrors(rows, rootFolder) {
       }
     }
 
-    // Hard requirement: ZIP folder must exist and contain at least one image.
+    // Folder is required per look-group, not per size row (same Color / Fragrance can inherit).
     if (rootFolder) {
       const folderCandidates = getImageFolderCandidatesForRow(row);
       const { folderPath: imageFolder } = resolveImageFolderByCandidates(
         rootFolder,
         folderCandidates
       );
-      if (!imageFolder) {
+      row._imageFolderPath = imageFolder || '';
+      row._imageFolderCount = countValidImagesInFolder(imageFolder);
+      if (imageFolder && row._imageFolderCount > MAX_VARIANT_IMAGES) {
         errors.push({
           rowNumber,
           productName,
           productCode,
           error:
-            `Image folder not found for productCode ${productCode}. ` +
-            `Tried: ${folderCandidates.join(', ')}. ` +
-            `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
+            `Folder for productCode ${productCode} has ${row._imageFolderCount} images; ` +
+            `max ${MAX_VARIANT_IMAGES} images allowed per variant.`
         });
-      } else {
-        const images = fs.readdirSync(imageFolder).filter((file) =>
-          /\.(jpg|jpeg|png|gif|webp)$/i.test(file)
-        );
-        if (!images.length) {
-          errors.push({
-            rowNumber,
-            productName,
-            productCode,
-            error:
-              `No valid images (jpg/jpeg/png/gif/webp) found in folder for productCode ${productCode}.`
-          });
-        } else if (images.length > MAX_VARIANT_IMAGES) {
-          errors.push({
-            rowNumber,
-            productName,
-            productCode,
-            error:
-              `Folder for productCode ${productCode} has ${images.length} images; ` +
-              `max ${MAX_VARIANT_IMAGES} images allowed per variant.`
-          });
-        }
       }
     } else {
       errors.push({
@@ -3292,6 +3413,19 @@ async function collectZipBulkPreflightErrors(rows, rootFolder) {
       }
     }
   }
+
+  const existingByBase = new Map();
+  for (const [codeBase] of groupBulkImportRowsByCodeBase(rows)) {
+    if (!codeBase) continue;
+    const existingProduct = await findExistingProductByCodeBase(codeBase);
+    if (existingProduct) existingByBase.set(codeBase, existingProduct);
+  }
+  attachBulkImageInheritance(rows, {
+    rootFolder,
+    existingByBase,
+    requireZipFolder: true,
+    errors
+  });
 
   // Name conflicts within the same BASE group
   const groupedForConflicts = groupBulkImportRowsByCodeBase(rows);
@@ -3537,6 +3671,11 @@ async function buildCompleteVariant(row, productName, images, options = {}) {
   if (salePrice !== null && salePrice >= basePrice) {
     throw new Error(`Sale price (${salePrice}) must be less than base price (${basePrice})`);
   }
+
+  const onSalePrice = parseOptionalOnSalePrice(row.onSalePrice, {
+    base: basePrice,
+    sale: salePrice,
+  });
   
   const wholesaleCfg = parseWholesaleConfigForImportRow(row);
   const wholesale = wholesaleCfg.wholesale;
@@ -3558,6 +3697,7 @@ async function buildCompleteVariant(row, productName, images, options = {}) {
     price: {
       base: basePrice,
       sale: salePrice,
+      ...(onSalePrice != null && { promo: onSalePrice }),
       ...(wholesale && wholesaleBase > 0 && { wholesaleBase }),
       ...(wholesale && wholesaleSale !== null && { wholesaleSale }),
     },
@@ -3819,38 +3959,35 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
         throw new Error(`Category not found: ${row.category}`);
       }
 
-      // Upload images from productCode folder.
+      // Upload images from productCode folder, or inherit from the same look-group.
       // Folder names may use canonical or two-digit suffix (e.g. 83478-1 vs 83478-01).
-      //
-      // POLICY (client / production): missing or wrong ZIP folders are hard
-      // errors. Preflight already blocks the batch; here we still refuse to
-      // create products without images and never soft-skip uploads.
       const folderCandidates = getImageFolderCandidatesForRow(row);
       const { folderPath: imageFolder, matchedCode } = resolveImageFolderByCandidates(
         rootFolder,
         folderCandidates
       );
 
-      if (!imageFolder) {
+      let variantImages = [];
+      if (imageFolder && countValidImagesInFolder(imageFolder) > 0) {
+        variantImages = await uploadVariantImages(
+          imageFolder,
+          row.name,
+          matchedCode || productCode
+        );
+        if (!variantImages.length && !row._inheritImages) {
+          throw new Error(
+            `No images were uploaded for productCode ${productCode}. Refusing to create product without images.`
+          );
+        }
+        for (const img of variantImages) {
+          if (img?.publicId) runSideEffects.uploadedPublicIds.push(img.publicId);
+        }
+      } else if (!row._inheritImages) {
         throw new Error(
           `Image folder not found for productCode ${productCode}. ` +
           `Tried: ${folderCandidates.join(", ")}. ` +
           `Available folders inside zip: ${describeAvailableImageFolders(rootFolder)}.`
         );
-      }
-
-      const variantImages = await uploadVariantImages(
-        imageFolder,
-        row.name,
-        matchedCode || productCode
-      );
-      if (!variantImages.length) {
-        throw new Error(
-          `No images were uploaded for productCode ${productCode}. Refusing to create product without images.`
-        );
-      }
-      for (const img of variantImages) {
-        if (img?.publicId) runSideEffects.uploadedPublicIds.push(img.publicId);
       }
 
       // Resolve product before variant build — primary only when creating a new product (first row)
@@ -3934,6 +4071,10 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
         }
 
         product.variants.push(newVariant);
+        if (variantImages.length) {
+          shareImagesAcrossGroup(product.variants, product.variants.length - 1);
+        }
+        applyInheritedGroupImages(product.variants);
 
         // Update product-level fields if not set
         if (finalHsnCode && !product.hsnCode) product.hsnCode = finalHsnCode;
@@ -4053,6 +4194,37 @@ const bulkUploadNewProductsWithImages = async (req, res) => {
           console.error(`❌ Failed to process ${row.name}:`, err.message);
           runtimeAbort = true;
           return;
+        }
+      }
+      if (runtimeAbort) return;
+      if (groupData.codeBase) {
+        const saved = await findExistingProductByCodeBase(groupData.codeBase);
+        if (saved?.variants?.length) {
+          const { filled } = applyInheritedGroupImages(saved.variants);
+          if (filled > 0) {
+            saved.markModified('variants');
+            await saved.save();
+          }
+          const importedCodes = new Set(
+            groupRows.map((r) => normalizeProductCode(r.productCode)).filter(Boolean)
+          );
+          const missing = saved.variants.filter(
+            (v) =>
+              importedCodes.has(normalizeProductCode(v.productCode))
+              && (!Array.isArray(v.images) || !v.images.some((img) => img?.url))
+          );
+          if (missing.length) {
+            stats.failed += missing.length;
+            stats.errors.push({
+              rowNumber: '',
+              productName: groupData.name || saved.name,
+              productCode: missing[0]?.productCode || '',
+              error:
+                'Some size rows still have no photos after inherit. Put images on the first look row (Color / Fragrance / Model).'
+            });
+            runtimeAbort = true;
+            return;
+          }
         }
       }
     });
@@ -4363,7 +4535,7 @@ const previewBulkUpload = async (req, res) => {
         existingProduct = await findExistingProductByCodeBase(productData.codeBase);
         if (existingProduct) {
           existingProduct = await Product.findById(existingProduct._id).select(
-            'name slug variants.productCode'
+            'name slug variants.productCode variants.attributes variants.images'
           );
         }
       }
@@ -4371,6 +4543,14 @@ const previewBulkUpload = async (req, res) => {
         productRows,
         (existingProduct?.variants || []).map((v) => v.productCode)
       );
+      attachBulkImageInheritance(productRows, {
+        rootFolder: hasZip ? rootFolder : null,
+        existingByBase: productData.codeBase && existingProduct
+          ? new Map([[productData.codeBase, existingProduct]])
+          : new Map(),
+        requireZipFolder: Boolean(hasZip),
+        errors: null
+      });
       const productErrors = [];
       if (productData.nameConflict) {
         productErrors.push(productData.nameConflict);
@@ -4479,6 +4659,11 @@ const previewBulkUpload = async (req, res) => {
         if (salePrice !== null && salePrice >= basePrice) {
           variantErrors.push(`Sale price (${salePrice}) must be less than base price (${basePrice})`);
         }
+        try {
+          parseOptionalOnSalePrice(row.onSalePrice, { base: basePrice, sale: salePrice });
+        } catch (onSaleErr) {
+          variantErrors.push(onSaleErr.message);
+        }
         
         // Wholesale validation
         const wholesale = parseBoolean(row.wholesale);
@@ -4486,20 +4671,18 @@ const previewBulkUpload = async (req, res) => {
           variantErrors.push("wholesaleBase is required when wholesale=true");
         }
         
-        // Image validation (only if ZIP provided)
+        // Image validation (ZIP folder or inherit from same look-group)
         let hasImages = false;
         let imageCount = 0;
         if (hasZip && rootFolder && productCode) {
           const folderCandidates = getImageFolderCandidatesForRow(row);
           const { folderPath: imageFolder } = resolveImageFolderByCandidates(rootFolder, folderCandidates);
+          row._imageFolderCount = countValidImagesInFolder(imageFolder);
           if (imageFolder) {
-            const images = fs.readdirSync(imageFolder).filter(file => 
-              /\.(jpg|jpeg|png|gif|webp)$/i.test(file)
-            );
-            imageCount = images.length;
+            imageCount = row._imageFolderCount;
             hasImages = imageCount > 0;
             if (hasImages) totalImagesFound++;
-            if (!hasImages) {
+            if (!hasImages && !row._inheritImages) {
               variantErrors.push(`No images found for productCode ${productCode}`);
               missingImagesCount++;
             } else if (imageCount > MAX_VARIANT_IMAGES) {
@@ -4508,13 +4691,16 @@ const previewBulkUpload = async (req, res) => {
                 `max ${MAX_VARIANT_IMAGES} images allowed per variant.`
               );
             }
-          } else {
+          } else if (!row._inheritImages) {
             variantErrors.push(
               `Image folder not found for productCode ${productCode} ` +
               `(tried: ${folderCandidates.join(", ")}; ` +
               `available: ${describeAvailableImageFolders(rootFolder)})`
             );
             missingImagesCount++;
+          } else {
+            hasImages = true;
+            variantWarnings.push('Images will inherit from the same look (Color / Fragrance / Model) row');
           }
         } else if (!hasZip && row.images) {
           // CSV-only mode: check if image URLs provided
@@ -4522,6 +4708,9 @@ const previewBulkUpload = async (req, res) => {
           hasImages = imageUrls.length > 0;
           imageCount = imageUrls.length;
           if (hasImages) totalImagesFound++;
+        } else if (!hasZip && row._inheritImages) {
+          hasImages = true;
+          variantWarnings.push('Images will inherit from the same look (Color / Fragrance / Model) row');
         }
         
         variants.push({
@@ -5197,6 +5386,30 @@ const updateProduct = async (req, res) => {
         variant.price.base = base;
         variant.price.sale = sale;
 
+        const incomingOnSale = readIncomingPromoPrice(parsedPrice);
+        if (incomingOnSale !== undefined) {
+          const promo =
+            incomingOnSale != null && incomingOnSale !== ''
+              ? Number(incomingOnSale)
+              : null;
+          if (promo != null && (!Number.isFinite(promo) || promo <= 0)) {
+            return res.status(400).json({
+              success: false,
+              message: "On-sale price must be a number greater than 0"
+            });
+          }
+          if (
+            promo != null &&
+            (promo >= base || sale == null || promo >= sale)
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "On-sale price must be less than sale price and base price"
+            });
+          }
+          variant.price.promo = promo;
+        }
+
         if (parsedPrice.wholesaleBase !== undefined) {
           variant.price.wholesaleBase =
             parsedPrice.wholesaleBase != null ? Number(parsedPrice.wholesaleBase) : null;
@@ -5341,6 +5554,11 @@ const updateProduct = async (req, res) => {
         if (nextImages !== null) {
           cloudIdsToDeleteAfterSave.push(...removedPublicIds);
           variant.images = nextImages;
+          if (variantIndex >= 0 && Array.isArray(nextImages) && nextImages.length) {
+            shareImagesAcrossGroup(doc.variants, variantIndex);
+          } else {
+            applyInheritedGroupImages(doc.variants);
+          }
         }
       } catch (imgErr) {
         return res.status(400).json({
@@ -6751,6 +6969,24 @@ const addVariant = async (req, res) => {
       });
     }
 
+    const incomingOnSale = readIncomingPromoPrice(variant.price);
+    let onSalePrice = null;
+    if (incomingOnSale != null && incomingOnSale !== '') {
+      onSalePrice = Number(incomingOnSale);
+      if (!Number.isFinite(onSalePrice) || onSalePrice <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "On-sale price must be a number greater than 0"
+        });
+      }
+      if (onSalePrice >= basePrice || salePrice == null || onSalePrice >= salePrice) {
+        return res.status(400).json({
+          success: false,
+          message: "On-sale price must be less than sale price and base price"
+        });
+      }
+    }
+
     // =========================
     // SKU from productCode (same rule as bulk): SKU-{productCode}
     // =========================
@@ -6812,6 +7048,7 @@ const newVariant = {
   price: {
     base: basePrice,
     sale: salePrice,
+    promo: onSalePrice,
     wholesaleBase: variant.price.wholesaleBase
       ? Number(variant.price.wholesaleBase)
       : null,
@@ -6854,6 +7091,10 @@ const newVariant = {
     }
 
     product.variants.push(newVariant);
+    if (uploadedImages.length) {
+      shareImagesAcrossGroup(product.variants, product.variants.length - 1);
+    }
+    applyInheritedGroupImages(product.variants);
 
     // =========================
     // 🔁 RECALCULATE TOTALS
@@ -7407,6 +7648,7 @@ const exportProductsCSV = async (req, res) => {
         // Pricing & inventory from variant
         const basePrice           = variant && variant.price ? variant.price.base : '';
         const salePrice           = variant && variant.price && variant.price.sale != null ? variant.price.sale : '';
+        const onSalePrice         = variant && variant.price && variant.price.promo != null ? variant.price.promo : '';
         const quantity            = variant && variant.inventory ? variant.inventory.quantity : '';
         const productCode         = variant ? (variant.productCode || '') : '';
         const wholesale           = variant ? (variant.wholesale ? 'TRUE' : 'FALSE') : 'FALSE';
@@ -7423,6 +7665,7 @@ const exportProductsCSV = async (req, res) => {
           product.isFeatured  ? 'TRUE' : 'FALSE',
           basePrice,
           salePrice,
+          onSalePrice,
           quantity,
           variantAttributes,
           weight,

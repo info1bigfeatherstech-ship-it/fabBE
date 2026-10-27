@@ -18,11 +18,12 @@ const {
 const {
   normalizeTagSlugs,
   buildTagFilterClause,
+  productHasOnSaleTag,
 } = require('../utils/productTagQuery');
 const { buildNameAndProductCodeSearch } = require('../utils/productCode');
+const { resolveStorefrontVariantPrice } = require('../utils/variantPrice');
 
 const storefrontFrom = (req) => req.storefront || 'ecomm';
-const useWholesalePricing = (storefront) => storefront === 'wholesale';
 
 /** Max docs Mongo `$sample` may return in one storefront request (DoS / memory guard). */
 const RANDOM_SAMPLE_MAX = 100;
@@ -115,48 +116,16 @@ async function applyInventoryStockToCachedPayload(payload, storefront, logContex
 
 // Price resolution is storefront-driven:
 // wholesale storefront => wholesale price for all visitors (logged-in or guest)
-// ecomm storefront => retail price
-const getVariantPrice = (variant, storefront) => {
-  if (useWholesalePricing(storefront)) {
-    const wholesaleBase = Number(variant.price?.wholesaleBase || 0);
-    const wholesaleSaleRaw = variant.price?.wholesaleSale;
-    const wholesaleSale = wholesaleSaleRaw != null ? Number(wholesaleSaleRaw) : null;
-    const isSaleActive = Number.isFinite(wholesaleSale) && wholesaleSale > 0 && wholesaleSale < wholesaleBase;
-    const current = isSaleActive ? wholesaleSale : wholesaleBase;
-    const discountPercentage = isSaleActive && wholesaleBase > 0
-      ? Math.round(((wholesaleBase - wholesaleSale) / wholesaleBase) * 100)
-      : 0;
-    return {
-      base: wholesaleBase,
-      sale: Number.isFinite(wholesaleSale) ? wholesaleSale : null,
-      current,
-      isSaleActive,
-      discountPercentage,
-      minimumOrderQuantity: variant.minimumOrderQuantity || 1
-    };
-  }
-  const retailSaleRaw = variant.price?.sale;
-  const retailSale = retailSaleRaw != null ? Number(retailSaleRaw) : null;
-  const retailBase = Number(variant.price?.base || 0);
-  const isSaleActive = Number.isFinite(retailSale) && retailSale > 0 && retailSale < retailBase;
-  const current = isSaleActive ? retailSale : retailBase;
-  const discountPercentage = isSaleActive && retailBase > 0
-    ? Math.round(((retailBase - retailSale) / retailBase) * 100)
-    : 0;
-  return {
-    base: retailBase,
-    sale: Number.isFinite(retailSale) ? retailSale : null,
-    current,
-    isSaleActive,
-    discountPercentage,
-    minimumOrderQuantity: 1
-  };
+// ecomm storefront => retail price (promo only when product is tagged on-sale)
+const getVariantPrice = (variant, storefront, { isOnSale = false } = {}) => {
+  return resolveStorefrontVariantPrice(variant, storefront, { isOnSale });
 };
 
 function mapProductVariantsForApi(product, userType, storefront) {
+  const isOnSale = productHasOnSaleTag(product?.appliedTags);
   const visible = filterVariantsForStorefront(product.variants || [], storefront);
   return visible.map((variant) => {
-    const resolvedPrice = getVariantPrice(variant, storefront);
+    const resolvedPrice = getVariantPrice(variant, storefront, { isOnSale });
     const availability = getVariantAvailability(variant, storefront);
     return {
       ...variant,
@@ -164,6 +133,7 @@ function mapProductVariantsForApi(product, userType, storefront) {
       availability,
       // Keep top-level computed fields aligned with resolved storefront/user pricing.
       isSaleActive: Boolean(resolvedPrice.isSaleActive),
+      isPromoActive: Boolean(resolvedPrice.isPromoActive),
       finalPrice: Number(resolvedPrice.current || 0),
       discountPercentage: Number(resolvedPrice.discountPercentage || 0)
     };
@@ -173,6 +143,8 @@ function mapProductVariantsForApi(product, userType, storefront) {
 function decorateProductForStorefront(product, userType, storefront) {
   const variants = mapProductVariantsForApi(product, userType, storefront);
   const currentPrices = variants.map((v) => {
+    const current = Number(v?.price?.current);
+    if (Number.isFinite(current) && current >= 0) return current;
     const sale = Number(v?.price?.sale);
     const base = Number(v?.price?.base || 0);
     return Number.isFinite(sale) && sale > 0 && sale < base ? sale : base;
@@ -181,12 +153,7 @@ function decorateProductForStorefront(product, userType, storefront) {
   const maxPrice = currentPrices.length ? Math.max(...currentPrices) : null;
   const maxDiscountPercentage = variants.length
     ? Math.max(
-      ...variants.map((v) => {
-        const sale = Number(v?.price?.sale);
-        const base = Number(v?.price?.base || 0);
-        if (!(Number.isFinite(sale) && sale > 0 && sale < base && base > 0)) return 0;
-        return Math.round(((base - sale) / base) * 100);
-      })
+      ...variants.map((v) => Number(v?.discountPercentage || v?.price?.discountPercentage || 0))
     )
     : 0;
 
@@ -197,6 +164,16 @@ function decorateProductForStorefront(product, userType, storefront) {
     maxPrice,
     maxDiscountPercentage
   };
+}
+
+async function decorateStorefrontProduct(product, userType, storefront) {
+  const withTags = await attachAppliedTagsToProduct(product);
+  return decorateProductForStorefront(withTags, userType, storefront);
+}
+
+async function decorateStorefrontProducts(products, userType, storefront) {
+  const withTags = await attachAppliedTagsToProducts(products);
+  return withTags.map((p) => decorateProductForStorefront(p, userType, storefront));
 }
 
 // Attach `appliedTags: string[]` to every product in a list using a single
@@ -353,14 +330,10 @@ const getProducts = async (req, res) => {
       }),
     ]);
 
-    const productsWithData = await attachAppliedTagsToProducts(
-      products.map((product) =>
-        decorateProductForStorefront(
-          product,
-          currentUserType,
-          storefront
-        )
-      )
+    const productsWithData = await decorateStorefrontProducts(
+      products,
+      currentUserType,
+      storefront
     );
 
     await applyInventoryStockToProducts(
@@ -441,12 +414,10 @@ const getProductBySlug = async (req, res) => {
       });
     }
 
-    const productResponse = await attachAppliedTagsToProduct(
-      decorateProductForStorefront(
-        product.toObject(),
-        userType,
-        storefront
-      )
+    const productResponse = await decorateStorefrontProduct(
+      product.toObject(),
+      userType,
+      storefront
     );
 
     await overlayExternalStockOnProduct(productResponse, {
@@ -576,14 +547,10 @@ const searchProducts= async (req, res) => {
       .populate("category")
       .lean({ virtuals: true });
 
-    const productsWithData = await attachAppliedTagsToProducts(
-      products.map((product) =>
-        decorateProductForStorefront(
-          product,
-          currentUserType,
-          currentStorefront
-        )
-      )
+    const productsWithData = await decorateStorefrontProducts(
+      products,
+      currentUserType,
+      currentStorefront
     );
 
     await applyInventoryStockToProducts(
@@ -720,14 +687,10 @@ const getProductsByCategory = async (req, res) => {
       limit,
     });
 
-    const productsWithData = await attachAppliedTagsToProducts(
-      products.map((product) =>
-        decorateProductForStorefront(
-          product,
-          currentUserType,
-          currentStorefront
-        )
-      )
+    const productsWithData = await decorateStorefrontProducts(
+      products,
+      currentUserType,
+      currentStorefront
     );
 
     await applyInventoryStockToProducts(
@@ -813,10 +776,10 @@ const getFeaturedProducts = async (req, res) => {
       .populate('category')
       .lean({ virtuals: true });
 
-    const productsWithData = await attachAppliedTagsToProducts(
-      products.map((product) =>
-        decorateProductForStorefront(product, userType, storefront)
-      )
+    const productsWithData = await decorateStorefrontProducts(
+      products,
+      userType,
+      storefront
     );
 
     await applyInventoryStockToProducts(
@@ -907,10 +870,10 @@ const getRelatedProducts = async (req, res) => {
       .populate('category')
       .lean({ virtuals: true });
 
-    const relatedWithData = await attachAppliedTagsToProducts(
-      related.map((rel) =>
-        decorateProductForStorefront(rel, userType, storefront)
-      )
+    const relatedWithData = await decorateStorefrontProducts(
+      related,
+      userType,
+      storefront
     );
 
     await applyInventoryStockToProducts(
@@ -961,12 +924,10 @@ const getProductDetails = async (req, res) => {
 
     const userType = req.userType || 'user';
 
-    const productResponse = await attachAppliedTagsToProduct(
-      decorateProductForStorefront(
-        product.toObject(),
-        userType,
-        storefront
-      )
+    const productResponse = await decorateStorefrontProduct(
+      product.toObject(),
+      userType,
+      storefront
     );
 
     await overlayExternalStockOnProduct(productResponse, {

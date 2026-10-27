@@ -121,6 +121,19 @@ const validateProductPrices = (price) => {
     throw new Error('Sale price must be less than base price');
   }
 
+  if (price.promo != null) {
+    const promo = Number(price.promo);
+    if (!Number.isFinite(promo) || promo <= 0) {
+      throw new Error('On-sale price must be a positive number');
+    }
+    if (promo >= price.base) {
+      throw new Error('On-sale price must be less than base price');
+    }
+    if (price.sale != null && promo >= price.sale) {
+      throw new Error('On-sale price must be less than sale price');
+    }
+  }
+
   if (!price.wholesaleBase || price.wholesaleBase <= 0) {
     throw new Error('Wholesale base price is required and must be greater than 0');
   }
@@ -147,6 +160,7 @@ const BULK_PRODUCT_TEMPLATE_HEADERS = [
   'isfeatured',
   'basePrice',
   'salePrice',
+  'onSalePrice',
   'quantity',
   'variantAttributes',
   'weight',
@@ -187,6 +201,36 @@ const GST_RATE_OPTIONS = [0, 3, 5, 12, 18, 28];
 
 function gstRateAllowedValuesText() {
   return GST_RATE_OPTIONS.join(', ');
+}
+
+/**
+ * Optional On-sale price from bulk Excel/CSV (column `onSalePrice`).
+ * Blank → null. When present must be < salePrice and < basePrice.
+ */
+function parseOptionalOnSalePrice(raw, { base, sale } = {}) {
+  if (raw === undefined || raw === null) return null;
+  const text = typeof raw === 'number' ? String(raw) : String(raw).trim();
+  if (!text) return null;
+  const cleaned = text.replace(/[^0-9.]/g, '');
+  if (!cleaned) return null;
+  const parsed = Number(cleaned);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid onSalePrice "${text}". Enter a positive number less than salePrice.`
+    );
+  }
+  const baseNum = Number(base);
+  const saleNum = Number(sale);
+  if (!Number.isFinite(saleNum) || saleNum <= 0) {
+    throw new Error('onSalePrice requires salePrice. Fill salePrice first, then onSalePrice.');
+  }
+  if (Number.isFinite(baseNum) && parsed >= baseNum) {
+    throw new Error(`On-sale price (${parsed}) must be less than base price (${baseNum})`);
+  }
+  if (parsed >= saleNum) {
+    throw new Error(`On-sale price (${parsed}) must be less than sale price (${saleNum})`);
+  }
+  return parsed;
 }
 
 /**
@@ -262,13 +306,44 @@ function patchBulkInstructionColumns(instructionRows, targetHeaders = BULK_PRODU
     colByField.set(bulkHeaderKey(h), excelColLetter(i + 1));
   });
   const allowedGst = gstRateAllowedValuesText();
-  return (Array.isArray(instructionRows) ? instructionRows : []).map((row) => {
+  const mapped = (Array.isArray(instructionRows) ? instructionRows : []).map((row) => {
     const next = Array.isArray(row) ? row.slice() : [];
     const field = bulkHeaderKey(next[1]);
     if (field && colByField.has(field)) next[0] = colByField.get(field);
     if (field === 'gstrate') next[4] = allowedGst;
+    if (field === 'images') {
+      next[6] =
+        'Photos for the look (Color / Fragrance / Model). Same-look rows can leave images blank — they inherit from the first row of that group. Do not re-upload the same files for every size.';
+    }
+    if (field === 'onsaleprice') {
+      next[2] = 'No';
+      next[3] = 'Number';
+      next[4] = 'Less than salePrice';
+      next[6] =
+        'Optional. Shown as Sale price on the Sale tab. Fill this before adding the product to On Sale. Must be less than salePrice.';
+    }
     return next;
   });
+
+  const hasOnSaleRow = mapped.some((row) => bulkHeaderKey(row?.[1]) === 'onsaleprice');
+  if (hasOnSaleRow) return mapped;
+
+  const insertRow = [
+    colByField.get('onsaleprice') || '',
+    'onSalePrice',
+    'No',
+    'Number',
+    'Less than salePrice',
+    '80',
+    'Optional. Shown as Sale price on the Sale tab. Fill this before adding the product to On Sale. Must be less than salePrice.',
+  ];
+  const saleIdx = mapped.findIndex((row) => bulkHeaderKey(row?.[1]) === 'saleprice');
+  if (saleIdx >= 0) {
+    const next = mapped.slice();
+    next.splice(saleIdx + 1, 0, insertRow);
+    return next;
+  }
+  return mapped.concat([insertRow]);
 }
 
 module.exports = {
@@ -283,6 +358,7 @@ module.exports = {
   GST_RATE_OPTIONS,
   gstRateAllowedValuesText,
   parseBulkGstRate,
+  parseOptionalOnSalePrice,
   bulkHeaderKey,
   excelColLetter,
   reorderBulkProductRows,

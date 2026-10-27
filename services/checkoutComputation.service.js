@@ -33,6 +33,8 @@ const {
 const {
   evaluateFreeGiftForOrder
 } = require('./freeGiftOffer.service');
+const { getOnSaleProductIdSet } = require('../utils/productTagQuery');
+const { resolveRetailPayablePrice } = require('../utils/variantPrice');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -41,7 +43,7 @@ const findVariant = (product, variantId) => {
   return product.variants.find((v) => String(v._id) === String(variantId));
 };
 
-const getStorefrontSpecificPrice = (variant, storefront) => {
+const getStorefrontSpecificPrice = (variant, storefront, { isOnSale = false } = {}) => {
   const now = new Date();
   if (storefront === 'wholesale') {
     const wholesaleBase = variant.price?.wholesaleBase || variant.price?.base || 0;
@@ -50,20 +52,33 @@ const getStorefrontSpecificPrice = (variant, storefront) => {
       wholesaleSale !== wholesaleBase &&
       (!variant.price?.wholesaleSaleStartDate || now >= variant.price.wholesaleSaleStartDate) &&
       (!variant.price?.wholesaleSaleEndDate || now <= variant.price.wholesaleSaleEndDate);
+    const payable = isWholesaleSaleValid ? wholesaleSale : wholesaleBase;
     return {
       base: wholesaleBase,
-      sale: isWholesaleSaleValid ? wholesaleSale : wholesaleBase,
+      sale: payable,
+      current: payable,
+      promo: null,
+      isPromoActive: false,
       moq: variant.minimumOrderQuantity || 1
     };
   }
-  const base = variant.price?.base || 0;
-  let sale = variant.price?.sale || null;
-  const isSaleValid =
-    sale &&
-    sale < base &&
+  const retail = resolveRetailPayablePrice(variant, { isOnSale });
+  const saleValid =
+    retail.sale &&
+    retail.sale < retail.base &&
     (!variant.price?.saleStartDate || now >= variant.price.saleStartDate) &&
     (!variant.price?.saleEndDate || now <= variant.price.saleEndDate);
-  return { base, sale: isSaleValid ? sale : base, moq: 1 };
+  // Without promo: payable is sale-or-base (existing checkout behaviour, including sale dates).
+  const payableWithoutPromo = saleValid ? retail.sale : retail.base;
+  const payable = retail.isPromoActive ? retail.current : payableWithoutPromo;
+  return {
+    base: retail.base,
+    sale: payable,
+    current: payable,
+    promo: retail.isPromoActive ? retail.promo : null,
+    isPromoActive: retail.isPromoActive,
+    moq: 1
+  };
 };
 
 const couponUserEligible = (coupon, finalUserType) => {
@@ -202,6 +217,13 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
     { storefront, logContext: 'evaluateCartForCheckout' }
   );
 
+  let onSaleIds = new Set();
+  try {
+    onSaleIds = await getOnSaleProductIdSet(resolved.map((r) => r.product?._id));
+  } catch (err) {
+    console.error('evaluateCartForCheckout on-sale tags:', err?.message || err);
+  }
+
   // Pass 2: stock + price using overlaid quantities.
   for (const { cartItem, product, variant } of resolved) {
     if (variant.inventory?.trackInventory && variant.inventory.quantity < cartItem.quantity) {
@@ -210,14 +232,16 @@ async function evaluateCartForCheckout(cart, finalUserType, session = null, stor
       throw err;
     }
 
-    const price = getStorefrontSpecificPrice(variant, storefront);
+    const isOnSale = onSaleIds.has(String(product._id));
+    const price = getStorefrontSpecificPrice(variant, storefront, { isOnSale });
     if (storefront === 'wholesale' && cartItem.quantity < price.moq) {
       const err = new Error(`Minimum order quantity for ${product.name} is ${price.moq}`);
       err.statusCode = 400;
       throw err;
     }
 
-    const itemTotal = roundMoney2(price.sale * cartItem.quantity);
+    const unitPrice = Number.isFinite(price.current) ? price.current : price.sale;
+    const itemTotal = roundMoney2(unitPrice * cartItem.quantity);
     subtotal += itemTotal;
     const resolvedShipping = resolveVariantShipping(variant, product);
     totalWeight += cartItem.quantity * unitWeightKgFromResolvedShipping(resolvedShipping);

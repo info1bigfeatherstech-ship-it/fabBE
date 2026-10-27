@@ -2,7 +2,11 @@ const Product = require("../models/Product");
 const ProductTag = require("../models/ProductTag");
 const cacheInvalidation = require("../services/cacheInvalidation.service");
 const { mongoCatalogAnd } = require("../utils/storefrontCatalog");
-const { MARKETING_TAG_SLUGS } = require("../utils/productTagQuery");
+const { MARKETING_TAG_SLUGS, ON_SALE_TAG } = require("../utils/productTagQuery");
+const {
+  productHasValidOnSalePrice,
+  ON_SALE_PRICE_REQUIRED_MESSAGE,
+} = require("../utils/variantPrice");
 
 const CONTROLLED_FLAGS = MARKETING_TAG_SLUGS;
 
@@ -53,7 +57,7 @@ async function updateProductTagController(req, res) {
 
     const products = await Product.find({
       slug: { $in: normalizedSlugs },
-    }).select("_id slug channelStatus status");
+    }).select("_id slug channelStatus status variants.price");
 
     if (!products.length) {
       return res.status(404).json({
@@ -62,8 +66,31 @@ async function updateProductTagController(req, res) {
       });
     }
 
+    const skipped = [];
+    let eligibleProducts = products;
+    if (value === true && normalizedFlag === ON_SALE_TAG) {
+      eligibleProducts = [];
+      for (const product of products) {
+        if (productHasValidOnSalePrice(product)) {
+          eligibleProducts.push(product);
+        } else {
+          skipped.push({
+            slug: product.slug,
+            reason: ON_SALE_PRICE_REQUIRED_MESSAGE,
+          });
+        }
+      }
+      if (!eligibleProducts.length) {
+        return res.status(400).json({
+          success: false,
+          message: ON_SALE_PRICE_REQUIRED_MESSAGE,
+          skipped,
+        });
+      }
+    }
+
     const results = await Promise.all(
-      products.map(async (product) => {
+      eligibleProducts.map(async (product) => {
         const existing = await ProductTag.findOne({
           product: product._id,
         });
@@ -86,7 +113,7 @@ async function updateProductTagController(req, res) {
       })
     );
 
-    const productIds = products.map((p) => p._id);
+    const productIds = eligibleProducts.map((p) => p._id);
 
     try {
       await cacheInvalidation.onProductTagChange(productIds);
@@ -97,7 +124,7 @@ async function updateProductTagController(req, res) {
 
     const notStorefrontVisible = [];
     if (value === true) {
-      for (const product of products) {
+      for (const product of eligibleProducts) {
         const liveCount = await Product.countDocuments(
           mongoCatalogAnd("ecomm", { _id: product._id })
         );
@@ -110,13 +137,17 @@ async function updateProductTagController(req, res) {
       }
     }
 
+    const skippedCount = skipped.length;
     return res.status(200).json({
       success: true,
-      message: "Flag updated successfully",
+      message: skippedCount
+        ? `Flag updated for ${results.length} product(s). ${skippedCount} skipped — add On-sale price first.`
+        : "Flag updated successfully",
       flagType: normalizedFlag,
       value,
       updatedCount: results.length,
-      slugs: products.map((p) => p.slug),
+      slugs: eligibleProducts.map((p) => p.slug),
+      skipped,
       notStorefrontVisible,
     });
   } catch (error) {

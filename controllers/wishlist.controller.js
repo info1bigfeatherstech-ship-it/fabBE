@@ -7,6 +7,8 @@ const {
   isVariantListedOnStorefront
 } = require('../utils/storefrontCatalog');
 const { findOrCreateCartForStorefront } = require('../services/cartStorefront.service');
+const { getOnSaleProductIdSet } = require('../utils/productTagQuery');
+const { resolveRetailPayablePrice } = require('../utils/variantPrice');
 
 const WISHLIST_PRODUCT_SELECT =
   'name slug variants images brand category seo soldInfo fomo hsnCode gstRate isFragile shipping attributes isFeatured status channelStatus createdAt updatedAt';
@@ -25,7 +27,7 @@ const calculateDiscountPercentage = (base, sale) => {
 };
 
 // ✅ HELPER: Get variant price based on user type with virtuals
-const getVariantPrice = (variant, userType) => {
+const getVariantPrice = (variant, userType, { isOnSale = false } = {}) => {
   if (userType === 'wholesaler') {
     const base = Number(variant.price?.wholesaleBase || 0);
     const wholesaleSaleRaw = variant.price?.wholesaleSale;
@@ -36,33 +38,36 @@ const getVariantPrice = (variant, userType) => {
     return {
       base: base,
       sale: sale,
+      promo: null,
       current: isSaleActive ? sale : base,
       isSaleActive: isSaleActive,
+      isPromoActive: false,
       discountPercentage: discountPercentage,
       minimumOrderQuantity: variant.minimumOrderQuantity || 1
     };
   }
-  
-  // Normal user
-  const base = Number(variant.price?.base || 0);
-  const retailSaleRaw = variant.price?.sale;
-  const sale = retailSaleRaw != null ? Number(retailSaleRaw) : null;
-  const isSaleActive = sale && sale > 0 && sale < base;
-  const discountPercentage = isSaleActive ? calculateDiscountPercentage(base, sale) : 0;
-  
-  return {
-    base: base,
-    sale: sale,
-    current: isSaleActive ? sale : base,
-    isSaleActive: isSaleActive,
-    discountPercentage: discountPercentage,
-    minimumOrderQuantity: 1
-  };
+
+  return resolveRetailPayablePrice(variant, { isOnSale });
 };
 
+async function onSaleSetFromWishlistItems(items) {
+  try {
+    const ids = [];
+    for (const it of items || []) {
+      const product = it?.productId;
+      if (!product) continue;
+      ids.push(product._id || product);
+    }
+    return await getOnSaleProductIdSet(ids);
+  } catch (err) {
+    console.error('onSaleSetFromWishlistItems:', err?.message || err);
+    return new Set();
+  }
+}
+
 // ✅ HELPER: Format variant with all virtual fields
-const formatVariantWithVirtuals = (variant, userType) => {
-  const price = getVariantPrice(variant, userType);
+const formatVariantWithVirtuals = (variant, userType, { isOnSale = false } = {}) => {
+  const price = getVariantPrice(variant, userType, { isOnSale });
   
   return {
     _id: variant._id,
@@ -74,8 +79,10 @@ const formatVariantWithVirtuals = (variant, userType) => {
     price: {
       base: price.base,
       sale: price.sale,
+      promo: price.isPromoActive ? price.promo : null,
       current: price.current,
       isSaleActive: price.isSaleActive,
+      isPromoActive: Boolean(price.isPromoActive),
       discountPercentage: price.discountPercentage,
       minimumOrderQuantity: userType === 'wholesaler' ? (variant.minimumOrderQuantity || 1) : 1
     },
@@ -84,13 +91,14 @@ const formatVariantWithVirtuals = (variant, userType) => {
     minimumOrderQuantity: variant.minimumOrderQuantity || 1,
     // ✅ Virtual fields
     isSaleActive: price.isSaleActive,
+    isPromoActive: Boolean(price.isPromoActive),
     finalPrice: price.current,
     discountPercentage: price.discountPercentage
   };
 };
 
 // ✅ HELPER: Format wishlist item response (SAME AS CART RESPONSE)
-const formatWishlistItem = (item, userType, storefront) => {
+const formatWishlistItem = (item, userType, storefront, { isOnSale = false } = {}) => {
   const product = item.productId;
   if (!product) return null;
 
@@ -109,7 +117,7 @@ const formatWishlistItem = (item, userType, storefront) => {
   if (!variant) return null;
   
   // ✅ Format variant with all virtuals
-  const formattedVariant = formatVariantWithVirtuals(variant, userType);
+  const formattedVariant = formatVariantWithVirtuals(variant, userType, { isOnSale });
   
   // ✅ FULL PRODUCT RESPONSE with variants array
   const productObj = product.toObject ? product.toObject() : product;
@@ -123,6 +131,19 @@ const formatWishlistItem = (item, userType, storefront) => {
     }
   };
 };
+
+async function formatWishlistItemsWithPromo(items, userType, storefront) {
+  const onSaleIds = await onSaleSetFromWishlistItems(items);
+  return (items || [])
+    .map((item) => {
+      const product = item?.productId;
+      const id = product?._id || product;
+      return formatWishlistItem(item, userType, storefront, {
+        isOnSale: id ? onSaleIds.has(String(id)) : false
+      });
+    })
+    .filter((item) => item !== null);
+}
 
 // =============================================
 // GET WISHLIST
@@ -148,9 +169,11 @@ const getWishlist = async (req, res) => {
       });
     }
 
-    const formattedProducts = wishlist.products
-      .map((item) => formatWishlistItem(item, userType, storefront))
-      .filter((item) => item !== null);
+    const formattedProducts = await formatWishlistItemsWithPromo(
+      wishlist.products,
+      userType,
+      storefront
+    );
 
     return res.json({
       success: true,
@@ -256,9 +279,11 @@ const addToWishlist = async (req, res) => {
         select: WISHLIST_PRODUCT_SELECT
       });
 
-    const formattedProducts = updatedWishlist.products
-      .map((item) => formatWishlistItem(item, userType, storefront))
-      .filter((item) => item !== null);
+    const formattedProducts = await formatWishlistItemsWithPromo(
+      updatedWishlist.products,
+      userType,
+      storefront
+    );
 
     return res.json({ 
       success: true, 
@@ -332,9 +357,11 @@ const removeFromWishlist = async (req, res) => {
       });
     }
 
-    const formattedProducts = updatedWishlist.products
-      .map((item) => formatWishlistItem(item, userType, storefront))
-      .filter((item) => item !== null);
+    const formattedProducts = await formatWishlistItemsWithPromo(
+      updatedWishlist.products,
+      userType,
+      storefront
+    );
 
     return res.json({
       success: true,
@@ -687,9 +714,11 @@ const removeBulkFromWishlist = async (req, res) => {
       });
     }
 
-    const formattedProducts = updatedWishlist.products
-      .map((item) => formatWishlistItem(item, userType, storefront))
-      .filter((item) => item !== null);
+    const formattedProducts = await formatWishlistItemsWithPromo(
+      updatedWishlist.products,
+      userType,
+      storefront
+    );
 
     return res.json({
       success: true,

@@ -7,7 +7,9 @@ const {
   GST_RATE_OPTIONS,
   gstRateAllowedValuesText,
   parseBulkGstRate,
+  parseOptionalOnSalePrice,
   patchBulkInstructionColumns,
+  BULK_PRODUCT_TEMPLATE_HEADERS,
 } = require('./productUtils')
 
 assert.deepEqual(GST_RATE_OPTIONS, [0, 3, 5, 12, 18, 28])
@@ -40,5 +42,11 @@ const patched = patchBulkInstructionColumns([
   ['Z', 'gstRate', 'No', 'Number', '0, 5, 12, 18, 28'],
 ])
 assert.equal(patched[1][4], '0, 3, 5, 12, 18, 28')
+
+assert.equal(parseOptionalOnSalePrice('', { base: 120, sale: 100 }), null)
+assert.equal(parseOptionalOnSalePrice(80, { base: 120, sale: 100 }), 80)
+assert.throws(() => parseOptionalOnSalePrice(80, { base: 120, sale: null }), /salePrice/)
+assert.throws(() => parseOptionalOnSalePrice(100, { base: 120, sale: 100 }), /less than sale/)
+assert.ok(BULK_PRODUCT_TEMPLATE_HEADERS.indexOf('onSalePrice') === BULK_PRODUCT_TEMPLATE_HEADERS.indexOf('salePrice') + 1)
 
 console.log('productUtils.gst.unit.js: all assertions passed')

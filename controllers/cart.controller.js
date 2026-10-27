@@ -14,6 +14,8 @@ const {
   overlayExternalStockOnProduct,
   overlayExternalStockOnProducts
 } = require('../services/inventoryStockOverlay.service');
+const { getOnSaleProductIdSet } = require('../utils/productTagQuery');
+const { resolveStorefrontVariantPrice } = require('../utils/variantPrice');
 
 const CART_PRODUCT_SELECT =
   'name slug title description brand category seo soldInfo fomo hsnCode gstRate isFragile shipping attributes isFeatured status channelStatus createdAt updatedAt variants';
@@ -59,47 +61,62 @@ const isSaleValid = (price) => {
   return true;
 };
 
-// Helper: Get storefront-specific pricing for a variant
-const getStorefrontSpecificPrice = (variant, storefront) => {
-  if (storefront === 'wholesale') {
-    const wholesaleBase = Number(variant.price?.wholesaleBase || 0);
-    const wholesaleSaleRaw = variant.price?.wholesaleSale;
-    const wholesaleSale = wholesaleSaleRaw != null ? Number(wholesaleSaleRaw) : null;
-    return {
-      base: wholesaleBase,
-      sale: Number.isFinite(wholesaleSale) ? wholesaleSale : null,
-      moq: variant.minimumOrderQuantity || 1
-    };
+async function onSaleSetFromCartItems(items) {
+  try {
+    const ids = [];
+    for (const it of items || []) {
+      const product = it?.productId;
+      if (!product) continue;
+      ids.push(product._id || product);
+    }
+    return await getOnSaleProductIdSet(ids);
+  } catch (err) {
+    console.error('onSaleSetFromCartItems:', err?.message || err);
+    return new Set();
   }
-  const retailSaleRaw = variant.price?.sale;
-  const retailSale = retailSaleRaw != null ? Number(retailSaleRaw) : null;
+}
+
+function isCartProductOnSale(onSaleIds, product) {
+  if (!onSaleIds || !product) return false;
+  const id = product._id || product;
+  return onSaleIds.has(String(id));
+}
+
+async function productIsOnSale(productId) {
+  try {
+    if (!productId) return false;
+    const set = await getOnSaleProductIdSet([productId]);
+    return set.has(String(productId));
+  } catch (err) {
+    console.error('productIsOnSale:', err?.message || err);
+    return false;
+  }
+}
+
+// Helper: Get storefront-specific pricing for a variant
+const getStorefrontSpecificPrice = (variant, storefront, { isOnSale = false } = {}) => {
+  const resolved = resolveStorefrontVariantPrice(variant, storefront, { isOnSale });
   return {
-    base: variant.price?.base || 0,
-    sale: Number.isFinite(retailSale) ? retailSale : null,
-    moq: 1
+    base: resolved.base,
+    sale: resolved.sale,
+    promo: resolved.promo,
+    current: resolved.current,
+    isSaleActive: resolved.isSaleActive,
+    isPromoActive: resolved.isPromoActive,
+    discountPercentage: resolved.discountPercentage,
+    compareSale: resolved.compareSale,
+    moq: resolved.minimumOrderQuantity || 1
   };
 };
 
-//  HELPER: Calculate discount percentage
-const calculateDiscountPercentage = (base, sale) => {
-  if (!sale || sale <= 0 || sale >= base) return 0;
-  return Math.round(((base - sale) / base) * 100);
-};
-
 //  HELPER: Format cart item with FULL variant data (including virtuals)
-const formatcartItem = (item, product, variant, storefront) => {
+const formatcartItem = (item, product, variant, storefront, { isOnSale = false } = {}) => {
   if (!product || !variant) return null;
   
-  const price = getStorefrontSpecificPrice(variant, storefront);
-  
-  // Calculate sale validity and discount
-  const isSaleValidForVariant = price.sale && price.sale > 0 && price.sale < price.base;
-  const discountPercentage = isSaleValidForVariant 
-    ? calculateDiscountPercentage(price.base, price.sale)
-    : 0;
-  
-  // Calculate current price
-  let currentPrice = isSaleValidForVariant ? price.sale : price.base;
+  const price = getStorefrontSpecificPrice(variant, storefront, { isOnSale });
+  const currentPrice = Number.isFinite(price.current) ? price.current : (price.base || 0);
+  const discountPercentage = Number(price.discountPercentage) || 0;
+  const isSaleValidForVariant = Boolean(price.isSaleActive);
   
   const itemTotal = currentPrice * item.quantity;
   
@@ -114,8 +131,10 @@ const formatcartItem = (item, product, variant, storefront) => {
     price: {
       base: price.base,
       sale: price.sale,
+      promo: price.isPromoActive ? price.promo : null,
       current: currentPrice,
       isSaleActive: isSaleValidForVariant,
+      isPromoActive: Boolean(price.isPromoActive),
       discountPercentage,
       minimumOrderQuantity: storefront === 'wholesale' ? (variant.minimumOrderQuantity || 1) : 1
     },
@@ -124,6 +143,7 @@ const formatcartItem = (item, product, variant, storefront) => {
     minimumOrderQuantity: variant.minimumOrderQuantity || 1,
     //  ADD VIRTUALS HERE
     isSaleActive: isSaleValidForVariant,
+    isPromoActive: Boolean(price.isPromoActive),
     finalPrice: currentPrice,
     discountPercentage: discountPercentage
   };
@@ -160,14 +180,51 @@ const formatcartItem = (item, product, variant, storefront) => {
     price: {
       base: price.base,
       sale: price.sale,
+      promo: price.isPromoActive ? price.promo : null,
       current: currentPrice,
       discountPercentage: discountPercentage,
-      isSaleActive: isSaleValidForVariant
+      isSaleActive: isSaleValidForVariant,
+      isPromoActive: Boolean(price.isPromoActive)
     },
     product: fullProduct,
     total: itemTotal
   };
 };
+
+function toCartPriceSnapshot(variant, storefront, { isOnSale = false } = {}) {
+  const price = getStorefrontSpecificPrice(variant, storefront, { isOnSale });
+  return {
+    base: price.base,
+    // calculateTotal + reminder emails treat snapshot.sale as the payable unit.
+    sale: price.current,
+    costPrice: variant.price?.costPrice ?? null,
+    saleStartDate: variant.price?.saleStartDate ?? null,
+    saleEndDate: variant.price?.saleEndDate ?? null
+  };
+}
+
+async function formatPopulatedCartItems(items, storefront) {
+  const onSaleIds = await onSaleSetFromCartItems(items);
+  const formattedItems = [];
+  for (const item of items || []) {
+    const prod = item.productId;
+    if (!prod) continue;
+    let varObj = null;
+    if (item.variantId) {
+      varObj = prod.variants?.find((v) => String(v._id) === String(item.variantId));
+      if (varObj && !isVariantListedOnStorefront(varObj, storefront)) {
+        varObj = null;
+      }
+    }
+    if (!varObj) varObj = firstListedVariant(prod, storefront);
+    if (!varObj) continue;
+    const formatted = formatcartItem(item, prod, varObj, storefront, {
+      isOnSale: isCartProductOnSale(onSaleIds, prod)
+    });
+    if (formatted) formattedItems.push(formatted);
+  }
+  return formattedItems;
+}
 
 // =============================================
 // GET CART
@@ -206,32 +263,7 @@ const getcart = async (req, res) => {
       'getcart'
     );
 
-    //  Format each item with full data
-    const itemsWithFullData = [];
-    
-    for (const item of cart.items) {
-      const product = item.productId;
-      if (!product) continue;
-      
-      let variant = null;
-      if (item.variantId) {
-        variant = product.variants?.find(v => String(v._id) === String(item.variantId));
-        if (variant && !isVariantListedOnStorefront(variant, storefront)) {
-          variant = null;
-        }
-      }
-      
-      if (!variant) {
-        variant = firstListedVariant(product, storefront);
-      }
-      
-      if (!variant) continue;
-      
-      const formattedItem = formatcartItem(item, product, variant, storefront);
-      if (formattedItem) {
-        itemsWithFullData.push(formattedItem);
-      }
-    }
+    const itemsWithFullData = await formatPopulatedCartItems(cart.items, storefront);
     
     // Calculate total
     const totalAmount = itemsWithFullData.reduce((sum, item) => sum + item.total, 0);
@@ -363,16 +395,8 @@ const addTocart = async (req, res) => {
       }
     }
 
-    // Prepare price snapshot based on storefront policy
-    const price = getStorefrontSpecificPrice(variant, storefront);
-    
-    const priceSnapshot = {
-      base: price.base,
-      sale: price.sale,
-      costPrice: variant.price?.costPrice ?? null,
-      saleStartDate: variant.price?.saleStartDate ?? null,
-      saleEndDate: variant.price?.saleEndDate ?? null
-    };
+    const isOnSale = await productIsOnSale(product._id);
+    const priceSnapshot = toCartPriceSnapshot(variant, storefront, { isOnSale });
 
     const variantAttrSnapshot = (variant.attributes || []).map(a => ({ 
       key: a.key, 
@@ -427,24 +451,7 @@ const addTocart = async (req, res) => {
       'addTocart:response'
     );
 
-    // Format response
-    const formattedItems = [];
-    for (const item of updatedcart.items) {
-      const prod = item.productId;
-      if (!prod) continue;
-      
-      let varObj = null;
-      if (item.variantId) {
-        varObj = prod.variants?.find(v => String(v._id) === String(item.variantId));
-      }
-      if (!varObj) {
-        varObj = firstListedVariant(prod, storefront);
-      }
-      if (!varObj) continue;
-      
-      const formatted = formatcartItem(item, prod, varObj, storefront);
-      if (formatted) formattedItems.push(formatted);
-    }
+    const formattedItems = await formatPopulatedCartItems(updatedcart.items, storefront);
     
     const totalAmt = formattedItems.reduce((sum, it) => sum + it.total, 0);
     const totalOriginalAmt = formattedItems.reduce((sum, it) => sum + (it.price.base * it.quantity), 0);
@@ -541,17 +548,7 @@ const updatecartItem = async (req, res) => {
         'updateCartItem:remove'
       );
 
-      // Format response
-      const formattedItems = [];
-      for (const it of updatedcart.items) {
-        const prod = it.productId;
-        if (!prod) continue;
-        let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
-        if (!varObj) varObj = firstListedVariant(prod, storefront);
-        if (!varObj) continue;
-        const formatted = formatcartItem(it, prod, varObj, storefront);
-        if (formatted) formattedItems.push(formatted);
-      }
+      const formattedItems = await formatPopulatedCartItems(updatedcart.items, storefront);
       
       const totalAmt = formattedItems.reduce((sum, it) => sum + it.total, 0);
       const totalOriginalAmt = formattedItems.reduce((sum, it) => sum + (it.price.base * it.quantity), 0);
@@ -606,17 +603,9 @@ const updatecartItem = async (req, res) => {
       });
     }
 
-    // Refresh price snapshot based on storefront policy
-    const price = getStorefrontSpecificPrice(variant, storefront);
-
+    const isOnSale = await productIsOnSale(product._id);
     item.quantity = Number(quantity);
-    item.priceSnapshot = {
-      base: price.base,
-      sale: price.sale,
-      costPrice: variant.price?.costPrice ?? null,
-      saleStartDate: variant.price?.saleStartDate ?? null,
-      saleEndDate: variant.price?.saleEndDate ?? null
-    };
+    item.priceSnapshot = toCartPriceSnapshot(variant, storefront, { isOnSale });
     item.variantAttributesSnapshot = (variant.attributes || []).map(a => ({ 
       key: a.key, 
       value: a.value 
@@ -638,17 +627,7 @@ const updatecartItem = async (req, res) => {
       'updateCartItem:response'
     );
 
-    // Format response
-    const formattedItems = [];
-    for (const it of populatedcart.items) {
-      const prod = it.productId;
-      if (!prod) continue;
-      let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
-      if (!varObj) varObj = firstListedVariant(prod, storefront);
-      if (!varObj) continue;
-      const formatted = formatcartItem(it, prod, varObj, storefront);
-      if (formatted) formattedItems.push(formatted);
-    }
+    const formattedItems = await formatPopulatedCartItems(populatedcart.items, storefront);
     
     const totalAmt = formattedItems.reduce((sum, it) => sum + it.total, 0);
     const totalOriginalAmt = formattedItems.reduce((sum, it) => sum + (it.price.base * it.quantity), 0);
@@ -739,18 +718,12 @@ const mergecart = async (req, res) => {
           const moq = Number(variant.minimumOrderQuantity || 1);
           qty = Math.max(qty, moq);
         }
-        const price = getStorefrontSpecificPrice(variant, storefront);
+        const isOnSale = await productIsOnSale(productId);
         cart.items.push({
           productId,
           variantId,
           quantity: qty,
-          priceSnapshot: {
-            base: price.base,
-            sale: price.sale,
-            costPrice: variant.price?.costPrice ?? null,
-            saleStartDate: variant.price?.saleStartDate ?? null,
-            saleEndDate: variant.price?.saleEndDate ?? null
-          },
+          priceSnapshot: toCartPriceSnapshot(variant, storefront, { isOnSale }),
           variantAttributesSnapshot: (variant.attributes || []).map(a => ({
             key: a.key,
             value: a.value
@@ -769,16 +742,7 @@ const mergecart = async (req, res) => {
         select: CART_PRODUCT_SELECT
       });
 
-    const formattedItems = [];
-    for (const it of populatedcart?.items || []) {
-      const prod = it.productId;
-      if (!prod) continue;
-      let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
-      if (!varObj) varObj = firstListedVariant(prod, storefront);
-      if (!varObj) continue;
-      const formatted = formatcartItem(it, prod, varObj, storefront);
-      if (formatted) formattedItems.push(formatted);
-    }
+    const formattedItems = await formatPopulatedCartItems(populatedcart?.items || [], storefront);
 
     const totalAmt = formattedItems.reduce((sum, it) => sum + it.total, 0);
     const totalOriginalAmt = formattedItems.reduce((sum, it) => sum + (it.price.base * it.quantity), 0);
@@ -841,18 +805,7 @@ const removecartItem = async (req, res) => {
         select: CART_PRODUCT_SELECT
       });
 
-    const formattedItems = [];
-    if (populatedcart) {
-      for (const it of populatedcart.items) {
-        const prod = it.productId;
-        if (!prod) continue;
-        let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
-        if (!varObj) varObj = firstListedVariant(prod, storefront);
-        if (!varObj) continue;
-        const formatted = formatcartItem(it, prod, varObj, storefront);
-        if (formatted) formattedItems.push(formatted);
-      }
-    }
+    const formattedItems = await formatPopulatedCartItems(populatedcart?.items || [], storefront);
 
     const totalAmt = formattedItems.reduce((sum, it) => sum + it.total, 0);
     const totalOriginalAmt = formattedItems.reduce((sum, it) => sum + (it.price.base * it.quantity), 0);
@@ -916,18 +869,7 @@ const bulkRemove = async (req, res) => {
         select: CART_PRODUCT_SELECT
       });
 
-    const formattedItems = [];
-    if (populatedcart) {
-      for (const it of populatedcart.items) {
-        const prod = it.productId;
-        if (!prod) continue;
-        let varObj = prod.variants?.find(v => String(v._id) === String(it.variantId));
-        if (!varObj) varObj = firstListedVariant(prod, storefront);
-        if (!varObj) continue;
-        const formatted = formatcartItem(it, prod, varObj, storefront);
-        if (formatted) formattedItems.push(formatted);
-      }
-    }
+    const formattedItems = await formatPopulatedCartItems(populatedcart?.items || [], storefront);
 
     const totalAmt = formattedItems.reduce((sum, it) => sum + it.total, 0);
     const totalOriginalAmt = formattedItems.reduce((sum, it) => sum + (it.price.base * it.quantity), 0);

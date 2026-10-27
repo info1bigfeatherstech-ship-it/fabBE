@@ -72,6 +72,8 @@ const variantSchema = new mongoose.Schema(
     price: {
       base: { type: Number, required: true, min: 0 },
       sale: { type: Number, default: null },
+      /** Extra on-sale payable (e.g. 20% off sale). Ignored unless product is tagged on-sale. */
+      promo: { type: Number, default: null, min: 0 },
       wholesaleBase: {
         type: Number,
         min: 0,

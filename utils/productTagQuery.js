@@ -101,10 +101,55 @@ async function buildTagFilterClause(tagSlugs = []) {
   return { _id: { $in: ids } };
 }
 
+const ON_SALE_TAG = 'on-sale';
+
+function productHasOnSaleTag(tags) {
+  if (!Array.isArray(tags)) return false;
+  return tags.some((tag) => String(tag || '').trim().toLowerCase() === ON_SALE_TAG);
+}
+
+/**
+ * Product ids that currently have the `on-sale` marketing tag.
+ * @param {Array<import('mongoose').Types.ObjectId|string>} productIds
+ * @returns {Promise<Set<string>>}
+ */
+async function getOnSaleProductIdSet(productIds = []) {
+  const ids = [];
+  const seen = new Set();
+
+  for (const raw of productIds || []) {
+    if (raw == null) continue;
+    const id = raw._id != null ? raw._id : raw;
+    const key = String(id);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (mongoose.Types.ObjectId.isValid(key)) ids.push(id);
+  }
+
+  if (!ids.length) return new Set();
+
+  const tagDocs = await ProductTag.find({
+    product: { $in: ids },
+    tags: ON_SALE_TAG,
+  })
+    .select('product')
+    .lean();
+
+  const onSale = new Set();
+  for (const doc of tagDocs) {
+    if (!doc?.product) continue;
+    onSale.add(String(doc.product));
+  }
+  return onSale;
+}
+
 module.exports = {
   MARKETING_TAG_SLUGS,
+  ON_SALE_TAG,
   normalizeTagSlugs,
+  productHasOnSaleTag,
   getProductIdsByTags,
   getLiveProductIdsByTags,
+  getOnSaleProductIdSet,
   buildTagFilterClause,
 };
