@@ -37,6 +37,11 @@ const {
 } = require('../utils/variantAttributes');
 const { readIncomingPromoPrice } = require('../utils/variantPrice');
 const {
+  resolveAdminMarketingTagFilter,
+  buildTagFilterClause,
+  sanitizeMarketingTags,
+} = require('../utils/productTagQuery');
+const {
   resolveImageAxisKey,
   imageGroupToken,
   applyInheritedGroupImages,
@@ -6719,13 +6724,31 @@ function buildAdminCatalogListFilter({ search = "", status = "", category = "" }
 
 const getAllProductsAdmin = async (req, res) => {
   try {
-    let { page = 1, limit = 20, search = "", status = "", category = "" } = req.query;
+    let { page = 1, limit = 20, search = "", status = "", category = "", tags = "" } = req.query;
 
     page = Number(page);
+    if (!Number.isFinite(page) || page < 1) page = 1;
     limit = Math.min(100, Math.max(1, Number(limit)));
+    if (!Number.isFinite(limit)) limit = 20;
 
     const skip = (page - 1) * limit;
     const listFilter = buildAdminCatalogListFilter({ search, status, category });
+    const tagFilter = resolveAdminMarketingTagFilter(tags);
+
+    let tagClause = null;
+    let emptyByTags = false;
+    if (tagFilter.active) {
+      if (!tagFilter.slugs.length) {
+        emptyByTags = true;
+      } else {
+        tagClause = await buildTagFilterClause(tagFilter.slugs);
+        if (!tagClause) emptyByTags = true;
+      }
+    }
+
+    const combinedFilter = tagClause
+      ? { $and: [listFilter, tagClause] }
+      : listFilter;
 
     const [
       products,
@@ -6736,14 +6759,16 @@ const getAllProductsAdmin = async (req, res) => {
       featuredCount,
       lowStockCount,
     ] = await Promise.all([
-      Product.find(listFilter)
-        .populate("category", "name slug status")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean({ virtuals: true }),
+      emptyByTags
+        ? Promise.resolve([])
+        : Product.find(combinedFilter)
+            .populate("category", "name slug status")
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean({ virtuals: true }),
 
-      Product.countDocuments(listFilter),
+      emptyByTags ? Promise.resolve(0) : Product.countDocuments(combinedFilter),
       Product.countDocuments({}),
       Product.countDocuments(buildEcommActiveCountQuery()),
       Product.countDocuments({ status: "archived" }),
@@ -6754,12 +6779,14 @@ const getAllProductsAdmin = async (req, res) => {
     const inactiveCount = Math.max(0, catalogTotal - activeCount - archivedCount);
 
     // get ids
-    const productIds = products.map((p) => p._id);
+    const productIds = products.map((p) => p._id).filter(Boolean);
 
     // fetch tags
-    const productTags = await ProductTag.find({
-      product: { $in: productIds },
-    }).lean();
+    const productTags = productIds.length
+      ? await ProductTag.find({
+          product: { $in: productIds },
+        }).lean()
+      : [];
 
     // make tag map
     const tagMap = {};
@@ -6773,7 +6800,7 @@ const getAllProductsAdmin = async (req, res) => {
 
       return {
         ...product,
-        tags: tagMap[product._id.toString()] || [],
+        tags: sanitizeMarketingTags(tagMap[product._id.toString()] || []),
         variants: variants.map((variant) => ({
           ...variant,
           availability: getVariantAvailabilityByStorefront(variant),
@@ -6795,9 +6822,10 @@ const getAllProductsAdmin = async (req, res) => {
     return res.status(200).json({
       success: true,
       totalProducts,
-      totalPages: Math.ceil(totalProducts / limit),
+      totalPages: totalProducts > 0 ? Math.ceil(totalProducts / limit) : 0,
       currentPage: page,
       products: finalProducts, // <- THIS
+      appliedTags: tagFilter.active ? tagFilter.slugs : [],
       counts: {
         total: catalogTotal,
         active: activeCount,

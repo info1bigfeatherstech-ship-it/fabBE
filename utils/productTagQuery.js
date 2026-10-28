@@ -13,6 +13,55 @@ const MARKETING_TAG_SLUGS = Object.freeze([
 ]);
 
 /**
+ * Old ProductTag slugs renamed when festive became a dynamic label.
+ * Values are current MARKETING_TAG_SLUGS. Mapping is additive (no product data loss).
+ */
+const LEGACY_MARKETING_TAG_MAP = Object.freeze({
+  'ganesh-chaturthi-sale': 'festive-offer',
+});
+
+/**
+ * Map legacy slugs, drop unknown values, de-dupe.
+ * Used on read + write so Mongoose enum never sees retired slugs.
+ * @param {unknown} rawTags
+ * @returns {string[]}
+ */
+function sanitizeMarketingTags(rawTags = []) {
+  try {
+    const list = Array.isArray(rawTags) ? rawTags : [];
+    const seen = new Set();
+    const out = [];
+    for (const raw of list) {
+      const slug = String(raw || '').trim().replace(/_/g, '-').toLowerCase();
+      if (!slug) continue;
+      const mapped = LEGACY_MARKETING_TAG_MAP[slug] || slug;
+      if (!MARKETING_TAG_SLUGS.includes(mapped) || seen.has(mapped)) continue;
+      seen.add(mapped);
+      out.push(mapped);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * When querying a current slug, also match its legacy aliases still sitting in Mongo.
+ * @param {string|string[]|null|undefined} tagSlugs
+ * @returns {string[]}
+ */
+function expandTagSlugsForQuery(tagSlugs = []) {
+  const normalized = sanitizeMarketingTags(
+    Array.isArray(tagSlugs) ? tagSlugs : normalizeTagSlugs(tagSlugs)
+  );
+  const out = new Set(normalized);
+  for (const [legacy, current] of Object.entries(LEGACY_MARKETING_TAG_MAP)) {
+    if (out.has(current)) out.add(legacy);
+  }
+  return [...out];
+}
+
+/**
  * Normalize tag slugs from query strings or admin payloads.
  * @param {string|string[]|null|undefined} raw
  * @returns {string[]}
@@ -41,12 +90,31 @@ function normalizeTagSlugs(raw) {
 }
 
 /**
+ * Parse admin `tags` query for catalog listing.
+ * Unknown slugs are dropped. Empty / omitted query → no tag filter.
+ *
+ * @param {string|string[]|null|undefined} raw
+ * @returns {{ active: boolean, slugs: string[] }}
+ */
+function resolveAdminMarketingTagFilter(raw) {
+  try {
+    if (raw == null) return { active: false, slugs: [] };
+    const joined = Array.isArray(raw) ? raw.join(',') : String(raw);
+    if (!String(joined).trim()) return { active: false, slugs: [] };
+    const slugs = sanitizeMarketingTags(normalizeTagSlugs(joined));
+    return { active: true, slugs };
+  } catch {
+    return { active: false, slugs: [] };
+  }
+}
+
+/**
  * Product ids that have at least one of the requested tags (ProductTag collection).
  * @param {string[]} tagSlugs
  * @returns {Promise<import('mongoose').Types.ObjectId[]>}
  */
 async function getProductIdsByTags(tagSlugs = []) {
-  const normalized = normalizeTagSlugs(tagSlugs);
+  const normalized = expandTagSlugsForQuery(tagSlugs);
   if (!normalized.length) return [];
 
   const tagDocs = await ProductTag.find({ tags: { $in: normalized } })
@@ -145,8 +213,12 @@ async function getOnSaleProductIdSet(productIds = []) {
 
 module.exports = {
   MARKETING_TAG_SLUGS,
+  LEGACY_MARKETING_TAG_MAP,
   ON_SALE_TAG,
   normalizeTagSlugs,
+  sanitizeMarketingTags,
+  expandTagSlugsForQuery,
+  resolveAdminMarketingTagFilter,
   productHasOnSaleTag,
   getProductIdsByTags,
   getLiveProductIdsByTags,

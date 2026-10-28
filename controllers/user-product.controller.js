@@ -19,6 +19,7 @@ const {
   normalizeTagSlugs,
   buildTagFilterClause,
   productHasOnSaleTag,
+  sanitizeMarketingTags,
 } = require('../utils/productTagQuery');
 const { buildNameAndProductCodeSearch } = require('../utils/productCode');
 const { resolveStorefrontVariantPrice } = require('../utils/variantPrice');
@@ -228,9 +229,9 @@ async function attachAppliedTagsToProducts(products) {
   for (const doc of tagDocs) {
     if (!doc?.product) continue;
     const key = String(doc.product);
-    const incoming = Array.isArray(doc.tags) ? doc.tags : [];
+    const incoming = sanitizeMarketingTags(doc.tags);
     const existing = tagMap.get(key) || [];
-    tagMap.set(key, Array.from(new Set([...existing, ...incoming])));
+    tagMap.set(key, sanitizeMarketingTags([...existing, ...incoming]));
   }
 
   return products.map((p) => ({
@@ -250,7 +251,7 @@ async function attachAppliedTagsToProduct(product) {
     .lean();
   return {
     ...product,
-    appliedTags: Array.isArray(doc?.tags) ? doc.tags : [],
+    appliedTags: sanitizeMarketingTags(doc?.tags),
   };
 }
 
