@@ -197,18 +197,22 @@ function paymentAndCollectable(order) {
   }
 }
 
-/** Assigned courier for the label header. Skip aggregator brand; keep original casing. */
+/**
+ * Custom label courier — actual assigned / booked courier (AWB + barcode match this).
+ * Shipping ₹ on the label stay customer quote via paymentAndCollectable (not changed here).
+ */
 function displayCourierName(order) {
-  const candidates = [
-    order?.shipmentInfo?.courier,
-    order?.shippingSnapshot?.courierName
-  ];
-  for (const raw of candidates) {
-    const name = String(raw || '').trim();
-    if (!name) continue;
-    if (/^ship\s*mozo$/i.test(name)) continue;
-    return name;
+  try {
+    const { resolveAssignedCourierName } = require('../utils/customerFacingCourier');
+    const assigned = resolveAssignedCourierName(order);
+    if (assigned) return assigned;
+  } catch {
+    /* fall through */
   }
+  const assigned = String(order?.shipmentInfo?.courier || '').trim();
+  if (assigned && !/^ship\s*mozo$/i.test(assigned) && !/^shiprocket$/i.test(assigned)) return assigned;
+  const snap = String(order?.shippingSnapshot?.courierName || '').trim();
+  if (snap && !/^ship\s*mozo$/i.test(snap) && !/^shiprocket$/i.test(snap)) return snap;
   return 'Courier';
 }
 

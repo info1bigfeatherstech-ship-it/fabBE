@@ -4067,11 +4067,21 @@ exports.trackOrder = async (req, res) => {
         const fallbackTimeline = buildDefaultOrderTimeline(orderDoc);
         const rawTimeline = buildLiveTimelineFromEvents(liveTracking?.events, fallbackTimeline);
 
+        const {
+            resolveCustomerFacingCourierName,
+            resolveAssignedCourierName
+        } = require('../utils/customerFacingCourier');
+        const assignedCourier = resolveAssignedCourierName(orderDoc) || orderDoc.shipmentInfo?.courier || null;
+        const quotedCourierForAdmin =
+            resolveCustomerFacingCourierName(orderDoc) || assignedCourier || null;
+        const isStaffTrack = isOrderStaffRequest(req);
+
         const tracking = {
             orderId: orderDoc.orderId,
             currentStatus: orderDoc.orderStatus,
             trackingNumber: orderDoc.shipmentInfo?.trackingNumber || null,
-            courier: orderDoc.shipmentInfo?.courier || null,
+            // Real booked courier (matches AWB / custom label name). Shipping ₹ stay quote-frozen on order.
+            courier: assignedCourier,
             estimatedDelivery: orderDoc.shipmentInfo?.estimatedDelivery || null,
             providerStatus: orderDoc.shipmentInfo?.providerStatus || null,
             lastSyncedAt: orderDoc.shipmentInfo?.lastSyncAt || null,
@@ -4080,9 +4090,11 @@ exports.trackOrder = async (req, res) => {
             timeline: enrichPreTransitTrackingTimeline(rawTimeline, orderDoc)
         };
 
-        if (isOrderStaffRequest(req)) {
+        if (isStaffTrack) {
             const { buildShipmentOpsView } = require('../services/shipmentOps');
             tracking.shipmentOps = buildShipmentOpsView(orderDoc, { source: 'track_order' });
+            tracking.assignedCourier = assignedCourier;
+            tracking.quotedCourier = quotedCourierForAdmin;
         } else {
             const { buildCustomerTrackingExtras } = require('../utils/customerTrackingDisplay');
             const hasAwb = Boolean(
@@ -4095,9 +4107,10 @@ exports.trackOrder = async (req, res) => {
                 liveEvents: liveTracking?.events,
                 hasAwb
             });
+            // Customers get common order milestones only — not raw provider scan noise.
             tracking.simpleTimeline = fallbackTimeline;
-            tracking.courierTimeline = customerExtras.courierTimeline;
             tracking.statusSummary = customerExtras.statusSummary;
+            // Do not expose courierTimeline / raw provider event feed on storefront track.
         }
 
         return res.json({
