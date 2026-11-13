@@ -21,7 +21,8 @@ const {
 } = require('../utils/checkoutFlow');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
 const {
-  evaluateFreeShippingForSubtotal
+  evaluateFreeShippingForSubtotal,
+  isExclusivePromoActive
 } = require('../services/freeShippingOffer.service');
 const { pricingUserTypeForStorefront } = require('../utils/accountScope');
 const {
@@ -64,6 +65,11 @@ function allowDemoMockShipping(req) {
 function buildFreeShippingClientFields(finalTotals) {
   const meta = finalTotals?.deliveryMeta || {};
   const applied = Boolean(finalTotals?.freeShippingApplied || meta.freeShippingApplied);
+  const blockedByPromo = Boolean(
+    finalTotals?.freeShippingBlockedByPromo || meta.freeShippingBlockedByPromo
+  );
+  const blockReason =
+    finalTotals?.freeShippingBlockReason || meta.freeShippingBlockReason || null;
   const originalDeliveryCharges =
     finalTotals?.originalDeliveryCharges != null &&
     Number.isFinite(Number(finalTotals.originalDeliveryCharges))
@@ -91,6 +97,8 @@ function buildFreeShippingClientFields(finalTotals) {
               : null
         }
       : null,
+    freeShippingBlockedByPromo: !applied && blockedByPromo,
+    freeShippingBlockReason: !applied && blockedByPromo ? blockReason : null,
     originalDeliveryCharges: applied ? originalDeliveryCharges : null,
     originalFreightInr: applied ? freightInr : null,
     originalCodFeeInr: applied ? codFeeInr : null
@@ -145,14 +153,25 @@ async function buildFinalTotals({
       null,
       { consumeUsage: false, userId: resolvedUserId, storefront }
     );
+    const exclusivePromoActive = isExclusivePromoActive({
+      appliedCouponCode,
+      appliedReferral
+    });
     let deliveryCharges = roundMoney2(35 + Math.floor(Math.random() * 56));
     const originalDeliveryCharges = deliveryCharges;
     const freightInr = deliveryCharges;
     const codFeeInr = 0;
     let freeShippingApplied = false;
     let freeShippingOfferMeta = null;
+    let freeShippingBlockedByPromo = false;
+    let freeShippingBlockReason = null;
     try {
-      const fsEval = await evaluateFreeShippingForSubtotal({ itemsSubtotal: evaluated.subtotal });
+      const fsEval = await evaluateFreeShippingForSubtotal({
+        itemsSubtotal: evaluated.subtotal,
+        exclusivePromoActive
+      });
+      freeShippingBlockedByPromo = Boolean(fsEval.blockedByExclusivePromo);
+      freeShippingBlockReason = fsEval.blockReason || null;
       if (fsEval.applied && fsEval.offer) {
         freeShippingApplied = true;
         freeShippingOfferMeta = {
@@ -164,6 +183,8 @@ async function buildFinalTotals({
       }
     } catch (_) {
       /* fail closed */
+      freeShippingBlockedByPromo = exclusivePromoActive;
+      freeShippingBlockReason = exclusivePromoActive ? 'COUPON_OR_REFERRAL_EXCLUSIVE' : null;
     }
     let freeGiftApplied = false;
     let freeGiftOfferMeta = null;
@@ -188,6 +209,8 @@ async function buildFinalTotals({
         tax,
         freeShippingApplied,
         freeShippingOffer: freeShippingOfferMeta,
+        freeShippingBlockedByPromo,
+        freeShippingBlockReason,
         originalDeliveryCharges,
         freeGiftApplied,
         freeGiftOffer: freeGiftOfferMeta,
@@ -202,7 +225,9 @@ async function buildFinalTotals({
           codFeeInr,
           originalDeliveryCharges,
           freeShippingApplied,
-          freeShippingOffer: freeShippingOfferMeta
+          freeShippingOffer: freeShippingOfferMeta,
+          freeShippingBlockedByPromo,
+          freeShippingBlockReason
         }
       },
       {

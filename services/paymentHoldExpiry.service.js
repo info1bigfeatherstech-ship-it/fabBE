@@ -111,6 +111,7 @@ class PaymentHoldExpiryService {
             continue;
           }
 
+          const previousStatusForCoupon = order.orderStatus;
           order.orderStatus = 'cancelled';
           order.paymentStatus = 'failed';
           order.amountPaidInr = 0;
@@ -121,6 +122,18 @@ class PaymentHoldExpiryService {
           order.paymentInfo.cancelledAt = now;
           order.markModified('paymentInfo');
           await order.save({ session });
+
+          try {
+            const { maybeReleaseCouponSlotOnStatusChange } = require('./couponUsage.service');
+            await maybeReleaseCouponSlotOnStatusChange(
+              order,
+              previousStatusForCoupon,
+              'cancelled',
+              session
+            );
+          } catch (_) {
+            /* non-blocking — cancel must proceed */
+          }
 
           await releaseOrderStockHold(order, session);
           await order.save({ session });

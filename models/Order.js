@@ -525,5 +525,7 @@ orderSchema.pre('save', async function () {
 
 orderSchema.index({ userId: 1, createdAt: -1 });
 orderSchema.index({ createdAt: -1, orderStatus: 1 });
+/** Per-user coupon usage lookups (appliedCoupon.code + status). */
+orderSchema.index({ userId: 1, 'appliedCoupon.code': 1, orderStatus: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);

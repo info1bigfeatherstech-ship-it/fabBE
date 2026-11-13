@@ -754,12 +754,19 @@ async function previewOrApplyPendingOrderEdit(opts) {
     }));
 
     order.balanceDueInr = 0;
+    const previousStatusForCoupon = order.orderStatus;
     order.orderStatus = 'cancelled';
     order.paymentInfo = order.paymentInfo || {};
     order.paymentInfo.cancellationReason = 'admin_amended_empty';
     order.paymentInfo.cancelledAt = new Date();
     order.paymentInfo.itemsUnavailableCancel = true;
     order.markModified('paymentInfo');
+    try {
+      const { maybeReleaseCouponSlotOnStatusChange } = require('./couponUsage.service');
+      await maybeReleaseCouponSlotOnStatusChange(order, previousStatusForCoupon, 'cancelled');
+    } catch (_) {
+      /* non-blocking */
+    }
 
     if (archiveEntries.length) {
       order.removedItemsArchive = [...(order.removedItemsArchive || []), ...archiveEntries];

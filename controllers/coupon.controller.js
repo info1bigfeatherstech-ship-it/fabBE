@@ -8,6 +8,10 @@ const {
   couponLoyaltyEligible,
   normalizeSlug
 } = require('../services/loyalty.service');
+const {
+  evaluatePerUserCouponAvailability,
+  assertUserMayUseCoupon
+} = require('../services/couponUsage.service');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const FIRST_ORDER_COUPON_CODE = 'WELC01';
@@ -390,8 +394,21 @@ const validateCoupon = async (req, res) => {
             return couponError(res, 400, 'COUPON_USAGE_LIMIT_REACHED', 'Coupon usage limit has been reached');
         }
 
-        // Check per user limit (you'll need a UserCouponUsage model for this)
-        // For now, skip or implement later
+        // Per-user limit (Order history + atomic counter)
+        try {
+            await assertUserMayUseCoupon(userId, coupon);
+        } catch (perUserErr) {
+            if (perUserErr?.code === 'COUPON_PER_USER_LIMIT') {
+                return couponError(
+                    res,
+                    409,
+                    'COUPON_PER_USER_LIMIT',
+                    perUserErr.message || 'You have already used this coupon',
+                    perUserErr.details || undefined
+                );
+            }
+            throw perUserErr;
+        }
 
         // Calculate discount amount
         let discountAmount = 0;
@@ -442,7 +459,7 @@ const getAvailableCoupons = async (req, res) => {
             isActive: true,
             expiryDate: { $gt: now },
             applicableUsers: applicableFilter
-        }).select('code name description discountType discountValue maxDiscountAmount minOrderValue expiryDate allowedLoyaltyBadges');
+        }).select('code name description discountType discountValue maxDiscountAmount minOrderValue expiryDate allowedLoyaltyBadges perUserLimit');
 
         const userDoc = await User.findById(req.userId).select('loyalty.badgeSlug').lean();
         const userSlug = userDoc?.loyalty?.badgeSlug || null;
@@ -454,6 +471,19 @@ const getAvailableCoupons = async (req, res) => {
         } else {
             coupons = coupons.sort((a, b) => Number(isFirstOrderCoupon(b)) - Number(isFirstOrderCoupon(a)));
         }
+
+        // Hide coupons the user has already exhausted (perUserLimit)
+        const availability = await Promise.all(
+            coupons.map(async (coupon) => {
+                try {
+                    const result = await evaluatePerUserCouponAvailability(req.userId, coupon);
+                    return result.ok ? coupon : null;
+                } catch (_) {
+                    return coupon; // fail open on list only — validate/checkout still enforce
+                }
+            })
+        );
+        coupons = availability.filter(Boolean);
 
         return res.json({
             success: true,

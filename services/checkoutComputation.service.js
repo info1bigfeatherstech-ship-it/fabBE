@@ -28,13 +28,20 @@ const {
 const { overlayExternalStockOnProducts } = require('./inventoryStockOverlay.service');
 const { normalizeProductCode } = require('../utils/productCode');
 const {
-  evaluateFreeShippingForSubtotal
+  evaluateFreeShippingForSubtotal,
+  isExclusivePromoActive,
+  applyExclusivePromoToDeliveryState
 } = require('./freeShippingOffer.service');
 const {
   evaluateFreeGiftForOrder
 } = require('./freeGiftOffer.service');
+const {
+  assertUserMayUseCoupon,
+  consumeUserCouponSlot
+} = require('./couponUsage.service');
 const { getOnSaleProductIdSet } = require('../utils/productTagQuery');
 const { resolveRetailPayablePrice } = require('../utils/variantPrice');
+const logger = require('../utils/logger');
 
 const roundMoney2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -354,6 +361,33 @@ async function resolveCouponDiscount(couponCode, subtotal, finalUserType, sessio
   }
 
   if (!isExpired && meetsMinOrder && isUserEligible && hasUsageLeft && loyaltyOk) {
+    // Per-user limit: soft-check on quote; hard claim when consumeUsage (order create).
+    try {
+      if (consumeUsage) {
+        if (!userId) {
+          const err = new Error('Login required to apply this coupon');
+          err.statusCode = 401;
+          err.code = 'COUPON_USER_REQUIRED';
+          throw err;
+        }
+        await consumeUserCouponSlot({ userId, coupon, session });
+      } else if (userId) {
+        await assertUserMayUseCoupon(userId, coupon, session);
+      }
+    } catch (perUserErr) {
+      if (perUserErr?.code === 'COUPON_PER_USER_LIMIT') {
+        // Quote/preview: treat as not applied. Order create (consumeUsage): fail hard.
+        if (consumeUsage) throw perUserErr;
+        return {
+          discount: 0,
+          appliedCouponCode: null,
+          couponDoc: coupon,
+          perUserLimitBlocked: true
+        };
+      }
+      throw perUserErr;
+    }
+
     if (coupon.discountType === 'percentage') {
       discount = (subtotal * coupon.discountValue) / 100;
       if (coupon.maxDiscountAmount && discount > coupon.maxDiscountAmount) {
@@ -413,6 +447,11 @@ async function computeCheckoutTotals({
     { consumeUsage: consumeCoupon, userId: resolvedUserId, storefront }
   );
 
+  const exclusivePromoActive = isExclusivePromoActive({
+    appliedCouponCode,
+    appliedReferral
+  });
+
   const { attachLoyaltyDiscountToTotals } = require('./loyaltyPoints.service');
 
   let deliveryCharges;
@@ -458,6 +497,46 @@ async function computeCheckoutTotals({
       freeShippingOffer: baseOverride.freeShippingOffer || null
     };
 
+    // Defense-in-depth: locked quote shipping must not stack with coupon/referral.
+    let freeShippingApplied = Boolean(deliveryMeta.freeShippingApplied);
+    let freeShippingOfferMeta = freeShippingApplied ? deliveryMeta.freeShippingOffer || null : null;
+    let freeShippingBlockedByPromo = false;
+    let freeShippingBlockReason = null;
+    let originalDeliveryCharges = deliveryMeta.originalDeliveryCharges;
+    try {
+      const exclusiveDelivery = applyExclusivePromoToDeliveryState({
+        deliveryCharges,
+        deliveryMeta,
+        exclusivePromoActive
+      });
+      deliveryCharges = exclusiveDelivery.deliveryCharges;
+      deliveryMeta = exclusiveDelivery.deliveryMeta;
+      freeShippingApplied = exclusiveDelivery.freeShippingApplied;
+      freeShippingOfferMeta = exclusiveDelivery.freeShippingOffer;
+      freeShippingBlockedByPromo = exclusiveDelivery.freeShippingBlockedByPromo;
+      freeShippingBlockReason = exclusiveDelivery.freeShippingBlockReason;
+      originalDeliveryCharges = exclusiveDelivery.originalDeliveryCharges;
+    } catch (exclusiveErr) {
+      logger.error('[checkout] exclusive promo delivery adjust failed (override path)', {
+        message: exclusiveErr?.message,
+        stack: exclusiveErr?.stack
+      });
+      // Fail closed: never keep free-shipping waiver if promo is active.
+      if (exclusivePromoActive) {
+        freeShippingApplied = false;
+        freeShippingOfferMeta = null;
+        freeShippingBlockedByPromo = true;
+        freeShippingBlockReason = 'COUPON_OR_REFERRAL_EXCLUSIVE';
+        deliveryMeta = {
+          ...deliveryMeta,
+          freeShippingApplied: false,
+          freeShippingOffer: null,
+          freeShippingBlockedByPromo: true,
+          freeShippingBlockReason
+        };
+      }
+    }
+
     const tax = calculateTax(evaluated.lines);
     const withLoyalty = await attachLoyaltyDiscountToTotals(
       {
@@ -469,9 +548,11 @@ async function computeCheckoutTotals({
         deliveryCharges,
         deliveryMeta,
         tax,
-        freeShippingApplied: Boolean(baseOverride.freeShippingApplied),
-        freeShippingOffer: baseOverride.freeShippingOffer || null,
-        originalDeliveryCharges: deliveryMeta.originalDeliveryCharges
+        freeShippingApplied,
+        freeShippingOffer: freeShippingOfferMeta,
+        freeShippingBlockedByPromo,
+        freeShippingBlockReason,
+        originalDeliveryCharges
       },
       {
         storefront,
@@ -536,14 +617,20 @@ async function computeCheckoutTotals({
 
   // Auto free-shipping offer: waive customer-billed delivery (freight + COD fee bundled).
   // Keep original courier splits on deliveryMeta for admin / RTO / fulfillment margin.
+  // Exclusive with coupon/referral — one checkout benefit at a time.
   const originalDeliveryCharges = roundMoney2(Number(deliveryCharges) || 0);
   let freeShippingApplied = false;
   let freeShippingOfferMeta = null;
+  let freeShippingBlockedByPromo = false;
+  let freeShippingBlockReason = null;
   try {
     // Threshold uses items subtotal only (before shipping; coupon discount does not change eligibility).
     const fsEval = await evaluateFreeShippingForSubtotal({
-      itemsSubtotal: evaluated.subtotal
+      itemsSubtotal: evaluated.subtotal,
+      exclusivePromoActive
     });
+    freeShippingBlockedByPromo = Boolean(fsEval.blockedByExclusivePromo);
+    freeShippingBlockReason = fsEval.blockReason || null;
     if (fsEval.applied && fsEval.offer) {
       freeShippingApplied = true;
       freeShippingOfferMeta = {
@@ -556,23 +643,35 @@ async function computeCheckoutTotals({
         ...deliveryMeta,
         originalDeliveryCharges,
         freeShippingApplied: true,
-        freeShippingOffer: freeShippingOfferMeta
+        freeShippingOffer: freeShippingOfferMeta,
+        freeShippingBlockedByPromo: false,
+        freeShippingBlockReason: null
       };
     } else {
       deliveryMeta = {
         ...deliveryMeta,
         originalDeliveryCharges,
         freeShippingApplied: false,
-        freeShippingOffer: null
+        freeShippingOffer: null,
+        freeShippingBlockedByPromo,
+        freeShippingBlockReason
       };
     }
   } catch (fsErr) {
     // Fail closed: keep charged shipping if offer evaluation throws.
+    logger.error('[checkout] free shipping evaluation failed', {
+      message: fsErr?.message,
+      stack: fsErr?.stack
+    });
+    freeShippingBlockedByPromo = exclusivePromoActive;
+    freeShippingBlockReason = exclusivePromoActive ? 'COUPON_OR_REFERRAL_EXCLUSIVE' : null;
     deliveryMeta = {
       ...deliveryMeta,
       originalDeliveryCharges,
       freeShippingApplied: false,
-      freeShippingOffer: null
+      freeShippingOffer: null,
+      freeShippingBlockedByPromo,
+      freeShippingBlockReason
     };
   }
 
@@ -608,6 +707,8 @@ async function computeCheckoutTotals({
       tax,
       freeShippingApplied,
       freeShippingOffer: freeShippingOfferMeta,
+      freeShippingBlockedByPromo,
+      freeShippingBlockReason,
       originalDeliveryCharges,
       freeGiftApplied,
       freeGiftOffer: freeGiftOfferMeta

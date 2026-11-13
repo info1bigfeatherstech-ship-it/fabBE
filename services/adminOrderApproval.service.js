@@ -691,6 +691,7 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
       Boolean(order.paymentInfo?.razorpayPaymentId);
     const refundAmountInr = canInitiateRefund ? getCancelledOrderRefundAmount(order) : 0;
 
+    const previousStatusForCoupon = order.orderStatus;
     order.orderStatus = 'cancelled';
     if (!hadCapturedPayment && String(order.paymentInfo?.method || '').toLowerCase() === 'online') {
       order.paymentStatus = 'failed';
@@ -709,6 +710,17 @@ async function runAdminCancelOrderSingle(orderId, opts = {}) {
     order.markModified('returnInfo');
 
     await order.save({ session });
+    try {
+      const { maybeReleaseCouponSlotOnStatusChange } = require('./couponUsage.service');
+      await maybeReleaseCouponSlotOnStatusChange(
+        order,
+        previousStatusForCoupon,
+        'cancelled',
+        session
+      );
+    } catch (_) {
+      /* non-blocking */
+    }
     // Paid/partial cancel must restock even if payment was already committed; refund is separate.
     const releaseOutcome = await releaseOrderStockHold(order, session, {
       restoreCommittedOnCancel: true,

@@ -1,11 +1,15 @@
 /**
- * Unit tests — free shipping offer evaluation (no DB).
+ * Unit tests — free shipping offer evaluation + coupon exclusivity (no DB).
  * Run: node scripts/test-free-shipping-offer.js
  */
 const assert = require('assert');
 const {
   isOfferCurrentlyLive,
-  roundMoney2
+  roundMoney2,
+  isExclusivePromoActive,
+  decideFreeShippingWaiver,
+  applyExclusivePromoToDeliveryState,
+  FREE_SHIPPING_BLOCK_REASON
 } = require('../services/freeShippingOffer.service');
 
 function testLiveWithoutEndDate() {
@@ -52,6 +56,112 @@ function testWaiverMath() {
   assert.ok(originalDelivery > customerDelivery);
 }
 
+function testExclusivePromoDetection() {
+  assert.strictEqual(isExclusivePromoActive({}), false);
+  assert.strictEqual(isExclusivePromoActive({ appliedCouponCode: null }), false);
+  assert.strictEqual(isExclusivePromoActive({ appliedCouponCode: '  ' }), false);
+  assert.strictEqual(isExclusivePromoActive({ appliedCouponCode: 'WEL50' }), true);
+  assert.strictEqual(
+    isExclusivePromoActive({ appliedReferral: { code: 'RF-001', discount: 80 } }),
+    true
+  );
+  assert.strictEqual(isExclusivePromoActive({ appliedReferral: {} }), false);
+}
+
+function testDecideWaiverWithoutPromo() {
+  const offer = { _id: 'o1', name: 'Free ship 999', minCartValue: 999 };
+  const ok = decideFreeShippingWaiver({
+    thresholdMet: true,
+    offer,
+    minCartValue: 999,
+    shortfallInr: 0,
+    exclusivePromoActive: false
+  });
+  assert.strictEqual(ok.applied, true);
+  assert.strictEqual(ok.blockedByExclusivePromo, false);
+  assert.strictEqual(ok.blockReason, null);
+}
+
+function testDecideWaiverBlockedByCoupon() {
+  const offer = { _id: 'o1', name: 'Free ship 999', minCartValue: 999 };
+  const blocked = decideFreeShippingWaiver({
+    thresholdMet: true,
+    offer,
+    minCartValue: 999,
+    shortfallInr: 0,
+    exclusivePromoActive: true
+  });
+  assert.strictEqual(blocked.applied, false);
+  assert.strictEqual(blocked.blockedByExclusivePromo, true);
+  assert.strictEqual(blocked.blockReason, FREE_SHIPPING_BLOCK_REASON);
+  assert.ok(blocked.offer);
+}
+
+function testDecideWaiverBelowThreshold() {
+  const offer = { _id: 'o1', name: 'Free ship 999', minCartValue: 999 };
+  const below = decideFreeShippingWaiver({
+    thresholdMet: false,
+    offer,
+    minCartValue: 999,
+    shortfallInr: 100,
+    exclusivePromoActive: false
+  });
+  assert.strictEqual(below.applied, false);
+  assert.strictEqual(below.blockedByExclusivePromo, false);
+  assert.strictEqual(below.shortfallInr, 100);
+}
+
+function testRestoreDeliveryWhenPromoBlocksQuoteWaiver() {
+  const restored = applyExclusivePromoToDeliveryState({
+    deliveryCharges: 0,
+    deliveryMeta: {
+      freeShippingApplied: true,
+      freeShippingOffer: { name: 'Free ship', minCartValue: 999 },
+      originalDeliveryCharges: 65,
+      freightInr: 45,
+      codFeeInr: 20
+    },
+    exclusivePromoActive: true
+  });
+  assert.strictEqual(restored.deliveryCharges, 65);
+  assert.strictEqual(restored.freeShippingApplied, false);
+  assert.strictEqual(restored.freeShippingOffer, null);
+  assert.strictEqual(restored.freeShippingBlockedByPromo, true);
+  assert.strictEqual(restored.deliveryMeta.freeShippingApplied, false);
+}
+
+function testNoChangeWhenNoPromoAndNoWaiver() {
+  const same = applyExclusivePromoToDeliveryState({
+    deliveryCharges: 49,
+    deliveryMeta: {
+      freeShippingApplied: false,
+      originalDeliveryCharges: 49,
+      freightInr: 49,
+      codFeeInr: 0
+    },
+    exclusivePromoActive: false
+  });
+  assert.strictEqual(same.deliveryCharges, 49);
+  assert.strictEqual(same.freeShippingApplied, false);
+  assert.strictEqual(same.freeShippingBlockedByPromo, false);
+}
+
+function testPromoActiveButShippingAlreadyCharged() {
+  const kept = applyExclusivePromoToDeliveryState({
+    deliveryCharges: 55,
+    deliveryMeta: {
+      freeShippingApplied: false,
+      originalDeliveryCharges: 55,
+      freightInr: 55,
+      codFeeInr: 0
+    },
+    exclusivePromoActive: true
+  });
+  assert.strictEqual(kept.deliveryCharges, 55);
+  assert.strictEqual(kept.freeShippingApplied, false);
+  assert.strictEqual(kept.freeShippingBlockedByPromo, true);
+}
+
 function run() {
   testLiveWithoutEndDate();
   testInactiveNotLive();
@@ -59,6 +169,13 @@ function run() {
   testFutureEndDateStillLive();
   testThresholdLogic();
   testWaiverMath();
+  testExclusivePromoDetection();
+  testDecideWaiverWithoutPromo();
+  testDecideWaiverBlockedByCoupon();
+  testDecideWaiverBelowThreshold();
+  testRestoreDeliveryWhenPromoBlocksQuoteWaiver();
+  testNoChangeWhenNoPromoAndNoWaiver();
+  testPromoActiveButShippingAlreadyCharged();
   console.log('All free-shipping offer tests passed.');
 }
 

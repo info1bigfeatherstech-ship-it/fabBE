@@ -36,6 +36,7 @@ const { findCartForStorefront } = require('../services/cartStorefront.service');
 const { addressBelongsToStorefront } = require('../utils/customerStorefrontScope');
 const paymentHoldExpiryService = require('../services/paymentHoldExpiry.service');
 const checkoutSettingsService = require('../services/checkoutSettings.service');
+const { maybeReleaseCouponSlotOnStatusChange } = require('../services/couponUsage.service');
 const {
     parseOrderIntentInput,
     toPublicOrderIntent,
@@ -3188,6 +3189,7 @@ exports.abandonOnlineCheckout = async (req, res) => {
                 );
             }
 
+            const previousStatusForCoupon = order.orderStatus;
             order.orderStatus = 'cancelled';
             order.paymentStatus = 'failed';
             order.paymentInfo = order.paymentInfo || {};
@@ -3198,6 +3200,12 @@ exports.abandonOnlineCheckout = async (req, res) => {
             normalizeTerminalUnpaidFinancials(order);
 
             await order.save({ session });
+            await maybeReleaseCouponSlotOnStatusChange(
+                order,
+                previousStatusForCoupon,
+                'cancelled',
+                session
+            );
             await releaseOrderStockHold(order, session);
             await order.save({ session });
             await mergeOrderLineItemsIntoUserCart(order.userId, order.items, session, order.storefront || 'ecomm');
@@ -3561,6 +3569,7 @@ exports.cancelOrder = async (req, res) => {
         const wasPaid = order.paymentStatus === 'paid';
         const canInitiateRefund = wasPaid && Boolean(order.paymentInfo?.razorpayPaymentId);
 
+        const previousStatusForCoupon = order.orderStatus;
         order.orderStatus = 'cancelled';
         if (!wasPaid && String(order.paymentInfo?.method || '').toLowerCase() === 'online') {
             order.paymentStatus = 'failed';
@@ -3579,6 +3588,12 @@ exports.cancelOrder = async (req, res) => {
         order.markModified('returnInfo');
 
         await order.save({ session });
+        await maybeReleaseCouponSlotOnStatusChange(
+            order,
+            previousStatusForCoupon,
+            'cancelled',
+            session
+        );
         await releaseOrderStockHold(order, session);
         await order.save({ session });
 
