@@ -25,15 +25,17 @@ function sendError(res, err, fallbackMessage) {
 
 /**
  * POST /api/orders/admin/items/:orderId/edit-pending-shipping-metrics/preview
- * Body: { lineOverrides: [{ productId, variantId, unitWeightKg, lengthCm, widthCm, heightCm }] }
+ * Body (one of):
+ *  { packageOverride: { totalWeightKg, lengthCm, widthCm, heightCm } }
+ *  { lineOverrides: [{ productId, variantId, unitWeightKg, lengthCm, widthCm, heightCm }] }
  */
 exports.previewPendingShippingMetricsEdit = async (req, res) => {
   try {
     const orderId = req.params.orderId;
-    const lineOverrides = req.body?.lineOverrides;
     const result = await previewOrApplyShippingMetricsEdit({
       orderId,
-      lineOverrides,
+      lineOverrides: req.body?.lineOverrides,
+      packageOverride: req.body?.packageOverride,
       commit: false,
       adminUserId: req.user?.id || req.user?._id || null,
       scopeMatch: getAdminOrderMatch(req)
@@ -61,18 +63,18 @@ exports.previewPendingShippingMetricsEdit = async (req, res) => {
 exports.applyPendingShippingMetricsEdit = async (req, res) => {
   try {
     const orderId = req.params.orderId;
-    const lineOverrides = req.body?.lineOverrides;
     const result = await previewOrApplyShippingMetricsEdit({
       orderId,
-      lineOverrides,
+      lineOverrides: req.body?.lineOverrides,
+      packageOverride: req.body?.packageOverride,
       commit: true,
       adminUserId: req.user?.id || req.user?._id || null,
       scopeMatch: getAdminOrderMatch(req)
     });
+    const mode = result?.mode === 'package' ? 'packed-box' : 'per-item';
     return res.json({
       success: true,
-      message:
-        'Package weight/dimensions updated. Customer shipping stayed locked at checkout; courier will use the new package metrics.',
+      message: `Shipping metrics updated (${mode}). Customer shipping stayed locked; courier will use the new package metrics.`,
       data: result
     });
   } catch (err) {

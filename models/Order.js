@@ -444,12 +444,27 @@ const orderSchema = new mongoose.Schema(
             /** Set when admin corrects listing-time weight/dims on this order line */
             overridden: { type: Boolean, default: false },
             overriddenAt: { type: Date, default: null },
-            overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null }
+            overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+            /** Set when full-package edit aligned this line to packed-box totals (order-only) */
+            packageAligned: { type: Boolean, default: false }
           }
         ],
         default: []
       },
-      /** checkout | admin_override | catalog_fallback (legacy display only) */
+      /**
+       * Packed-box totals set by admin (multi-item ship-as-one).
+       * When present, courier quote/create uses these instead of summing item lines.
+       * Item `lines` remain as listing reference only.
+       */
+      packageOverride: {
+        totalWeightKg: { type: Number, default: null },
+        lengthCm: { type: Number, default: null },
+        widthCm: { type: Number, default: null },
+        heightCm: { type: Number, default: null },
+        overriddenAt: { type: Date, default: null },
+        overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null }
+      },
+      /** checkout | admin_override | admin_package_override | catalog_fallback */
       source: { type: String, default: 'checkout' }
     },
 

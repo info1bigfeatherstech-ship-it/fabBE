@@ -620,14 +620,28 @@ class ShipmozoService {
     }
 
     const addr = order.addressSnapshot || {};
-    const totalWeightKg =
-      snapMetrics?.totalWeightKg != null
-        ? Number(snapMetrics.totalWeightKg)
-        : Number(order.shippingWeightSnapshot?.totalWeightKg) || 0.5;
+    // Prefer shared resolveShiprocketPackageMetrics (works for package override + line rebuild).
+    const totalWeightKg = Math.max(
+      0.05,
+      Number(
+        snapMetrics?.totalWeightKg ??
+          snapMetrics?.totalWeight ??
+          order.shippingWeightSnapshot?.totalWeightKg
+      ) || 0.5
+    );
     const dims = snapMetrics?.dims || order.shippingWeightSnapshot?.dims || {};
-    const lengthCm = Math.max(1, Number(dims.lengthCm) || 10);
-    const widthCm = Math.max(1, Number(dims.widthCm) || 10);
-    const heightCm = Math.max(1, Number(dims.heightCm) || 10);
+    const lengthCm = Math.max(
+      1,
+      Number(dims.lengthCm ?? snapMetrics?.maxL) || 10
+    );
+    const widthCm = Math.max(
+      1,
+      Number(dims.widthCm ?? snapMetrics?.maxB) || 10
+    );
+    const heightCm = Math.max(
+      1,
+      Number(dims.heightCm ?? snapMetrics?.maxH) || 10
+    );
 
     const payMethod = String(order.paymentInfo?.method || order.paymentMethod || '')
       .toLowerCase()

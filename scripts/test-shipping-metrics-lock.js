@@ -35,6 +35,60 @@ function testAggregateAndVol() {
   console.log('ok aggregate + vol', agg, vol);
 }
 
+function testPackageOverrideAlignsLineWeights() {
+  const {
+    applyPackageShippingOverrideToSnapshot,
+    hasPackageOverride
+  } = require('../utils/shippingWeightSnapshot');
+  const money = (n) => Math.round(Number(n) * 100) / 100;
+  const snap = {
+    source: 'checkout',
+    totalWeightKg: 3,
+    dims: { lengthCm: 10, widthCm: 10, heightCm: 10 },
+    lines: [
+      {
+        productId: 'p1',
+        variantId: 'v1',
+        quantity: 2,
+        unitWeightKg: 1,
+        lengthCm: 10,
+        widthCm: 10,
+        heightCm: 5
+      },
+      {
+        productId: 'p2',
+        variantId: 'v2',
+        quantity: 1,
+        unitWeightKg: 1,
+        lengthCm: 8,
+        widthCm: 8,
+        heightCm: 8
+      }
+    ]
+  };
+  const applied = applyPackageShippingOverrideToSnapshot(
+    snap,
+    { totalWeightKg: 4.5, lengthCm: 30, widthCm: 20, heightCm: 15 },
+    {}
+  );
+  assert.strictEqual(applied.ok, true);
+  assert.strictEqual(applied.snapshot.source, 'admin_package_override');
+  assert.strictEqual(applied.snapshot.totalWeightKg, 4.5);
+  assert.strictEqual(applied.snapshot.dims.lengthCm, 30);
+  assert.strictEqual(applied.snapshot.lines.length, 2);
+  // Lines kept, but weights aligned so sum ≈ package total
+  const sumKg = money(
+    applied.snapshot.lines.reduce((s, l) => s + Number(l.lineWeightKg || 0), 0)
+  );
+  assert.ok(Math.abs(sumKg - 4.5) < 0.02, `expected ~4.5 got ${sumKg}`);
+  assert.ok(applied.snapshot.lines[0].packageAligned);
+  assert.strictEqual(applied.snapshot.lines[0].lengthCm, 30);
+  assert.strictEqual(applied.snapshot.lines[0].widthCm, 20);
+  // Original catalog product is not in this function — only snapshot mutated
+  assert.ok(hasPackageOverride(applied.snapshot));
+  console.log('ok package override aligns line weights', sumKg);
+}
+
 function testIdNormalizeMatch() {
   const { idStr, lineKey } = require('../utils/shippingWeightSnapshot');
   const oid = { _id: '6acf400f91d73da5944505b6' };
@@ -203,6 +257,7 @@ function testRebuildPreservesFlags() {
 
 try {
   testAggregateAndVol();
+  testPackageOverrideAlignsLineWeights();
   testIdNormalizeMatch();
   testOverrideRebuildsPackage();
   testValidation();

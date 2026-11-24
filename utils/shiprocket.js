@@ -454,6 +454,7 @@ class ShiprocketService {
       }
 
       const variantKey = String(item.variantId);
+      // Prefer order snapshot (includes package-aligned line weights/dims). Never read catalog after this.
       if (snapMetrics?.lineWeightByVariantId?.has(variantKey)) {
         weight = snapMetrics.lineWeightByVariantId.get(variantKey);
       }
@@ -481,6 +482,7 @@ class ShiprocketService {
     }
 
     const addr = order.addressSnapshot || {};
+    // Package-level metrics from snapshot/override are authoritative for any active courier.
     const totalWeight = snapMetrics
       ? snapMetrics.totalWeight
       : orderItems.reduce((s, it) => s + (Number(it.weight) || 0.5) * (Number(it.units) || 1), 0);

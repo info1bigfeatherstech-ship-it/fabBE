@@ -1,10 +1,13 @@
 /**
- * Admin pending-order per-line weight / dimensions edit.
+ * Admin pending-order shipping metrics edit.
  *
- * - Rebuilds package totals + volumetric weight from overridden lines
+ * Modes:
+ * 1) packageOverride — packed-box total weight/dims (recommended for multi-item packs)
+ * 2) lineOverrides — per-item weight/dims (rebuild package from lines)
+ *
  * - Re-quotes courier for admin/ops (adminQuotedDeliveryInr)
- * - Never changes customer checkout shipping / totals from shipping delta
- * - Updated shippingWeightSnapshot is what Shiprocket/Shipmozo createShipment uses
+ * - Never changes customer checkout shipping
+ * - shippingWeightSnapshot is what Shiprocket/Shipmozo createShipment uses
  */
 
 const Order = require('../models/Order');
@@ -13,9 +16,12 @@ const { roundMoney2 } = require('./checkoutComputation.service');
 const {
   validateLineShippingOverride,
   applyLineShippingOverridesToSnapshot,
+  applyPackageShippingOverrideToSnapshot,
+  validatePackageShippingOverride,
   rebuildShippingWeightSnapshotFromLines,
   enrichShippingWeightSnapshotDims,
   buildShippingWeightSnapshotFromOrderItems,
+  hasPackageOverride,
   idStr,
   lineKey
 } = require('../utils/shippingWeightSnapshot');
@@ -61,8 +67,23 @@ function normalizeLineOverrides(rawList) {
   return out;
 }
 
+function normalizePackageOverride(raw) {
+  if (!raw || typeof raw !== 'object') {
+    throw createEditError(400, 'PACKAGE_OVERRIDE_REQUIRED', 'packageOverride is required');
+  }
+  const checked = validatePackageShippingOverride(raw);
+  if (!checked.ok) {
+    throw createEditError(400, 'PACKAGE_OVERRIDE_INVALID', 'Invalid packageOverride', {
+      errors: checked.errors
+    });
+  }
+  return checked.data;
+}
+
 async function ensureOrderWeightSnapshot(order) {
   let snap = order.shippingWeightSnapshot;
+  const priorPackageOverride = hasPackageOverride(snap) ? { ...snap.packageOverride } : null;
+
   if (!snap?.lines?.length) {
     snap = await buildShippingWeightSnapshotFromOrderItems(order);
     if (!snap?.lines?.length) {
@@ -78,7 +99,6 @@ async function ensureOrderWeightSnapshot(order) {
     order.shippingWeightSnapshot = snap;
   }
 
-  // Align snapshot lines to current order items (qty cuts / id normalization).
   const itemQtyByKey = new Map();
   for (const it of order.items || []) {
     const pid = idStr(it.productId);
@@ -89,7 +109,6 @@ async function ensureOrderWeightSnapshot(order) {
   }
 
   const alignedByKey = new Map();
-  // Prefer exact productId:variantId match; fall back to unique variantId match.
   const snapByVariant = new Map();
   for (const row of snap.lines || []) {
     const vid = idStr(row.variantId);
@@ -119,23 +138,26 @@ async function ensureOrderWeightSnapshot(order) {
     (k) => itemQtyByKey.get(k) > 0 && !alignedByKey.has(k)
   );
 
-  // Any missing current order lines → rebuild full snapshot from catalog (safe + complete).
+  let baseSnap;
   if (missingKeys.length || alignedByKey.size === 0) {
     snap = await buildShippingWeightSnapshotFromOrderItems(order);
     if (!snap?.lines?.length) {
       throw createEditError(400, 'SNAPSHOT_MISSING', 'Could not build shipping weight lines');
     }
-    // Normalize ids + qty from order items
-    const rebuiltLines = (snap.lines || []).map((row) => {
-      const key = lineKey(row.productId, row.variantId);
-      const qty = itemQtyByKey.has(key) ? itemQtyByKey.get(key) : Math.max(0, Number(row.quantity) || 0);
-      return {
-        ...row,
-        productId: idStr(row.productId) || row.productId,
-        variantId: idStr(row.variantId) || row.variantId,
-        quantity: qty
-      };
-    }).filter((row) => itemQtyByKey.has(lineKey(row.productId, row.variantId)));
+    const rebuiltLines = (snap.lines || [])
+      .map((row) => {
+        const key = lineKey(row.productId, row.variantId);
+        const qty = itemQtyByKey.has(key)
+          ? itemQtyByKey.get(key)
+          : Math.max(0, Number(row.quantity) || 0);
+        return {
+          ...row,
+          productId: idStr(row.productId) || row.productId,
+          variantId: idStr(row.variantId) || row.variantId,
+          quantity: qty
+        };
+      })
+      .filter((row) => itemQtyByKey.has(lineKey(row.productId, row.variantId)));
 
     if (!rebuiltLines.length) {
       throw createEditError(
@@ -144,18 +166,42 @@ async function ensureOrderWeightSnapshot(order) {
         'Order items could not be matched to shipping weight lines'
       );
     }
-    return rebuildShippingWeightSnapshotFromLines(rebuiltLines, {
+    baseSnap = rebuildShippingWeightSnapshotFromLines(rebuiltLines, {
       source: snap.source || 'catalog_fallback'
+    });
+  } else {
+    baseSnap = rebuildShippingWeightSnapshotFromLines([...alignedByKey.values()], {
+      source: snap.source || 'checkout'
     });
   }
 
-  return rebuildShippingWeightSnapshotFromLines([...alignedByKey.values()], {
-    source: snap.source || 'checkout'
-  });
+  // Preserve prior packed-box override on the aligned base (until admin replaces it).
+  if (priorPackageOverride) {
+    const restored = applyPackageShippingOverrideToSnapshot(baseSnap, priorPackageOverride, {
+      adminUserId: priorPackageOverride.overriddenBy || null
+    });
+    if (restored.ok) {
+      restored.snapshot.packageOverride = {
+        ...restored.snapshot.packageOverride,
+        overriddenAt: priorPackageOverride.overriddenAt || restored.snapshot.packageOverride.overriddenAt,
+        overriddenBy: priorPackageOverride.overriddenBy || null
+      };
+      return restored.snapshot;
+    }
+  }
+
+  return baseSnap;
 }
 
 /**
- * @param {{ orderId: string, lineOverrides: Array, commit?: boolean, adminUserId?: string|null, scopeMatch?: object }} opts
+ * @param {{
+ *   orderId: string,
+ *   lineOverrides?: Array,
+ *   packageOverride?: object,
+ *   commit?: boolean,
+ *   adminUserId?: string|null,
+ *   scopeMatch?: object
+ * }} opts
  */
 async function previewOrApplyShippingMetricsEdit(opts) {
   const orderId = String(opts.orderId || '').trim();
@@ -171,16 +217,50 @@ async function previewOrApplyShippingMetricsEdit(opts) {
 
   assertEditablePendingOrder(order);
 
-  const overrides = normalizeLineOverrides(opts.lineOverrides);
+  const hasPackage = opts.packageOverride != null && typeof opts.packageOverride === 'object';
+  const hasLines = Array.isArray(opts.lineOverrides) && opts.lineOverrides.length > 0;
+  if (hasPackage && hasLines) {
+    throw createEditError(
+      400,
+      'OVERRIDE_MODE_CONFLICT',
+      'Send either packageOverride (full packed box) or lineOverrides (per item), not both'
+    );
+  }
+  if (!hasPackage && !hasLines) {
+    throw createEditError(
+      400,
+      'OVERRIDES_REQUIRED',
+      'Provide packageOverride or lineOverrides'
+    );
+  }
+
   const beforeSnap = await ensureOrderWeightSnapshot(order);
   const beforeMoney = snapshotMoney(order);
   const lockedBefore = ensureCheckoutDeliveryFrozen(order);
 
-  const applied = applyLineShippingOverridesToSnapshot(beforeSnap, overrides, {
-    adminUserId: opts.adminUserId || null
-  });
+  let applied;
+  let mode;
+  let lineOverrides = null;
+  let packageOverride = null;
+
+  if (hasPackage) {
+    packageOverride = normalizePackageOverride(opts.packageOverride);
+    applied = applyPackageShippingOverrideToSnapshot(beforeSnap, packageOverride, {
+      adminUserId: opts.adminUserId || null
+    });
+    mode = 'package';
+  } else {
+    lineOverrides = normalizeLineOverrides(opts.lineOverrides);
+    applied = applyLineShippingOverridesToSnapshot(beforeSnap, lineOverrides, {
+      adminUserId: opts.adminUserId || null
+    });
+    mode = 'lines';
+  }
+
   if (!applied.ok) {
-    throw createEditError(400, applied.code || 'OVERRIDE_FAILED', applied.message || 'Override failed');
+    throw createEditError(400, applied.code || 'OVERRIDE_FAILED', applied.message || 'Override failed', {
+      errors: applied.errors
+    });
   }
 
   const nextSnap = applied.snapshot;
@@ -190,6 +270,7 @@ async function previewOrApplyShippingMetricsEdit(opts) {
 
   const preview = {
     orderId,
+    mode,
     before: {
       ...beforeMoney,
       checkoutDeliveryCharges: lockedBefore,
@@ -222,10 +303,12 @@ async function previewOrApplyShippingMetricsEdit(opts) {
       package: {
         totalWeightKg: priced.weightSnapshot?.totalWeightKg ?? null,
         totalDimWeightKg: priced.weightSnapshot?.totalDimWeightKg ?? null,
-        dims: priced.weightSnapshot?.dims || null
+        dims: priced.weightSnapshot?.dims || null,
+        packageOverrideApplied: Boolean(priced.weightSnapshot?.packageOverride)
       }
     },
-    lineOverrides: overrides,
+    lineOverrides,
+    packageOverride,
     commit: false
   };
 
@@ -233,7 +316,6 @@ async function previewOrApplyShippingMetricsEdit(opts) {
     return { success: true, preview };
   }
 
-  // Totals unchanged for customer (same items + locked ship). Only package + admin quote update.
   syncCustomerDeliveryChargesToLock(order);
   applyAdminQuotedDelivery(order, priced.quotedDelivery);
   order.shippingSnapshot = {
@@ -248,14 +330,22 @@ async function previewOrApplyShippingMetricsEdit(opts) {
 
   order.adminEditHistory = order.adminEditHistory || [];
   order.adminEditHistory.push({
-    action: 'pending_order_shipping_metrics_edited',
-    note: 'Admin corrected package weight/dimensions; customer shipping stayed locked at checkout',
+    action:
+      mode === 'package'
+        ? 'pending_order_package_metrics_edited'
+        : 'pending_order_shipping_metrics_edited',
+    note:
+      mode === 'package'
+        ? 'Admin set packed-box weight/dimensions; item lines kept as reference; customer shipping locked'
+        : 'Admin corrected per-item weight/dimensions; customer shipping stayed locked at checkout',
     performedBy: opts.adminUserId || null,
     createdAt: new Date(),
     before: beforeMoney,
     after: snapshotMoney(order),
     metadata: {
-      lineOverrides: overrides,
+      mode,
+      lineOverrides,
+      packageOverride,
       shipping: preview.shipping,
       packageBefore: {
         totalWeightKg: beforeSnap.totalWeightKg,
@@ -271,8 +361,8 @@ async function previewOrApplyShippingMetricsEdit(opts) {
 
   logger.info('[adminPendingShippingMetrics] applied', {
     orderId,
+    mode,
     adminUserId: opts.adminUserId || null,
-    overrideCount: overrides.length,
     checkoutDeliveryCharges: getCheckoutDeliveryCharges(order),
     adminQuotedDeliveryInr: order.adminQuotedDeliveryInr,
     totalWeightKg: order.shippingWeightSnapshot?.totalWeightKg
@@ -282,6 +372,7 @@ async function previewOrApplyShippingMetricsEdit(opts) {
     success: true,
     committed: true,
     orderId,
+    mode,
     shipping: preview.shipping,
     shippingWeightSnapshot: order.shippingWeightSnapshot,
     checkoutDeliveryCharges: getCheckoutDeliveryCharges(order),
@@ -295,5 +386,6 @@ async function previewOrApplyShippingMetricsEdit(opts) {
 module.exports = {
   previewOrApplyShippingMetricsEdit,
   normalizeLineOverrides,
+  normalizePackageOverride,
   ensureOrderWeightSnapshot
 };

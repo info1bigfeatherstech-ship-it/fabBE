@@ -22,7 +22,9 @@ const {
   buildShippingWeightSnapshotFromCheckoutLines,
   applySnapshotOverridesToCheckoutLines,
   rebuildShippingWeightSnapshotFromLines,
-  aggregateShippingFromWeightLines
+  aggregateShippingFromWeightLines,
+  hasPackageOverride,
+  dimsAggFromPackageOverride
 } = require('../utils/shippingWeightSnapshot');
 const { resolveVariantShipping } = require('../utils/variantCatalogFields');
 const ShiprocketService = require('../utils/shiprocket');
@@ -376,7 +378,33 @@ async function repriceShippingForItems(order, nextItems, opts = {}) {
   let weightSnapshot = opts.weightSnapshot || null;
   let dimsAgg;
 
-  if (weightSnapshot?.lines?.length) {
+  // Packed-box override wins for courier quote/create (item lines are reference only).
+  if (weightSnapshot && hasPackageOverride(weightSnapshot)) {
+    const po = weightSnapshot.packageOverride;
+    dimsAgg = dimsAggFromPackageOverride(po);
+    const packageDims = {
+      lengthCm: dimsAgg.lengthCm,
+      widthCm: dimsAgg.widthCm,
+      heightCm: dimsAgg.heightCm
+    };
+    const { dimWeightKgFromDimsCm } = require('../utils/shippingWeightSnapshot');
+    weightSnapshot = {
+      ...weightSnapshot,
+      totalWeightKg: dimsAgg.weightKg,
+      totalDimWeightKg: dimWeightKgFromDimsCm(packageDims),
+      dims: packageDims,
+      source: 'admin_package_override',
+      packageOverride: {
+        totalWeightKg: dimsAgg.weightKg,
+        lengthCm: dimsAgg.lengthCm,
+        widthCm: dimsAgg.widthCm,
+        heightCm: dimsAgg.heightCm,
+        overriddenAt: po.overriddenAt || new Date(),
+        overriddenBy: po.overriddenBy || null
+      },
+      lines: Array.isArray(weightSnapshot.lines) ? weightSnapshot.lines : []
+    };
+  } else if (weightSnapshot?.lines?.length) {
     weightSnapshot = rebuildShippingWeightSnapshotFromLines(weightSnapshot.lines, {
       source: weightSnapshot.source || 'admin_override'
     });

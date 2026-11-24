@@ -61,9 +61,203 @@ function lineKey(productId, variantId) {
 }
 
 const MAX_UNIT_WEIGHT_KG = 50;
+const MAX_PACKAGE_WEIGHT_KG = 100;
 const MAX_DIM_CM = 200;
 const MIN_UNIT_WEIGHT_KG = 0.05;
 const MIN_DIM_CM = 1;
+
+function hasPackageOverride(snap) {
+  const po = snap?.packageOverride;
+  if (!po || typeof po !== 'object') return false;
+  const w = Number(po.totalWeightKg);
+  const l = Number(po.lengthCm);
+  const wi = Number(po.widthCm);
+  const h = Number(po.heightCm);
+  return (
+    Number.isFinite(w) &&
+    w >= MIN_UNIT_WEIGHT_KG &&
+    [l, wi, h].every((n) => Number.isFinite(n) && n >= MIN_DIM_CM)
+  );
+}
+
+function dimsAggFromPackageOverride(po) {
+  return {
+    weightKg: Math.max(MIN_UNIT_WEIGHT_KG, roundMoney2(Number(po.totalWeightKg) || MIN_UNIT_WEIGHT_KG)),
+    lengthCm: Math.max(MIN_DIM_CM, Number(po.lengthCm) || MIN_DIM_CM),
+    widthCm: Math.max(MIN_DIM_CM, Number(po.widthCm) || MIN_DIM_CM),
+    heightCm: Math.min(MAX_DIM_CM, Math.max(MIN_DIM_CM, Number(po.heightCm) || MIN_DIM_CM))
+  };
+}
+
+function validatePackageShippingOverride(raw) {
+  const errors = [];
+  const totalWeightKg = Number(raw?.totalWeightKg);
+  if (!Number.isFinite(totalWeightKg) || totalWeightKg < MIN_UNIT_WEIGHT_KG) {
+    errors.push(`totalWeightKg must be ≥ ${MIN_UNIT_WEIGHT_KG}`);
+  } else if (totalWeightKg > MAX_PACKAGE_WEIGHT_KG) {
+    errors.push(`totalWeightKg must be ≤ ${MAX_PACKAGE_WEIGHT_KG}`);
+  }
+
+  const lengthCm = Number(raw?.lengthCm);
+  const widthCm = Number(raw?.widthCm);
+  const heightCm = Number(raw?.heightCm);
+  for (const [label, n] of [
+    ['lengthCm', lengthCm],
+    ['widthCm', widthCm],
+    ['heightCm', heightCm]
+  ]) {
+    if (!Number.isFinite(n) || n < MIN_DIM_CM) {
+      errors.push(`${label} must be ≥ ${MIN_DIM_CM}`);
+    } else if (n > MAX_DIM_CM) {
+      errors.push(`${label} must be ≤ ${MAX_DIM_CM}`);
+    }
+  }
+
+  if (errors.length) return { ok: false, errors };
+
+  return {
+    ok: true,
+    data: {
+      totalWeightKg: roundMoney2(totalWeightKg),
+      lengthCm: roundMoney2(lengthCm),
+      widthCm: roundMoney2(widthCm),
+      heightCm: roundMoney2(heightCm)
+    }
+  };
+}
+
+/**
+ * Proportionally scale order-snapshot line weights so Σ(unitWeight×qty) === packageTotalKg.
+ * Also align line L/W to package and split height by unit share (stack ≈ package H).
+ * Catalog/Product is never touched — order snapshot only (courier conflict prevention).
+ * @param {object[]} lines
+ * @param {{ totalWeightKg: number, lengthCm: number, widthCm: number, heightCm: number }} pkg
+ */
+function alignSnapshotLinesToPackageTotals(lines, pkg) {
+  const rows = (lines || []).map((row) => ({ ...row }));
+  const active = rows.filter((r) => Math.max(0, Number(r.quantity) || 0) > 0);
+  if (!active.length) return rows;
+
+  const targetKg = Math.max(
+    MIN_UNIT_WEIGHT_KG,
+    roundMoney2(Number(pkg.totalWeightKg) || MIN_UNIT_WEIGHT_KG)
+  );
+  const pkgL = Math.max(MIN_DIM_CM, Number(pkg.lengthCm) || MIN_DIM_CM);
+  const pkgW = Math.max(MIN_DIM_CM, Number(pkg.widthCm) || MIN_DIM_CM);
+  const pkgH = Math.min(MAX_DIM_CM, Math.max(MIN_DIM_CM, Number(pkg.heightCm) || MIN_DIM_CM));
+
+  const totalUnits = active.reduce((s, r) => s + Math.max(0, Number(r.quantity) || 0), 0);
+  if (!(totalUnits > 0)) return rows;
+
+  // Weight: keep relative shares from current line weights; fallback equal-by-qty.
+  let rawShare = active.map((r) => {
+    const qty = Math.max(0, Number(r.quantity) || 0);
+    const unit = Number(r.unitWeightKg);
+    const lineW =
+      Number.isFinite(unit) && unit > 0
+        ? unit * qty
+        : Number(r.lineWeightKg) > 0
+          ? Number(r.lineWeightKg)
+          : qty;
+    return Math.max(0.0001, lineW);
+  });
+  let shareSum = rawShare.reduce((s, n) => s + n, 0);
+  if (!(shareSum > 0)) {
+    rawShare = active.map((r) => Math.max(1, Number(r.quantity) || 1));
+    shareSum = rawShare.reduce((s, n) => s + n, 0);
+  }
+
+  // Height per unit so stacked height (Σ h×qty) ≈ package H.
+  const unitHeightCm = Math.max(MIN_DIM_CM, roundMoney2(pkgH / totalUnits));
+
+  let assignedKg = 0;
+  for (let i = 0; i < active.length; i += 1) {
+    const row = active[i];
+    const qty = Math.max(1, Number(row.quantity) || 1);
+    let lineKg;
+    if (i === active.length - 1) {
+      lineKg = roundMoney2(Math.max(MIN_UNIT_WEIGHT_KG * qty, targetKg - assignedKg));
+    } else {
+      lineKg = roundMoney2((targetKg * rawShare[i]) / shareSum);
+      lineKg = Math.max(MIN_UNIT_WEIGHT_KG * qty, lineKg);
+      assignedKg = roundMoney2(assignedKg + lineKg);
+    }
+    const unitWeightKg = Math.max(MIN_UNIT_WEIGHT_KG, roundMoney2(lineKg / qty));
+    // Recompute lineKg from rounded unit to keep unit×qty consistent for courier line payloads.
+    const consistentLineKg = roundMoney2(unitWeightKg * qty);
+    const unitDimWeightKg = dimWeightKgFromDimsCm({
+      lengthCm: pkgL,
+      widthCm: pkgW,
+      heightCm: unitHeightCm
+    });
+    row.unitWeightKg = unitWeightKg;
+    row.lineWeightKg = consistentLineKg;
+    row.lengthCm = pkgL;
+    row.widthCm = pkgW;
+    row.heightCm = unitHeightCm;
+    row.unitDimWeightKg = unitDimWeightKg;
+    row.lineDimWeightKg =
+      unitDimWeightKg != null ? roundMoney2(unitDimWeightKg * qty) : null;
+    // Mark as package-aligned (not a catalog edit — order snapshot only).
+    row.packageAligned = true;
+  }
+
+  // Fix residual kg on last active line after unit rounding (keep package total exact).
+  const sumLines = roundMoney2(
+    active.reduce((s, r) => s + Number(r.lineWeightKg || 0), 0)
+  );
+  const drift = roundMoney2(targetKg - sumLines);
+  if (Math.abs(drift) >= 0.01 && active.length) {
+    const last = active[active.length - 1];
+    const qty = Math.max(1, Number(last.quantity) || 1);
+    const nextLineKg = Math.max(MIN_UNIT_WEIGHT_KG * qty, roundMoney2(Number(last.lineWeightKg) + drift));
+    last.lineWeightKg = nextLineKg;
+    last.unitWeightKg = Math.max(MIN_UNIT_WEIGHT_KG, roundMoney2(nextLineKg / qty));
+    last.lineWeightKg = roundMoney2(last.unitWeightKg * qty);
+  }
+
+  return rows;
+}
+
+/**
+ * Set order package totals (packed box) and align snapshot line weights/dims so
+ * courier item-level + package-level metrics stay consistent (no catalog writes).
+ */
+function applyPackageShippingOverrideToSnapshot(snap, packageOverride, meta = {}) {
+  const checked = validatePackageShippingOverride(packageOverride);
+  if (!checked.ok) {
+    return { ok: false, code: 'PACKAGE_OVERRIDE_INVALID', message: 'Invalid packageOverride', errors: checked.errors };
+  }
+  const data = checked.data;
+  const packageDims = {
+    lengthCm: data.lengthCm,
+    widthCm: data.widthCm,
+    heightCm: data.heightCm
+  };
+  const baseLines = Array.isArray(snap?.lines) ? snap.lines.map((row) => ({ ...row })) : [];
+  const lines = alignSnapshotLinesToPackageTotals(baseLines, data);
+  const next = {
+    ...(snap && typeof snap === 'object' ? snap : {}),
+    totalWeightKg: data.totalWeightKg,
+    totalDimWeightKg: dimWeightKgFromDimsCm(packageDims),
+    dims: packageDims,
+    lines,
+    source: 'admin_package_override',
+    packageOverride: {
+      totalWeightKg: data.totalWeightKg,
+      lengthCm: data.lengthCm,
+      widthCm: data.widthCm,
+      heightCm: data.heightCm,
+      overriddenAt: new Date(),
+      overriddenBy: meta.adminUserId || null
+    }
+  };
+  return {
+    ok: true,
+    snapshot: next,
+    dimsAgg: dimsAggFromPackageOverride(data)
+  };
+}
 
 /**
  * Same package rules as checkoutComputation.aggregateShipping, but from snapshot lines
@@ -323,6 +517,8 @@ function applyLineShippingOverridesToSnapshot(snap, overrides, meta = {}) {
   }
 
   const rebuilt = rebuildShippingWeightSnapshotFromLines(nextLines, { source: 'admin_override' });
+  // Per-line edits own the package math — clear any prior packed-box override.
+  if (rebuilt.packageOverride) delete rebuilt.packageOverride;
   return { ok: true, snapshot: rebuilt, dimsAgg: aggregateShippingFromWeightLines(rebuilt.lines) };
 }
 
@@ -487,8 +683,8 @@ async function resolveShiprocketPackageMetrics(order) {
   const lineWeightByVariantId = new Map();
   const lineDimsByVariantId = new Map();
 
-  if (snap?.lines?.length) {
-    for (const row of snap.lines) {
+  if (snap?.lines?.length || hasPackageOverride(snap)) {
+    for (const row of snap?.lines || []) {
       if (row?.variantId != null) {
         const vid = String(row.variantId);
         lineWeightByVariantId.set(vid, Number(row.unitWeightKg) || 0.5);
@@ -501,16 +697,32 @@ async function resolveShiprocketPackageMetrics(order) {
         }
       }
     }
-    const maxL = Math.max(1, Number(snap.dims?.lengthCm) || 1);
-    const maxB = Math.max(1, Number(snap.dims?.widthCm) || 1);
-    const maxH = Math.max(1, Number(snap.dims?.heightCm) || 1);
+    // Packed-box override is authoritative for courier package metrics (any provider).
+    const pkg = hasPackageOverride(snap) ? dimsAggFromPackageOverride(snap.packageOverride) : null;
+    const maxL = Math.max(1, Number(pkg?.lengthCm ?? snap.dims?.lengthCm) || 1);
+    const maxB = Math.max(1, Number(pkg?.widthCm ?? snap.dims?.widthCm) || 1);
+    const maxH = Math.max(1, Number(pkg?.heightCm ?? snap.dims?.heightCm) || 1);
+    const totalWeight = Math.max(
+      0.05,
+      Number(pkg?.weightKg ?? snap.totalWeightKg) || 0.5
+    );
+    const dims = {
+      lengthCm: maxL,
+      widthCm: maxB,
+      heightCm: maxH
+    };
     return {
-      totalWeight: Math.max(0.05, Number(snap.totalWeightKg) || 0.5),
+      // Canonical names (Shiprocket + shared)
+      totalWeight,
       maxL,
       maxB,
       maxH,
+      // Aliases for Shipmozo / other readers
+      totalWeightKg: totalWeight,
+      dims,
       lineWeightByVariantId,
-      lineDimsByVariantId
+      lineDimsByVariantId,
+      packageOverrideApplied: Boolean(pkg)
     };
   }
 
@@ -531,8 +743,14 @@ module.exports = {
   hasLineDims,
   lineKey,
   idStr,
+  hasPackageOverride,
+  dimsAggFromPackageOverride,
+  validatePackageShippingOverride,
+  applyPackageShippingOverrideToSnapshot,
+  alignSnapshotLinesToPackageTotals,
   MIN_UNIT_WEIGHT_KG,
   MAX_UNIT_WEIGHT_KG,
+  MAX_PACKAGE_WEIGHT_KG,
   MIN_DIM_CM,
   MAX_DIM_CM
 };
