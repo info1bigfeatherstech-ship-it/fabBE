@@ -37,6 +37,20 @@ const orderSchema = new mongoose.Schema(
     subtotal: { type: Number, required: true },
     deliveryCharges: { type: Number, required: true, default: 0 },
     /**
+     * Immutable customer shipping (₹) frozen at checkout place-order.
+     * Admin re-quotes / weight-dim edits must never overwrite this for the customer.
+     * deliveryCharges stays aligned with this lock for customer-facing totals.
+     */
+    checkoutDeliveryCharges: { type: Number, default: null },
+    /**
+     * Last admin/courier re-quote after address or package metrics amend (admin-only).
+     * Does not affect customer bill / storefront / labels.
+     */
+    adminQuotedDeliveryInr: { type: Number, default: null },
+    /** adminQuotedDeliveryInr − checkoutDeliveryCharges (positive = merchant absorbs more) */
+    adminShippingDeltaInr: { type: Number, default: null },
+    adminQuotedDeliveryAt: { type: Date, default: null },
+    /**
      * Admin/RTO clarity only: Shiprocket quote split when COD fee was bundled into deliveryCharges.
      * Customer totals still use deliveryCharges; do not surface these on storefront UI.
      */
@@ -426,12 +440,16 @@ const orderSchema = new mongoose.Schema(
             widthCm: { type: Number, default: null },
             heightCm: { type: Number, default: null },
             unitDimWeightKg: { type: Number, default: null },
-            lineDimWeightKg: { type: Number, default: null }
+            lineDimWeightKg: { type: Number, default: null },
+            /** Set when admin corrects listing-time weight/dims on this order line */
+            overridden: { type: Boolean, default: false },
+            overriddenAt: { type: Date, default: null },
+            overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null }
           }
         ],
         default: []
       },
-      /** checkout | catalog_fallback (legacy display only) */
+      /** checkout | admin_override | catalog_fallback (legacy display only) */
       source: { type: String, default: 'checkout' }
     },
 

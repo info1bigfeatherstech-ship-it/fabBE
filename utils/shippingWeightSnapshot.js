@@ -43,6 +43,289 @@ function hasLineDims(row) {
   );
 }
 
+/** Normalize ObjectId / populated doc / string to a stable id string. */
+function idStr(value) {
+  if (value == null || value === '') return '';
+  if (typeof value === 'object') {
+    if (value._id != null) return String(value._id).trim();
+    if (typeof value.toString === 'function' && value.toString !== Object.prototype.toString) {
+      const s = String(value.toString()).trim();
+      if (s && s !== '[object Object]') return s;
+    }
+  }
+  return String(value).trim();
+}
+
+function lineKey(productId, variantId) {
+  return `${idStr(productId)}:${idStr(variantId)}`;
+}
+
+const MAX_UNIT_WEIGHT_KG = 50;
+const MAX_DIM_CM = 200;
+const MIN_UNIT_WEIGHT_KG = 0.05;
+const MIN_DIM_CM = 1;
+
+/**
+ * Same package rules as checkoutComputation.aggregateShipping, but from snapshot lines
+ * (supports admin weight/dim overrides without touching product catalog).
+ * @param {Array<{ quantity?: number, unitWeightKg?: number, lengthCm?: number, widthCm?: number, heightCm?: number }>} lines
+ */
+function aggregateShippingFromWeightLines(lines) {
+  let totalWeightKg = 0;
+  let maxL = 0;
+  let maxW = 0;
+  let heightStack = 0;
+
+  for (const row of lines || []) {
+    const qty = Math.max(0, Number(row.quantity) || 0);
+    if (qty <= 0) continue;
+    const w = Number(row.unitWeightKg);
+    const unitW = Number.isFinite(w) && w > 0 ? w : 0.5;
+    const l = Number(row.lengthCm);
+    const wi = Number(row.widthCm);
+    const h = Number(row.heightCm);
+    totalWeightKg += unitW * qty;
+    if (Number.isFinite(l) && l > 0) maxL = Math.max(maxL, l);
+    if (Number.isFinite(wi) && wi > 0) maxW = Math.max(maxW, wi);
+    if (Number.isFinite(h) && h > 0) heightStack += h * qty;
+  }
+
+  const heightCm = Math.min(200, Math.max(1, heightStack || 1));
+  return {
+    weightKg: Math.max(0.05, roundMoney2(totalWeightKg)),
+    lengthCm: maxL || 1,
+    widthCm: maxW || 1,
+    heightCm
+  };
+}
+
+/**
+ * Rebuild package totals + per-line kg/vol from line rows.
+ * @param {object[]} lineSnapshots
+ * @param {{ source?: string }} [opts]
+ */
+function rebuildShippingWeightSnapshotFromLines(lineSnapshots, opts = {}) {
+  const lines = (lineSnapshots || []).map((row) => {
+    const qty = Math.max(0, Number(row.quantity) || 0);
+    const unitWeightKg = Math.max(
+      MIN_UNIT_WEIGHT_KG,
+      roundMoney2(Number(row.unitWeightKg) || MIN_UNIT_WEIGHT_KG)
+    );
+    const dims = hasLineDims(row)
+      ? {
+          lengthCm: Number(row.lengthCm),
+          widthCm: Number(row.widthCm),
+          heightCm: Number(row.heightCm)
+        }
+      : null;
+    const unitDimWeightKg = dims ? dimWeightKgFromDimsCm(dims) : null;
+    return {
+      productId: row.productId || null,
+      variantId: row.variantId || null,
+      productName: row.productName || 'Product',
+      sku: row.sku || null,
+      quantity: qty,
+      unitWeightKg,
+      lineWeightKg: roundMoney2(unitWeightKg * qty),
+      lengthCm: dims ? dims.lengthCm : row.lengthCm ?? null,
+      widthCm: dims ? dims.widthCm : row.widthCm ?? null,
+      heightCm: dims ? dims.heightCm : row.heightCm ?? null,
+      unitDimWeightKg,
+      lineDimWeightKg: unitDimWeightKg != null ? roundMoney2(unitDimWeightKg * qty) : null,
+      overridden: Boolean(row.overridden),
+      overriddenAt: row.overriddenAt || null,
+      overriddenBy: row.overriddenBy || null
+    };
+  });
+
+  const dimsAgg = aggregateShippingFromWeightLines(lines);
+  const packageDims = {
+    lengthCm: dimsAgg.lengthCm,
+    widthCm: dimsAgg.widthCm,
+    heightCm: dimsAgg.heightCm
+  };
+  const anyOverride = lines.some((l) => l.overridden);
+  const source =
+    opts.source ||
+    (anyOverride ? 'admin_override' : 'checkout');
+
+  return {
+    totalWeightKg: dimsAgg.weightKg,
+    totalDimWeightKg: dimWeightKgFromDimsCm(packageDims),
+    dims: packageDims,
+    lines,
+    source
+  };
+}
+
+/**
+ * Overlay stored snapshot unit weight/dims onto checkout lines (prefer order snapshot over catalog).
+ * @param {Array} checkoutLines
+ * @param {object|null} existingSnap
+ */
+function applySnapshotOverridesToCheckoutLines(checkoutLines, existingSnap) {
+  const byKey = new Map();
+  for (const row of existingSnap?.lines || []) {
+    byKey.set(lineKey(row.productId, row.variantId), row);
+  }
+  return (checkoutLines || []).map((line) => {
+    const pid = line.product?._id || line.productId;
+    const vid = line.variant?._id || line.variantId;
+    const snap = byKey.get(lineKey(pid, vid));
+    if (!snap) return line;
+    const unitWeightKg = Number(snap.unitWeightKg);
+    const hasW = Number.isFinite(unitWeightKg) && unitWeightKg > 0;
+    const hasD = hasLineDims(snap);
+    if (!hasW && !hasD) return line;
+    const base = line.resolvedShipping || resolveVariantShipping(line.variant, line.product) || {};
+    const resolvedShipping = {
+      ...base,
+      weight: hasW ? unitWeightKg : base.weight,
+      dimensions: hasD
+        ? {
+            length: Number(snap.lengthCm),
+            width: Number(snap.widthCm),
+            height: Number(snap.heightCm)
+          }
+        : base.dimensions
+    };
+    return { ...line, resolvedShipping };
+  });
+}
+
+function validateLineShippingOverride(raw) {
+  const errors = [];
+  const productId = String(raw?.productId || '').trim();
+  const variantId = String(raw?.variantId || '').trim();
+  if (!productId || !variantId) {
+    errors.push('productId and variantId are required');
+  }
+
+  const unitWeightKg = Number(raw?.unitWeightKg);
+  if (!Number.isFinite(unitWeightKg) || unitWeightKg < MIN_UNIT_WEIGHT_KG) {
+    errors.push(`unitWeightKg must be ≥ ${MIN_UNIT_WEIGHT_KG}`);
+  } else if (unitWeightKg > MAX_UNIT_WEIGHT_KG) {
+    errors.push(`unitWeightKg must be ≤ ${MAX_UNIT_WEIGHT_KG}`);
+  }
+
+  const lengthCm = Number(raw?.lengthCm);
+  const widthCm = Number(raw?.widthCm);
+  const heightCm = Number(raw?.heightCm);
+  for (const [label, n] of [
+    ['lengthCm', lengthCm],
+    ['widthCm', widthCm],
+    ['heightCm', heightCm]
+  ]) {
+    if (!Number.isFinite(n) || n < MIN_DIM_CM) {
+      errors.push(`${label} must be ≥ ${MIN_DIM_CM}`);
+    } else if (n > MAX_DIM_CM) {
+      errors.push(`${label} must be ≤ ${MAX_DIM_CM}`);
+    }
+  }
+
+  if (errors.length) {
+    return { ok: false, errors };
+  }
+
+  return {
+    ok: true,
+    data: {
+      productId,
+      variantId,
+      unitWeightKg: roundMoney2(unitWeightKg),
+      lengthCm: roundMoney2(lengthCm),
+      widthCm: roundMoney2(widthCm),
+      heightCm: roundMoney2(heightCm)
+    }
+  };
+}
+
+/**
+ * Apply per-line weight/dim overrides onto an existing snapshot (remaining order lines).
+ * @param {object} snap
+ * @param {Array} overrides — validated { productId, variantId, unitWeightKg, lengthCm, widthCm, heightCm }
+ * @param {{ adminUserId?: string|null }} [meta]
+ */
+function findOverrideForSnapshotRow(row, byKey, byVariantId) {
+  const key = lineKey(row.productId, row.variantId);
+  if (byKey.has(key)) return { override: byKey.get(key), matchKey: key };
+  const vid = idStr(row.variantId);
+  if (vid && byVariantId.has(vid)) {
+    const list = byVariantId.get(vid);
+    if (list.length === 1) return { override: list[0], matchKey: lineKey(list[0].productId, list[0].variantId) };
+  }
+  return null;
+}
+
+function applyLineShippingOverridesToSnapshot(snap, overrides, meta = {}) {
+  const byKey = new Map();
+  const byVariantId = new Map();
+  for (const o of overrides || []) {
+    const key = lineKey(o.productId, o.variantId);
+    byKey.set(key, o);
+    const vid = idStr(o.variantId);
+    if (!vid) continue;
+    if (!byVariantId.has(vid)) byVariantId.set(vid, []);
+    byVariantId.get(vid).push(o);
+  }
+  if (!byKey.size) {
+    return { ok: false, code: 'OVERRIDES_REQUIRED', message: 'lineOverrides is required' };
+  }
+
+  const existingLines = Array.isArray(snap?.lines) ? snap.lines : [];
+  if (!existingLines.length) {
+    return { ok: false, code: 'SNAPSHOT_MISSING', message: 'Order has no shipping weight snapshot lines' };
+  }
+
+  const matched = new Set();
+  const nextLines = existingLines.map((row) => {
+    const found = findOverrideForSnapshotRow(row, byKey, byVariantId);
+    if (!found) {
+      return {
+        ...row,
+        productId: idStr(row.productId) || row.productId || null,
+        variantId: idStr(row.variantId) || row.variantId || null
+      };
+    }
+    matched.add(found.matchKey);
+    const o = found.override;
+    const unitDimWeightKg = dimWeightKgFromDimsCm({
+      lengthCm: o.lengthCm,
+      widthCm: o.widthCm,
+      heightCm: o.heightCm
+    });
+    const qty = Math.max(0, Number(row.quantity) || 0);
+    return {
+      ...row,
+      productId: idStr(o.productId) || idStr(row.productId) || row.productId || null,
+      variantId: idStr(o.variantId) || idStr(row.variantId) || row.variantId || null,
+      unitWeightKg: o.unitWeightKg,
+      lineWeightKg: roundMoney2(o.unitWeightKg * qty),
+      lengthCm: o.lengthCm,
+      widthCm: o.widthCm,
+      heightCm: o.heightCm,
+      unitDimWeightKg,
+      lineDimWeightKg: unitDimWeightKg != null ? roundMoney2(unitDimWeightKg * qty) : null,
+      overridden: true,
+      overriddenAt: new Date(),
+      overriddenBy: meta.adminUserId || null
+    };
+  });
+
+  for (const key of byKey.keys()) {
+    if (!matched.has(key)) {
+      return {
+        ok: false,
+        code: 'LINE_NOT_ON_ORDER',
+        message: `No snapshot line for ${key}`
+      };
+    }
+  }
+
+  const rebuilt = rebuildShippingWeightSnapshotFromLines(nextLines, { source: 'admin_override' });
+  return { ok: true, snapshot: rebuilt, dimsAgg: aggregateShippingFromWeightLines(rebuilt.lines) };
+}
+
 /**
  * @param {{ lines: Array<{ product: object, variant: object, quantity: number, resolvedShipping?: object }>, totalWeightKg?: number, dims?: object }} input
  */
@@ -239,5 +522,17 @@ module.exports = {
   buildShippingWeightSnapshotFromOrderItems,
   enrichShippingWeightSnapshotDims,
   resolveShiprocketPackageMetrics,
-  dimWeightKgFromDimsCm
+  dimWeightKgFromDimsCm,
+  aggregateShippingFromWeightLines,
+  rebuildShippingWeightSnapshotFromLines,
+  applySnapshotOverridesToCheckoutLines,
+  validateLineShippingOverride,
+  applyLineShippingOverridesToSnapshot,
+  hasLineDims,
+  lineKey,
+  idStr,
+  MIN_UNIT_WEIGHT_KG,
+  MAX_UNIT_WEIGHT_KG,
+  MIN_DIM_CM,
+  MAX_DIM_CM
 };

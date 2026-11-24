@@ -21,6 +21,11 @@ const { roundMoney2 } = require('./checkoutComputation.service');
 const ShiprocketService = require('../utils/shiprocket');
 const { mergeReturnInfo } = require('./rtoRefund.service');
 const { pickCheapestActiveCourier } = require('./courierPolicy.service');
+const {
+  ensureCheckoutDeliveryFrozen,
+  applyAdminQuotedDelivery,
+  syncCustomerDeliveryChargesToLock
+} = require('../utils/customerDeliveryLock');
 
 const razorpay =
   String(process.env.RAZORPAY_KEY_ID || '').trim() && String(process.env.RAZORPAY_KEY_SECRET || '').trim()
@@ -440,9 +445,12 @@ async function settleOosShippingAfterActualFreight(order, opts = {}) {
       return { settled: false, skipped: true, reason: 'not_pending' };
     }
 
-    const held = roundMoney2(
-      Number(meta.heldDeliveryCharges != null ? meta.heldDeliveryCharges : order.deliveryCharges) || 0
+    // Customer shipping is frozen at checkout; held meta may predate the lock field.
+    const lockedCustomerShip = ensureCheckoutDeliveryFrozen(
+      order,
+      meta.heldDeliveryCharges != null ? meta.heldDeliveryCharges : order.deliveryCharges
     );
+    const held = lockedCustomerShip;
     const hasAwb = Boolean(
       String(order.shipmentInfo?.awbCode || order.shipmentInfo?.trackingNumber || '').trim()
     );
@@ -483,14 +491,15 @@ async function settleOosShippingAfterActualFreight(order, opts = {}) {
       Math.max(0, Number(meta.maxBalanceDueInr != null ? meta.maxBalanceDueInr : order.balanceDueInr) || 0)
     );
 
+    // Bill the customer with locked checkout shipping; actual courier freight is admin-only.
     const math = computeFinalOosSettlement({
       subtotal: order.subtotal,
       tax: order.tax,
       discount: order.discount,
-      actualFreightInr: freightInr,
+      actualFreightInr: lockedCustomerShip,
       amountPaidInr,
       maxBalanceDueInr,
-      allowZeroFreight: Boolean(freightPick.allowZeroFreight)
+      allowZeroFreight: lockedCustomerShip < MIN_POSITIVE_FREIGHT_INR
     });
 
     if (!math.ok) {
@@ -556,6 +565,8 @@ async function settleOosShippingAfterActualFreight(order, opts = {}) {
       }
     }
 
+    syncCustomerDeliveryChargesToLock(order);
+    applyAdminQuotedDelivery(order, freightInr);
     order.deliveryCharges = math.customerDelivery;
     order.totalAmount = math.newTotal;
     order.balanceDueInr = math.refundInr > 0.005 ? 0 : math.balanceDueInr;
@@ -585,9 +596,12 @@ async function settleOosShippingAfterActualFreight(order, opts = {}) {
       actualFreightInr: freightInr,
       freightSource: freightPick.source,
       customerDelivery: math.customerDelivery,
+      checkoutDeliveryCharges: lockedCustomerShip,
+      adminQuotedDeliveryInr: freightInr,
       heldDeliveryCharges: held,
       usedActualFreight: freightPick.source === 'actual',
-      policyVersion: 3,
+      customerShippingLocked: true,
+      policyVersion: 4,
       courierId: opts.courierId != null ? Number(opts.courierId) : null,
       courierName: opts.courierName || null,
       source: opts.source || 'ship_now',

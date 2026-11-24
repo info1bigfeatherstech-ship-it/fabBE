@@ -35,6 +35,7 @@ const {
 const adminFulfillment = require('../controllers/admin-order-fulfillment.controller');
 const adminPendingOrderEdit = require('../controllers/admin-pending-order-edit.controller');
 const adminPendingOrderAddress = require('../controllers/admin-pending-order-address.controller');
+const adminPendingOrderShippingMetrics = require('../controllers/admin-pending-order-shipping-metrics.controller');
 
 // Razorpay webhook is mounted in index.js (raw body) — not here
 
@@ -133,6 +134,18 @@ router.post(
   '/admin/items/:orderId/edit-pending-address',
   ...adminOrderStaff,
   adminPendingOrderAddress.applyPendingAddressEdit
+);
+
+router.post(
+  '/admin/items/:orderId/edit-pending-shipping-metrics/preview',
+  ...adminOrderStaff,
+  adminPendingOrderShippingMetrics.previewPendingShippingMetricsEdit
+);
+
+router.post(
+  '/admin/items/:orderId/edit-pending-shipping-metrics',
+  ...adminOrderStaff,
+  adminPendingOrderShippingMetrics.applyPendingShippingMetricsEdit
 );
 
 router.post(

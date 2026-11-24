@@ -1585,6 +1585,8 @@ exports.createOrder = async (req, res) => {
             loyaltyDiscount,
             loyaltyPointsRedeemed
         } = priced;
+        // Freeze customer shipping at place-order — admin re-quotes never change this for the buyer.
+        const checkoutDeliveryCharges = roundMoney2(Math.max(0, Number(deliveryCharges) || 0));
         const orderItemsWithCodes = attachProductCodesToOrderItems(orderItems, lines);
         const shippingWeightSnapshot = buildShippingWeightSnapshotFromCheckoutLines({
             lines: priced.lines,
@@ -1703,6 +1705,10 @@ exports.createOrder = async (req, res) => {
             items: orderItemsWithCodes,
             subtotal: subtotal,
             deliveryCharges: deliveryCharges,
+            checkoutDeliveryCharges,
+            adminQuotedDeliveryInr: checkoutDeliveryCharges,
+            adminShippingDeltaInr: 0,
+            adminQuotedDeliveryAt: new Date(),
             deliveryFreightInr:
                 priced.deliveryMeta?.freightInr != null &&
                 Number.isFinite(Number(priced.deliveryMeta.freightInr))
@@ -3414,6 +3420,10 @@ exports.getOrder = async (req, res) => {
             // Admin/RTO-only shipping split — never surface on customer order API.
             delete transformedOrder.deliveryFreightInr;
             delete transformedOrder.deliveryCodFeeInr;
+            // Admin-only re-quote vs checkout lock — customer must never see these.
+            delete transformedOrder.adminQuotedDeliveryInr;
+            delete transformedOrder.adminShippingDeltaInr;
+            delete transformedOrder.adminQuotedDeliveryAt;
             try {
                 const {
                     attachCustomerFacingMoneyFields

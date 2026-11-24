@@ -47,21 +47,31 @@ function computeLiveCourierCollectable(order) {
     const useCodAtDoor = payMethod === 'cod' || (balanceViaCod && balanceDue > 0.005);
     const collectable = useCodAtDoor ? (payMethod === 'cod' ? totalInr : balanceDue) : 0;
 
+    const { getCheckoutDeliveryCharges } = require('../utils/customerDeliveryLock');
+    const shippingCharges = getCheckoutDeliveryCharges(order);
+
     return {
       collectable: roundMoney2(collectable),
       paymentMode: useCodAtDoor ? 'COD' : 'PREPAID',
       orderTotal: totalInr,
-      shippingCharges: roundMoney2(Number(order?.deliveryCharges) || 0),
+      shippingCharges,
       useCodAtDoor: Boolean(useCodAtDoor),
       balanceDue,
       paidInr
     };
   } catch {
+    let shippingCharges = roundMoney2(Number(order?.deliveryCharges) || 0);
+    try {
+      const { getCheckoutDeliveryCharges } = require('../utils/customerDeliveryLock');
+      shippingCharges = getCheckoutDeliveryCharges(order);
+    } catch (_) {
+      /* keep fallback */
+    }
     return {
       collectable: 0,
       paymentMode: 'PREPAID',
       orderTotal: roundMoney2(Number(order?.totalAmount) || 0),
-      shippingCharges: roundMoney2(Number(order?.deliveryCharges) || 0),
+      shippingCharges,
       useCodAtDoor: false,
       balanceDue: 0,
       paidInr: roundMoney2(Number(order?.amountPaidInr) || 0)
@@ -105,9 +115,13 @@ function getCustomerFacingDeliveryInr(order) {
       const frozen = asFiniteMoney(order.shipmentInfo?.courierDeliveryInr);
       if (frozen != null) return frozen;
     }
-    return roundMoney2(Number(order?.deliveryCharges) || 0);
+    // Prefer immutable checkout lock so admin re-quotes never leak to customer UI/labels.
+    const {
+      getCheckoutDeliveryCharges
+    } = require('../utils/customerDeliveryLock');
+    return getCheckoutDeliveryCharges(order);
   } catch {
-    return 0;
+    return roundMoney2(Number(order?.deliveryCharges) || 0);
   }
 }
 

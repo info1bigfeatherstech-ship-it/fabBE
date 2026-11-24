@@ -18,7 +18,12 @@ const {
   calculateTax,
   aggregateShipping
 } = require('./checkoutComputation.service');
-const { buildShippingWeightSnapshotFromCheckoutLines } = require('../utils/shippingWeightSnapshot');
+const {
+  buildShippingWeightSnapshotFromCheckoutLines,
+  applySnapshotOverridesToCheckoutLines,
+  rebuildShippingWeightSnapshotFromLines,
+  aggregateShippingFromWeightLines
+} = require('../utils/shippingWeightSnapshot');
 const { resolveVariantShipping } = require('../utils/variantCatalogFields');
 const ShiprocketService = require('../utils/shiprocket');
 const ShipmozoService = require('../utils/shipmozo');
@@ -39,6 +44,12 @@ const {
   buildOosShippingSettlementMeta,
   computeDeferredApplyFinancials
 } = require('./oosShippingSettlement.service');
+const {
+  ensureCheckoutDeliveryFrozen,
+  applyAdminQuotedDelivery,
+  syncCustomerDeliveryChargesToLock,
+  getCheckoutDeliveryCharges
+} = require('../utils/customerDeliveryLock');
 
 const razorpay =
   String(process.env.RAZORPAY_KEY_ID || '').trim() && String(process.env.RAZORPAY_KEY_SECRET || '').trim()
@@ -337,9 +348,15 @@ function estimateCodAmount(order, provisionalTotal, amountPaidInr) {
 }
 
 /**
- * Re-quote cheapest courier; customer delivery never increases.
+ * Re-quote cheapest courier from package metrics.
+ * Customer delivery is ALWAYS the checkout lock (never raised or lowered for the buyer).
+ * Admin quote is returned separately as quotedDelivery.
+ *
+ * @param {object} order
+ * @param {Array} nextItems
+ * @param {{ weightSnapshot?: object|null, skipCatalogOverlay?: boolean }} [opts]
  */
-async function repriceShippingForItems(order, nextItems) {
+async function repriceShippingForItems(order, nextItems, opts = {}) {
   const postalCode = String(order.addressSnapshot?.postalCode || '')
     .replace(/\D/g, '')
     .slice(0, 6);
@@ -348,27 +365,69 @@ async function repriceShippingForItems(order, nextItems) {
   }
 
   const discount = roundMoney2(Number(order.discount) || 0);
-  const oldDelivery = roundMoney2(Number(order.deliveryCharges) || 0);
+  const lockedDelivery = ensureCheckoutDeliveryFrozen(order);
+  const oldDelivery = lockedDelivery;
   const amountPaidInr = roundMoney2(Number(order.amountPaidInr) || 0);
   const subtotal = roundMoney2(
     nextItems.reduce((s, it) => s + (Number(it.priceSnapshot?.total) || 0), 0)
   );
   const tax = taxFromItems(nextItems);
 
-  const checkoutLines = await loadCheckoutLinesForItems(nextItems);
-  const dimsAgg = aggregateShipping(checkoutLines);
-  const weightSnapshot = buildShippingWeightSnapshotFromCheckoutLines({
-    lines: checkoutLines,
-    totalWeightKg: dimsAgg.weightKg,
-    dims: {
-      lengthCm: dimsAgg.lengthCm,
-      widthCm: dimsAgg.widthCm,
-      heightCm: dimsAgg.heightCm
-    }
-  });
+  let weightSnapshot = opts.weightSnapshot || null;
+  let dimsAgg;
 
-  const provisionalTotalWithOldShip = roundMoney2(subtotal + oldDelivery + tax - discount);
-  const codPass1 = estimateCodAmount(order, provisionalTotalWithOldShip, amountPaidInr);
+  if (weightSnapshot?.lines?.length) {
+    weightSnapshot = rebuildShippingWeightSnapshotFromLines(weightSnapshot.lines, {
+      source: weightSnapshot.source || 'admin_override'
+    });
+    dimsAgg = aggregateShippingFromWeightLines(weightSnapshot.lines);
+  } else {
+    let checkoutLines = await loadCheckoutLinesForItems(nextItems);
+    // Prefer prior order snapshot (incl. admin overrides) over live catalog dims/weight.
+    if (!opts.skipCatalogOverlay) {
+      checkoutLines = applySnapshotOverridesToCheckoutLines(
+        checkoutLines,
+        order.shippingWeightSnapshot
+      );
+    }
+    dimsAgg = aggregateShipping(checkoutLines);
+    weightSnapshot = buildShippingWeightSnapshotFromCheckoutLines({
+      lines: checkoutLines,
+      totalWeightKg: dimsAgg.weightKg,
+      dims: {
+        lengthCm: dimsAgg.lengthCm,
+        widthCm: dimsAgg.widthCm,
+        heightCm: dimsAgg.heightCm
+      }
+    });
+    // Preserve override flags from prior snapshot where line keys match.
+    const priorByKey = new Map();
+    for (const row of order.shippingWeightSnapshot?.lines || []) {
+      priorByKey.set(lineKey(row.productId, row.variantId), row);
+    }
+    let anyOverride = false;
+    weightSnapshot.lines = (weightSnapshot.lines || []).map((row) => {
+      const prior = priorByKey.get(lineKey(row.productId, row.variantId));
+      if (prior?.overridden) {
+        anyOverride = true;
+        return {
+          ...row,
+          overridden: true,
+          overriddenAt: prior.overriddenAt || null,
+          overriddenBy: prior.overriddenBy || null
+        };
+      }
+      return row;
+    });
+    if (anyOverride) {
+      weightSnapshot.source = 'admin_override';
+    }
+  }
+
+  // Customer bill always uses locked checkout shipping (not the new courier quote).
+  const customerDelivery = lockedDelivery;
+  const provisionalTotalWithLockedShip = roundMoney2(subtotal + customerDelivery + tax - discount);
+  const codPass1 = estimateCodAmount(order, provisionalTotalWithLockedShip, amountPaidInr);
 
   const orderProvider = resolveOrderShippingProvider(order);
   const ship =
@@ -379,7 +438,7 @@ async function repriceShippingForItems(order, nextItems) {
           widthCm: dimsAgg.widthCm,
           heightCm: dimsAgg.heightCm,
           codAmount: codPass1,
-          orderAmount: provisionalTotalWithOldShip
+          orderAmount: provisionalTotalWithLockedShip
         })
       : await ShiprocketService.checkDeliveryAvailability(postalCode, {
           weightKg: dimsAgg.weightKg,
@@ -398,9 +457,6 @@ async function repriceShippingForItems(order, nextItems) {
   }
 
   const quotedDelivery = roundMoney2(Number(ship.deliveryCharges) || 0);
-  // Never charge the customer more than previously quoted shipping.
-  const customerDelivery = roundMoney2(Math.min(oldDelivery, quotedDelivery));
-
   const totalAmount = roundMoney2(subtotal + customerDelivery + tax - discount);
   const courierCompanyId =
     ship.courierCompanyId != null && Number.isFinite(Number(ship.courierCompanyId))
@@ -412,9 +468,13 @@ async function repriceShippingForItems(order, nextItems) {
     tax,
     discount,
     oldDelivery,
+    checkoutDeliveryCharges: lockedDelivery,
     quotedDelivery,
     customerDelivery,
-    shippingIncreasedAbsorbed: quotedDelivery > oldDelivery + 0.005,
+    adminQuotedDeliveryInr: quotedDelivery,
+    adminShippingDeltaInr: roundMoney2(quotedDelivery - lockedDelivery),
+    shippingIncreasedAbsorbed: quotedDelivery > lockedDelivery + 0.005,
+    customerShippingLocked: true,
     totalAmount,
     weightSnapshot,
     dimsAgg,
@@ -430,7 +490,8 @@ async function repriceShippingForItems(order, nextItems) {
       pickupsAutomaticallyScheduled:
         ship.pickupsAutomaticallyScheduled != null
           ? Boolean(ship.pickupsAutomaticallyScheduled)
-          : null
+          : null,
+      freightInr: quotedDelivery
     },
     shipMeta: {
       isDeliverable: ship.isDeliverable,
@@ -893,6 +954,9 @@ async function previewOrApplyPendingOrderEdit(opts) {
   const afterPreview = {
     subtotal: priced.subtotal,
     deliveryCharges: priced.customerDelivery,
+    checkoutDeliveryCharges: priced.checkoutDeliveryCharges,
+    adminQuotedDeliveryInr: priced.quotedDelivery,
+    adminShippingDeltaInr: priced.adminShippingDeltaInr,
     tax: priced.tax,
     discount: priced.discount,
     totalAmount: priced.totalAmount,
@@ -900,6 +964,7 @@ async function previewOrApplyPendingOrderEdit(opts) {
     balanceDueInr: settlement.balanceDueInr,
     paymentStatus: settlement.paymentStatus,
     shippingSnapshot: priced.shippingSnapshot,
+    shippingWeightSnapshot: priced.weightSnapshot,
     weightKg: priced.dimsAgg.weightKg
   };
 
@@ -914,15 +979,24 @@ async function previewOrApplyPendingOrderEdit(opts) {
     shippingSettlementDeferred: deferShipping,
     shipping: {
       oldDelivery: priced.oldDelivery,
+      checkoutDeliveryCharges: priced.checkoutDeliveryCharges,
       quotedDelivery: priced.quotedDelivery,
+      adminQuotedDeliveryInr: priced.quotedDelivery,
+      adminShippingDeltaInr: priced.adminShippingDeltaInr,
       customerDelivery: priced.customerDelivery,
+      customerShippingLocked: true,
       shippingIncreasedAbsorbed: priced.shippingIncreasedAbsorbed,
       shippingSettlementDeferred: deferShipping,
       provisionalEstimateOnly: deferShipping,
       courierName: priced.shippingSnapshot.courierName,
       courierCompanyId: priced.shippingSnapshot.courierCompanyId,
       estimatedDays: priced.shippingSnapshot.estimatedDays,
-      quotedMock: Boolean(priced.shipMeta?.mock)
+      quotedMock: Boolean(priced.shipMeta?.mock),
+      package: {
+        totalWeightKg: priced.weightSnapshot?.totalWeightKg ?? null,
+        totalDimWeightKg: priced.weightSnapshot?.totalDimWeightKg ?? null,
+        dims: priced.weightSnapshot?.dims || null
+      }
     },
     customerNotes,
     remainingItems: nextItems.map((it) => ({
@@ -951,7 +1025,9 @@ async function previewOrApplyPendingOrderEdit(opts) {
 
   order.items = nextItems;
   order.subtotal = priced.subtotal;
-  order.deliveryCharges = priced.customerDelivery;
+  // Customer shipping stays at checkout lock; admin quote stored separately.
+  syncCustomerDeliveryChargesToLock(order);
+  applyAdminQuotedDelivery(order, priced.quotedDelivery);
   order.tax = priced.tax;
   // discount frozen
   order.discount = priced.discount;

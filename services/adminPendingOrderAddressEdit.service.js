@@ -6,7 +6,8 @@
  * - Phone stays frozen from existing addressSnapshot
  * - Recipient name may be edited (max 3 words, 50 chars) on THIS order snapshot only
  * - Name-only edits never re-quote shipping and never change totals/refunds
- * - Physical address edits re-quote shipping (never increase customer delivery)
+ * - Physical address edits re-quote shipping for admin/ops only
+ * - Customer checkout shipping stays locked (no refund/charge from shipping delta)
  * - Optionally updates linked Address doc only when it belongs to the same order.userId
  */
 
@@ -21,10 +22,12 @@ const {
   assertEditablePendingOrder,
   createEditError,
   repriceShippingForItems,
-  settleFinancials,
-  attemptAmendmentRefund,
   snapshotMoney
 } = require('./adminPendingOrderEdit.service');
+const {
+  syncCustomerDeliveryChargesToLock,
+  applyAdminQuotedDelivery
+} = require('../utils/customerDeliveryLock');
 const { notifyOrderAmended } = require('./orderAmendmentNotification.service');
 
 const EDITABLE_ADDRESS_FIELDS = Object.freeze([
@@ -383,8 +386,10 @@ async function previewOrApplyPendingAddressEdit(opts) {
     order.addressSnapshot = previousSnapshot;
   }
 
-  const settlement = settleFinancials(order, priced.totalAmount);
   const localQuality = computeLocalAddressQuality(nextSnapshot);
+  // Keep paid/due as-is in preview — shipping lock means address edit does not resettle money.
+  const previewPaid = roundMoney2(Number(order.amountPaidInr) || 0);
+  const previewDue = roundMoney2(Number(order.balanceDueInr) || 0);
 
   const preview = {
     orderId,
@@ -401,12 +406,15 @@ async function previewOrApplyPendingAddressEdit(opts) {
     after: {
       subtotal: priced.subtotal,
       deliveryCharges: priced.customerDelivery,
+      checkoutDeliveryCharges: priced.checkoutDeliveryCharges,
+      adminQuotedDeliveryInr: priced.quotedDelivery,
+      adminShippingDeltaInr: priced.adminShippingDeltaInr,
       tax: priced.tax,
       discount: priced.discount,
       totalAmount: priced.totalAmount,
-      amountPaidInr: settlement.amountPaidInr,
-      balanceDueInr: settlement.balanceDueInr,
-      paymentStatus: settlement.paymentStatus,
+      amountPaidInr: previewPaid,
+      balanceDueInr: previewDue,
+      paymentStatus: order.paymentStatus,
       address: formatAddressLines(nextSnapshot),
       addressSnapshot: nextSnapshot,
       contactFrozen: {
@@ -415,11 +423,16 @@ async function previewOrApplyPendingAddressEdit(opts) {
       },
       localAddressQuality: localQuality
     },
-    refundInr: settlement.refundInr,
+    // Shipping delta never refunds/charges the customer (checkout lock).
+    refundInr: 0,
     shipping: {
       oldDelivery: priced.oldDelivery,
+      checkoutDeliveryCharges: priced.checkoutDeliveryCharges,
       quotedDelivery: priced.quotedDelivery,
+      adminQuotedDeliveryInr: priced.quotedDelivery,
+      adminShippingDeltaInr: priced.adminShippingDeltaInr,
       customerDelivery: priced.customerDelivery,
+      customerShippingLocked: true,
       shippingIncreasedAbsorbed: priced.shippingIncreasedAbsorbed,
       courierName: priced.shippingSnapshot.courierName,
       courierCompanyId: priced.shippingSnapshot.courierCompanyId,
@@ -437,7 +450,9 @@ async function previewOrApplyPendingAddressEdit(opts) {
   order.addressSnapshot = nextSnapshot;
   order.markModified('addressSnapshot');
   order.subtotal = priced.subtotal;
-  order.deliveryCharges = priced.customerDelivery;
+  // Customer shipping locked at checkout; admin quote updated for ops only.
+  syncCustomerDeliveryChargesToLock(order);
+  applyAdminQuotedDelivery(order, priced.quotedDelivery);
   order.tax = priced.tax;
   order.discount = priced.discount;
   order.totalAmount = priced.totalAmount;
@@ -446,45 +461,26 @@ async function previewOrApplyPendingAddressEdit(opts) {
   order.markModified('shippingSnapshot');
   order.markModified('shippingWeightSnapshot');
 
-  const priorPaymentStatus = order.paymentStatus;
-  const refundOutcome = await attemptAmendmentRefund(
-    order,
-    settlement.refundInr,
-    `Address update on order ${orderId}`
-  );
+  // Address re-quote updates package/admin quote only — do not mutate paid/due from shipping delta.
+  order.amountPaidInr = roundMoney2(Number(order.amountPaidInr) || 0);
+  order.balanceDueInr = roundMoney2(Number(order.balanceDueInr) || 0);
 
-  if (settlement.refundInr > 0.005 && refundOutcome.warning) {
-    order.paymentStatus = priorPaymentStatus === 'partially_paid' ? 'partially_paid' : 'paid';
-    order.paymentInfo = order.paymentInfo || {};
-    order.paymentInfo.amendmentRefundFailureReason = refundOutcome.warning;
-    order.markModified('paymentInfo');
-  } else if (settlement.refundInr > 0.005 && refundOutcome.refund) {
-    order.amountPaidInr = settlement.amountPaidInr;
-    order.balanceDueInr = 0;
-    order.paymentStatus = 'paid';
-  } else {
-    order.amountPaidInr = settlement.amountPaidInr;
-    order.balanceDueInr = settlement.balanceDueInr;
-    order.paymentStatus = settlement.paymentStatus;
-  }
+  const noteMessage = 'Your delivery address was updated by our team for accurate shipping.';
 
-  const noteMessage =
-    settlement.refundInr > 0.005
-      ? `Your delivery address was updated by our team for accurate shipping. A refund of ₹${settlement.refundInr.toFixed(2)} was processed for any reduced charges.`
-      : 'Your delivery address was updated by our team for accurate shipping.';
-
-  order.customerNotes = Array.isArray(order.customerNotes) ? order.customerNotes : [];
-  order.customerNotes.push({
+  order.customerFacingNotes = Array.isArray(order.customerFacingNotes)
+    ? order.customerFacingNotes
+    : [];
+  order.customerFacingNotes.push({
     kind: 'address_updated',
     message: noteMessage,
     createdAt: new Date(),
     metadata: {
-      refundInr: settlement.refundInr,
+      refundInr: 0,
       shipping: preview.shipping,
       nameChanged
     }
   });
-  order.markModified('customerNotes');
+  order.markModified('customerFacingNotes');
 
   await order.save();
 
@@ -499,7 +495,7 @@ async function previewOrApplyPendingAddressEdit(opts) {
 
   try {
     await notifyOrderAmended(order, noteMessage, {
-      refundInr: settlement.refundInr,
+      refundInr: 0,
       newTotal: order.totalAmount,
       cancelledEmpty: false
     });
@@ -512,15 +508,18 @@ async function previewOrApplyPendingAddressEdit(opts) {
     orderId,
     nameOnly: false,
     shippingRequoted: true,
-    refundInr: settlement.refundInr,
-    refundWarning: refundOutcome.warning,
+    refundInr: 0,
+    refundWarning: null,
     shipping: preview.shipping,
     addressSnapshot: nextSnapshot,
     localAddressQuality: localQuality,
     savedAddressUpdated,
     paymentStatus: order.paymentStatus,
     totalAmount: order.totalAmount,
-    deliveryCharges: order.deliveryCharges
+    deliveryCharges: order.deliveryCharges,
+    checkoutDeliveryCharges: order.checkoutDeliveryCharges,
+    adminQuotedDeliveryInr: order.adminQuotedDeliveryInr,
+    adminShippingDeltaInr: order.adminShippingDeltaInr
   };
 }
 
